@@ -20,7 +20,9 @@
 #define POGO_CMD_TOUCHPAD 0x03
 #define POGO_CMD_SYNC_UPLOAD 0x2f
 #define POGO_CRC_INIT 0xc596
-#define POGO_MAX_FRAME 275
+#define POGO_MAX_PAYLOAD 255
+/* Cached frame excludes the 0x55 preamble. */
+#define POGO_MAX_FRAME (5 + POGO_MAX_PAYLOAD + 2 + 1 + 4)
 #define POGO_MAX_TOUCHES 5
 
 struct pogo_media_map { u16 usage, key; };
@@ -42,6 +44,7 @@ struct oneplus_pogo {
 	u8 frame[POGO_MAX_FRAME];
 	size_t frame_len,expected;
 	u8 sync_count;
+	bool receiving;
 };
 
 static const u8 keycode[256] = {
@@ -113,21 +116,32 @@ static void report_touchpad(struct oneplus_pogo *p,const u8 *buf,size_t len)
 static void handle_frame(struct oneplus_pogo *p)
 {
 	u8 *f=p->frame,plen,cmd;u16 got,calc;const u8 *payload;
-	if(p->frame_len<20||(f[8]!=POGO_START&&f[8]!=POGO_REPEAT))return;
-	if(f[9]!=POGO_KBD_ADDR||f[10]!=POGO_PAD_ADDR)return;
-	cmd=f[11];plen=f[12];if(p->frame_len!=plen+20)return;
-	got=(u16)f[13+plen]<<8|f[14+plen];calc=pogo_crc(p->crc_init,f+8,plen+5);if(got!=calc)return;
-	if(f[15+plen]!=POGO_END||f[16+plen]!=POGO_TAIL||f[17+plen]!=POGO_TAIL||f[18+plen]!=POGO_TAIL||f[19+plen]!=POGO_TAIL)return;
-	payload=f+13;
+	/* Cached layout starts at F1/F2, so total is payload + 12 bytes. */
+	if(p->frame_len<12||(f[0]!=POGO_START&&f[0]!=POGO_REPEAT))return;
+	if(f[1]!=POGO_KBD_ADDR||f[2]!=POGO_PAD_ADDR)return;
+	cmd=f[3];plen=f[4];if(p->frame_len!=(size_t)plen+12)return;
+	got=(u16)f[5+plen]<<8|f[6+plen];calc=pogo_crc(p->crc_init,f,plen+5);if(got!=calc)return;
+	if(f[7+plen]!=POGO_END||f[8+plen]!=POGO_TAIL||f[9+plen]!=POGO_TAIL||f[10+plen]!=POGO_TAIL||f[11+plen]!=POGO_TAIL)return;
+	payload=f+5;
 	switch(cmd){case POGO_CMD_KEY:report_keys(p,payload,plen);break;case POGO_CMD_MEDIA:report_media(p,payload,plen);break;case POGO_CMD_TOUCHPAD:report_touchpad(p,payload,plen);break;case POGO_CMD_SYNC_UPLOAD:dev_dbg(&p->serdev->dev,"sync/heartbeat len=%u\n",plen);break;default:dev_dbg_ratelimited(&p->serdev->dev,"unhandled cmd 0x%02x\n",cmd);}
+}
+
+static void rx_reset(struct oneplus_pogo *p)
+{
+	p->receiving=false;p->frame_len=0;p->expected=0;
 }
 
 static void rx_byte(struct oneplus_pogo *p,u8 b)
 {
-	if(!p->frame_len){if(b==POGO_SYNC){if(++p->sync_count==8){memset(p->frame,POGO_SYNC,8);p->frame_len=8;p->sync_count=0;}}else p->sync_count=0;return;}
-	if(p->frame_len>=sizeof(p->frame)){p->frame_len=p->expected=0;return;}
-	p->frame[p->frame_len++]=b;if(p->frame_len==13)p->expected=p->frame[12]+20;
-	if(p->expected&&p->frame_len==p->expected){handle_frame(p);p->frame_len=p->expected=0;}
+	if(!p->receiving){
+		if(b==POGO_SYNC){if(p->sync_count<0xff)p->sync_count++;return;}
+		if((b==POGO_START||b==POGO_REPEAT)&&p->sync_count>=4){p->receiving=true;p->frame_len=1;p->frame[0]=b;p->expected=0;}
+		p->sync_count=0;return;
+	}
+	if(p->frame_len>=sizeof(p->frame)){rx_reset(p);p->sync_count=(b==POGO_SYNC);return;}
+	p->frame[p->frame_len++]=b;
+	if(p->frame_len==5){p->expected=(size_t)p->frame[4]+12;if(p->expected>sizeof(p->frame)){rx_reset(p);return;}}
+	if(p->expected&&p->frame_len==p->expected){handle_frame(p);rx_reset(p);}
 }
 static size_t pogo_receive(struct serdev_device *s,const u8 *buf,size_t count){struct oneplus_pogo *p=serdev_device_get_drvdata(s);size_t i;for(i=0;i<count;i++)rx_byte(p,buf[i]);return count;}
 static const struct serdev_device_ops pogo_ops={.receive_buf=pogo_receive};
@@ -140,7 +154,7 @@ static int pogo_inputs(struct oneplus_pogo *p)
 	ret=input_register_device(p->kbd);if(ret)return ret;
 	p->touchpad=devm_input_allocate_device(dev);if(!p->touchpad)return -ENOMEM;p->touchpad->name="OnePlus Pogo Touchpad";p->touchpad->id.bustype=BUS_RS232;__set_bit(INPUT_PROP_POINTER,p->touchpad->propbit);__set_bit(INPUT_PROP_BUTTONPAD,p->touchpad->propbit);
 	input_set_capability(p->touchpad,EV_KEY,BTN_LEFT);input_set_capability(p->touchpad,EV_KEY,BTN_RIGHT);input_set_abs_params(p->touchpad,ABS_MT_POSITION_X,0,p->x_max,0,0);input_set_abs_params(p->touchpad,ABS_MT_POSITION_Y,0,p->y_max,0,0);
-	ret=input_mt_init_slots(p->touchpad,POGO_MAX_TOUCHES,INPUT_MT_POINTER);return ret?ret:input_register_device(p->touchpad);
+	ret=input_mt_init_slots(p->touchpad,POGO_MAX_TOUCHES,INPUT_MT_POINTER|INPUT_MT_DROP_UNUSED);return ret?ret:input_register_device(p->touchpad);
 }
 
 static int oneplus_pogo_probe(struct serdev_device *serdev)
