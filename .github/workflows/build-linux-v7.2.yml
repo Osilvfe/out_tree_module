@@ -1,0 +1,28 @@
+name: Build against Linux v7.2
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
+
+      - name: Prepare Linux v7.2
+        run: |
+          git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
+          make -C "$RUNNER_TEMP/linux" defconfig
+          "$RUNNER_TEMP/linux/scripts/config" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          make -C "$RUNNER_TEMP/linux" olddefconfig
+          make -C "$RUNNER_TEMP/linux" -j"$(nproc)" prepare modules_prepare
+
+      - name: Build out-of-tree modules
+        run: |
+          make KDIR="$RUNNER_TEMP/linux" KBUILD_MODPOST_WARN=1 -j"$(nproc)"
