@@ -13,215 +13,160 @@ instead of merging the whole development branch.
 - `main`: conservative code intended for actual device testing.
 - `sc8547-next`: may contain unverified control paths and incomplete policy
   integration.
-- Every functional stage should be a separate commit or small commit series.
-- A stage that writes charge-pump control/protection registers must not be
-  silently enabled by merely adding the normal device node.
-- VOOC/SuperVOOC/UFCS protocol support is intentionally separate from generic
-  charge-pump control.
-- Documentation is written before or together with each write-capable stage so
-  the test and merge contract does not depend on unwritten context.
-- Focused Linux-v7.2 `W=1` CI is the compile gate for charging changes; the
-  repository-wide build may still fail because pogo/touchscreen are separate
-  workstreams.
+- Every functional stage is kept as a separate commit or small commit series.
+- Write-capable behavior is hidden behind explicit development-only DT opt-ins.
+- VOOC/SuperVOOC/UFCS remains separate from generic CP work.
+- Documentation is written before or together with write-capable stages.
+- Focused Linux-v7.2 `W=1` CI is the charging compile gate; repo-wide failures
+  from the independent pogo/touchscreen workstreams do not redefine charging
+  status.
 
 ## Hardware topology
 
-Caihong downstream DT uses two SC8547-family devices at I2C address `0x6f` on
+Caihong downstream uses two SC8547-family devices at I2C address `0x6f` on
 separate buses:
 
-- QUP I2C hub 2: primary, downstream `oplus,sc8547a`
-- QUP I2C hub 0: secondary, downstream `slave_vphy_sc8547`
+- hub 2: primary SC8547A, downstream `oplus,sc8547a`, CP index 0;
+- hub 0: secondary SC8547-family, downstream `slave_vphy_sc8547`, CP index 1.
 
-Both downstream nodes carry:
+Downstream virtual CP connects them in parallel, uses `main_cp = <0>` and lists
+a nominal 3000 mA input-current budget for each path. The standalone port treats
+those values as evidence only, never as an automatic source request or generic
+safe limit.
+
+Both downstream physical nodes carry:
 
 ```dts
 ocp_reg = <0xb>;
 ovp_reg = <0x36>;
 ```
 
-The downstream virtual charge-pump layer connects the two devices in parallel,
-uses CP index 0 as the main CP, and assigns a nominal 3000 mA input-current
-budget to each path. These values are reverse-engineering evidence only and are
-not automatic limits/requests in the standalone driver.
+These project values are not programmed automatically because vendor comments
+and header formulas are not fully self-consistent.
 
-## Important silicon compatibility rule
+## Silicon compatibility rule
 
-SC8547 and SC8547A share the core charge-pump and ADC data map used by this
-port. VBUS/IBUS/VBAT/VOUT/VAC/TDIE data locations and scales are shared in the
-Oplus source.
+SC8547 and SC8547A share the core ADC/data map used by this port, but are not
+control-register identical. In particular, REG05 UCP deglitch and downstream
+REG07 low-bit setup differ. Shared controls therefore use masked writes, while
+variant-specific fields remain separated.
 
-They are **not** register-for-register identical for control programming.
-Known differences include the `REG05` IBUS-UCP deglitch field and downstream
-`REG07` low-bit setup. Therefore common control code uses masked updates for
-shared bits such as CP enable and work mode, and variant-specific helpers for
-fields that differ.
-
-SC8547A additionally exposes UFCS registers starting at `0x40`; those are not
-part of the generic charge-pump bring-up.
-
-SC8547D is currently recognized for telemetry but deliberately rejected by the
-experimental write path until its control compatibility is established.
+SC8547A also exposes UFCS registers at `0x40+`; those are outside the generic CP
+bring-up. SC8547D is recognized for telemetry but rejected by experimental
+write paths until its control compatibility is established.
 
 ## Protection-value caution
 
-Do not infer electrical thresholds from downstream comments alone.
+The Oplus common header describes BAT_OVP as 3500 mV + 25 mV/code, making code
+`0x36` decode to 4850 mV, while nearby vendor comments can describe 4.65 V.
+Similarly, the header formula makes IBUS OCP code `0x0b` decode to 4500 mA while
+some source comments describe 3.6 A.
 
-The common Oplus SC8547 header describes BAT_OVP (`REG00[5:0]`) as 3500 mV +
-25 mV/code. Under that definition code `0x36` decodes to 4850 mV, while some
-downstream comments near the project configuration describe 4.65 V.
-
-The common header describes the low nibble of `REG05` as 1200 mA +
-300 mA/code. Project code `0x0b` therefore decodes to 4500 mA by that formula,
-while some downstream comments describe 3.6 A.
-
-These discrepancies are preserved as evidence rather than silently resolved.
-The development driver keeps raw values visible and does not automatically
-derive a protection profile from project `ovp_reg`/`ocp_reg` values.
+Raw values are therefore preserved beside clearly labelled `header_*` decodes;
+ambiguous formulas are never treated as electrically validated board limits.
 
 ## Stage 0 - baseline telemetry
 
-Status: implemented on `main`, not yet hardware-validated in this development
-cycle.
+Status: implemented on `main`, hardware validation pending.
 
-Automatic write:
+Automatic write: ADC enable only (`REG11[7]`).
 
-- ADC enable only (`REG11[7]`).
+Features include I2C/regmap probe, ID, ADC telemetry, CP state/mode/status,
+fault decoding and basic read-only `power_supply` reporting.
 
-Features:
+### Hardware gate
 
-- I2C/regmap probe
-- device ID
-- ADC telemetry
-- CP enable/mode/switching state
-- status/fault decoding
-- `power_supply` read-only reporting
+Verify both `0x6f` devices probe, IDs/ADC/status are plausible and no unexpected
+CP activity occurs.
 
-### Test gate
-
-For both `0x6f` devices verify stable probe, plausible primary ID (`0x67`
-expected for SC8547A), plausible ADC values, sensible status/fault bits, and no
-unexpected CP activity.
-
-## Stage 1 - variant model and register snapshot
+## Stage 1 - variant model and snapshot
 
 Status: implemented on `sc8547-next`.
-
-Source commit:
 
 - `60c230c` - variant model, runtime-ID warning, masked helpers and read-only
   register snapshot.
 
-No new automatic CP/protection write is introduced.
+No new automatic write.
 
-### Test gate
+### Hardware gate
 
-Capture `variant` and `register_dump` for both devices unplugged and with a
-normal 5 V source attached.
+Capture `variant` and `register_dump` for both pumps unplugged and on a normal
+5 V source.
 
-## Stage 2 - protection model, decode only
+## Stage 2 - protection decode, read-only
 
-Status: implemented on `sc8547-next`.
+Status: implemented.
 
-Source commits:
+- `bc553aa` - read-only `protection_state` decode;
+- `f15fb5a` - explicit bitfield include.
 
-- `bc553aa` - read-only protection decode;
-- `f15fb5a` - explicit bitfield-helper include.
+### Hardware gate
 
-`protection_state` reports raw protection registers together with clearly
-labelled vendor-header formula decodes. It does not claim those formulas are
-electrically validated on Caihong.
+Compare raw/decoded values against register dump, downstream evidence and
+unplugged/5-V states. Keep contradictory formulas labelled ambiguous.
 
-No new automatic write is introduced.
+## Stage 3 - gated controlled init
 
-### Test gate
+Status: implemented, focused Linux-v7.2 build-verified, **not hardware-validated**.
 
-Compare `protection_state` against the same device's `register_dump`, any
-available downstream register dump, and unplugged/5-V states.
-
-## Stage 3 - gated controlled hardware init
-
-Status: implemented on `sc8547-next`, Linux-v7.2 build-verified, **not
-hardware-validated**.
-
-Source commits:
-
-- `aa3c510` - initial gated reset/init/watchdog controls;
-- `29e6c6c` - role-safe profile handling and stricter fail-closed behavior;
+- `aa3c510` - gated reset/init/watchdog controls;
+- `29e6c6c` - role-safe profile handling/fail-closed tightening;
 - `17d7037a` - Linux v7.2 API/format compatibility.
 
-Documentation:
+Documentation: `docs/sc8547-experimental-control.md`.
 
-- `docs/sc8547-experimental-control.md`
-
-Experimental init exists only with:
+Requires:
 
 ```dts
 southchip,allow-experimental-control;
 ```
 
-It requires explicit raw protection bytes, keeps CP disabled, performs exact
-readback, and exposes watchdog control only after successful init.
+and explicit raw protection bytes. Init leaves CP off, verifies readback and
+only then marks `init_done`.
 
-### Test gate
+### Hardware gate
 
-After `apply_init`, CP must remain disabled, ADC must remain plausible, written
-protection bytes must read back exactly, no unexpected fault may appear, and
-normal PMIC/pmic-glink charging must remain functional.
+After init, CP stays off, ADC remains plausible, written bytes read back exactly,
+no unexpected fault appears and pmic-glink/basic charging still works.
 
 ## Stage 4 - manual single-pump control
 
-Status: implemented on `sc8547-next` in source commit `8033a03`, focused
-Linux-v7.2 `W=1` CI **passes**, but the stage remains **not hardware-validated**.
+Status: implemented in `8033a03`, focused Linux-v7.2 `W=1` passes,
+**not hardware-validated**.
 
-Documentation:
+Documentation: `docs/sc8547-stage4-manual-control.md` (`ffd115b` design commit).
 
-- `docs/sc8547-stage4-manual-control.md`
-- design commit `ffd115b`
-
-Stage 4 adds a second opt-in:
+Requires a second opt-in and explicit VBUS/VBAT authorization windows:
 
 ```dts
 southchip,allow-experimental-cp-enable;
 ```
 
-and requires explicit VBUS/VBAT authorization windows. There are no default
-voltage windows.
+Mode changes are masked and allowed only while off. Enable repeats Stage-4
+preflight, sets REG07[7], waits the vendor-derived 500 ms observation interval,
+requires switching and rechecks faults/voltage window. Failure clears enable.
 
-Implemented rules:
-
-- mode changes only `REG09[7]` and are refused while CP is enabled;
-- enable requires Stage-3 `init_done`, supported silicon, complete window,
-  adapter/battery presence, no blocking fault and in-window ADC values;
-- enable changes only `REG07[7]`;
-- after 500 ms the driver requires `REG06[2]` switching state and rechecks
-  faults/voltage window;
-- failed post-enable validation immediately clears `REG07[7]`;
-- disable is fail-closed and intentionally less restrictive;
-- no USB source negotiation or automatic fast-charge policy exists.
-
-### Test gate
+### Hardware gate
 
 Primary and secondary must each pass repeated controlled single-pump tests
-separately before any dual-pump write path is considered safe.
+independently before Stage 5B is considered safe to test.
 
-## Stage 5A - dual-pump pairing and aggregate telemetry
+## Stage 5A - virtual pair and aggregate telemetry
 
-Status: implemented on `sc8547-next`, focused Linux-v7.2 `W=1` CI **passes**,
-not hardware-validated.
+Status: implemented, focused Linux-v7.2 `W=1` passes, hardware validation
+pending.
 
-Architecture/documentation:
+Architecture/documentation: `docs/sc8547-stage5-dual-coordinator.md`.
 
-- `docs/sc8547-stage5-dual-coordinator.md`
-- `1801dae` - align documentation to a separate virtual coordinator node.
+Initial read-only source/build series:
 
-Source/build commits:
-
-- `18581b0` - add read-only `sc8547_dual` platform coordinator;
+- `18581b0` - read-only `sc8547_dual` platform coordinator;
 - `ec05245` - build `sc8547_dual.ko`;
-- `6986e8c` - require physical primary/secondary role match;
-- `edf0998` - focused CI builds both `sc8547_cp.ko` and `sc8547_dual.ko`.
+- `6986e8c` - validate primary/secondary roles;
+- `edf0998` - focused CI builds both charging modules.
 
-Stage 5A mirrors the downstream virtual-CP layering with a separate DT node:
+The coordinator is a separate virtual node, matching the downstream virtual-CP
+layering concept:
 
 ```dts
 charge-pump-coordinator {
@@ -231,96 +176,128 @@ charge-pump-coordinator {
 };
 ```
 
-The coordinator resolves the two I2C clients through phandles, requires them to
-be distinct, bound to the `sc8547` physical driver and labelled `primary` /
-`secondary`, then exposes only read-only paired telemetry:
+Later refactor `7caaee0` moved Stage-5A state reads onto the shared physical
+API, so the virtual layer no longer duplicates SC8547 register interpretation.
 
-- peer identity/ID/variant label;
-- per-pump enable/switching/mode/fault and VBUS/VBAT/IBUS snapshot;
-- arithmetic aggregate IBUS.
+### Hardware gate
 
-Stage 5A performs no protection/mode/watchdog/CP-enable write.
-
-### Test gate
-
-With both pumps disabled, validate the coordinator node, physical-device
-identity, both ADC sets and exact aggregate-IBUS arithmetic unplugged and on a
-normal 5 V source. Confirm register snapshots are unchanged merely by loading
-and reading `sc8547_dual.ko`.
+With both pumps off, verify peer identity, both snapshots, aggregate IBUS and
+that loading/reading the virtual module causes no physical register changes.
 
 ## Stage 5B - gated dual-pump coordinator
 
-Status: design documented; next source work is to expose a small shared safety
-API from the physical driver before adding any coordinator write control.
+Status: **implemented and focused Linux-v7.2 `W=1` build-verified**, but
+**not hardware-validated** and must remain on `sc8547-next` until both pumps pass
+Stage 4 independently.
 
-Rules:
+Documentation: `docs/sc8547-stage5-dual-coordinator.md`.
 
-- a third explicit opt-in belongs to the **virtual coordinator node** before
-  dual-start controls appear;
-- coordinator must call the same physical-driver preflight/enable/post-check/
-  disable helpers used by Stage 4 rather than duplicating raw SMBus writes;
-- both devices must have Stage-3 init complete and Stage-4 authorization ready;
-- both preflights must pass before the first enable write;
-- primary (downstream `main_cp = <0>`) starts first and must reach validated
-  switching state before secondary starts;
-- secondary starts second and must independently pass post-enable validation;
-- if secondary fails, disable secondary and primary;
-- dual stop disables secondary first, then primary;
-- first implementation has no degraded one-pump fallback;
-- no PD/PPS/VOOC/UFCS policy is introduced.
+Shared physical API series:
 
-The shared physical-driver API refactor itself should preserve Stage-4 behavior
-and may be compiled/reviewed independently before the coordinator receives any
-new writable attribute.
+- `60cb97e` - introduce `charging/sc8547_api.h`;
+- `e854be9` - keep the API opaque from physical private structures;
+- `9b29a00` - physical driver exports shared state/mode/preflight/enable/disable
+  helpers and Stage-4 sysfs uses the same safety implementation;
+- `3cbdb91` - document the shared API contract;
+- `7caaee0` - virtual telemetry consumes the shared state API.
+
+Coordinator write implementation:
+
+- `25d0e27` - add gated dual work-mode and dual enable/disable coordination;
+- `0c92c3a` - document the implemented Stage-5B test/rollback contract.
+
+Writable virtual controls require the third opt-in:
+
+```dts
+southchip,allow-experimental-dual-cp;
+```
+
+Rules implemented:
+
+- `work_mode` updates primary then secondary through the physical API while both
+  are initialized/authorized/off; failure before enable performs best-effort
+  mode rollback;
+- dual start requires both initial states ready and modes matching;
+- both physical Stage-4 preflights pass before the first enable;
+- primary starts first and completes its own 500 ms post-enable validation;
+- secondary starts only after primary is validated;
+- secondary/final validation failure disables secondary then primary;
+- explicit stop disables secondary then primary and attempts both even if the
+  first returns an error;
+- virtual driver remove/shutdown performs best-effort dual stop when Stage-5B
+  opt-in is present;
+- no degraded one-pump fallback in the first implementation;
+- no PD/PPS/VOOC/UFCS policy.
+
+Focused CI for `25d0e27` passed building both `sc8547_cp.ko` and
+`sc8547_dual.ko` against torvalds Linux v7.2 with `W=1`.
+
+### Hardware gate
+
+Do not test dual start until each pump passes Stage 4. Then test one already
+validated ratio with a controlled source: verify primary validated switching
+precedes secondary, both are fault-free/in-window after start, and stop returns
+both to off. Test refusal paths by removing authorization, not by deliberately
+creating electrical OVP/OCP/thermal faults.
 
 ## Stage 6 - USB-PD/PPS policy integration
 
-Planned only after dual-pump hardware operation is stable.
+Status: research/design next. No automatic policy code should be written until
+we know which mainline Qualcomm/USB-C interfaces on Caihong can safely request
+and observe PD/PPS contracts.
 
-Goals:
+Planned work:
 
-- negotiate source voltage/current before CP start;
-- coordinate requested VBUS with battery voltage and 2:1/bypass mode;
-- ramp current instead of immediately requesting the final level;
-- continuously handle thermal/fault/input-collapse conditions;
-- fall back to normal PMIC charging on failure.
+1. inventory current mainline `pmic-glink`, USB Type-C/TCPM and power-supply
+   interfaces available on SM8650/Caihong;
+2. determine whether PPS contract requests are exposed in-kernel or require a
+   missing platform bridge;
+3. define source-contract ownership so SC8547 code never changes VBUS without
+   a confirmed source contract;
+4. define a low-current/low-voltage ramp state machine with explicit fallback
+   to normal PMIC charging;
+5. keep the policy in a separate layer above the physical and virtual CP
+   drivers;
+6. only after design/compile review consider development-only automatic policy
+   code.
 
 ## Stage 7 - proprietary protocol work
 
-Optional/later. VOOC/SuperVOOC/UFCS blocks remain separate from generic CP
-bring-up and require their own design/review/testing.
+Optional/later. VOOC/SuperVOOC/UFCS remains a separate protocol layer with its
+own review and test gates.
 
 ## Suggested cherry-pick sequence
 
-When hardware testing becomes available, move changes to `main` in this order:
+When hardware testing is available:
 
-1. `60c230c` - Stage 1 variant/snapshot support;
-2. `bc553aa`, then `f15fb5a` - Stage 2 protection decode/include fix;
-3. `aa3c510`, `29e6c6c`, `17d7037a` - Stage 3 source series, only after Stage
-   0-2 data review;
-4. `8033a03` - Stage 4 manual single-pump control, only after Stage 3 passes on
-   hardware;
-5. Stage 5A source/build series: `18581b0`, `ec05245`, `6986e8c` (plus relevant
-   documentation; CI-only `edf0998` is optional for local cherry-picks);
-6. Stage 5B shared-API/coordinator commit(s), only after both single pumps pass
-   Stage 4;
-7. Stage 6 PD/PPS integration.
+1. `60c230c` - Stage 1;
+2. `bc553aa`, `f15fb5a` - Stage 2;
+3. `aa3c510`, `29e6c6c`, `17d7037a` - Stage 3 after Stage 0-2 review;
+4. `8033a03` - Stage 4 only after Stage 3 hardware pass;
+5. Stage-5A read-only series `18581b0`, `ec05245`, `6986e8c` if you want the
+   original no-API telemetry checkpoint;
+6. for the current shared-API/Stage-5B line: `60cb97e`, `e854be9`, `9b29a00`,
+   `3cbdb91`, `7caaee0`, then `25d0e27` (plus documentation as desired);
+7. do not cherry-pick `25d0e27` to `main` until both single pumps pass Stage 4;
+8. Stage 6 only after dual hardware validation.
 
-Documentation-only and CI-only commits may be cherry-picked earlier.
-Never promote a write-capable stage solely because it compiles.
+Temporary one-shot refactor tooling used to generate `9b29a00` was removed and
+is not part of the recommended cherry-pick set. CI-only commits are optional
+for a local test branch.
 
 ## Build verification
 
-The focused workflow clones torvalds Linux v7.2 and builds the charging modules
-with `W=1`. It is the charging workstream's compile gate while unrelated
-pogo/touchscreen code remains independent.
+The focused workflow clones torvalds Linux v7.2 and builds both charging
+modules with `W=1`:
 
-- original focused CI definition: `4a0df97`;
-- Stage-4 source `8033a03`: `sc8547_cp.ko` focused v7.2 build passed;
-- Stage-5A CI update `edf0998`: focused build now checks both
-  `sc8547_cp.ko` and `sc8547_dual.ko`;
-- Stage-5A head including role validation (`6986e8c`) passed that focused build.
+```text
+sc8547_cp.ko
+sc8547_dual.ko
+```
 
-The repository-wide Linux-v7.2 workflow may still fail on unrelated
-pogo/touchscreen compilation issues. The exact Caihong Linux 7.2 configuration
-and real tablet remain the final target compile/hardware environment.
+Stage 4, Stage 5A and current Stage 5B all pass this focused compile gate. The
+repo-wide workflow can still fail on independent pogo/touchscreen code and is
+not the charging workstream's status signal.
+
+The exact Caihong Linux 7.2 configuration and real tablet remain the final
+compile/hardware environment.
