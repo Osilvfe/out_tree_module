@@ -1,4 +1,4 @@
-name: SC8547 module build
+name: SC8547 Linux v7.2 build
 
 on:
   push:
@@ -16,22 +16,33 @@ on:
       - ".github/workflows/sc8547-build.yml"
 
 jobs:
-  build-sc8547:
+  build-sc8547-v7-2:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install kernel headers
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-headers-generic
+          sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev
 
-      - name: Build SC8547 module with warnings enabled
+      - name: Prepare Linux v7.2
         shell: bash
         run: |
           set -euo pipefail
-          KDIR="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n1)"
-          test -n "$KDIR"
-          echo "KDIR=$KDIR"
-          make -C "$KDIR" M="$GITHUB_WORKSPACE" W=1 sc8547_cp.ko
+          git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
+          make -C "$RUNNER_TEMP/linux" defconfig
+          "$RUNNER_TEMP/linux/scripts/config" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          make -C "$RUNNER_TEMP/linux" olddefconfig
+          make -C "$RUNNER_TEMP/linux" -j"$(nproc)" prepare modules_prepare
+
+      - name: Build only SC8547 with warnings enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C "$RUNNER_TEMP/linux" \
+            M="$GITHUB_WORKSPACE" \
+            W=1 \
+            KBUILD_MODPOST_WARN=1 \
+            sc8547_cp.ko
