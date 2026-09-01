@@ -17,6 +17,7 @@
 #include <linux/sysfs.h>
 
 #include "sc8547_api.h"
+#include "sc8547_dual_api.h"
 
 enum sc8547_dual_result {
 	SC8547_DUAL_NEVER_RUN,
@@ -169,6 +170,41 @@ err_put:
 	sc8547_dual_put_clients(*primary, *secondary);
 	return ret;
 }
+
+static struct sc8547_dual *
+sc8547_dual_from_pdev(struct platform_device *pdev)
+{
+	if (!pdev || !pdev->dev.driver ||
+	    strcmp(pdev->dev.driver->name, "sc8547-dual"))
+		return NULL;
+
+	return platform_get_drvdata(pdev);
+}
+
+int sc8547_dual_get_state(struct platform_device *pdev,
+			  struct sc8547_dual_state *state)
+{
+	struct sc8547_dual *dual = sc8547_dual_from_pdev(pdev);
+	struct i2c_client *primary, *secondary;
+	int ret;
+
+	if (!dual || !state)
+		return -ENODEV;
+
+	mutex_lock(&dual->lock);
+	ret = sc8547_dual_get_states(dual, &primary, &secondary,
+				     &state->primary, &state->secondary);
+	if (ret)
+		goto out;
+
+	state->aggregate_ibus_ua = state->primary.ibus_ua +
+				   state->secondary.ibus_ua;
+	sc8547_dual_put_clients(primary, secondary);
+out:
+	mutex_unlock(&dual->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sc8547_dual_get_state);
 
 static bool sc8547_dual_state_ready(const struct sc8547_state *state)
 {
