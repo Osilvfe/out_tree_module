@@ -712,14 +712,14 @@ static ssize_t protection_state_show(struct device *dev,
 				     "ibus_ucp_deglitch_us=unknown_for_variant\n");
 	len += sysfs_emit_at(buf, len,
 		"ss_timeout_code=%u pmid2out_uvp_code=%u pmid2out_ovp_code=%u\n",
-		FIELD_GET(SC8547_SS_TIMEOUT_MASK, r08),
-		FIELD_GET(SC8547_PMID2OUT_UVP_MASK, r0d),
-		FIELD_GET(SC8547_PMID2OUT_OVP_MASK, r0d));
+		(unsigned int)FIELD_GET(SC8547_SS_TIMEOUT_MASK, r08),
+		(unsigned int)FIELD_GET(SC8547_PMID2OUT_UVP_MASK, r0d),
+		(unsigned int)FIELD_GET(SC8547_PMID2OUT_OVP_MASK, r0d));
 	if (watchdog_ms >= 0)
 		len += sysfs_emit_at(buf, len, "watchdog_ms=%d\n", watchdog_ms);
 	else
 		len += sysfs_emit_at(buf, len, "watchdog_ms=reserved_code_%u\n",
-				     FIELD_GET(SC8547_WATCHDOG_MASK, r09));
+				     (unsigned int)FIELD_GET(SC8547_WATCHDOG_MASK, r09));
 	len += sysfs_emit_at(buf, len,
 		"note=header_* values are vendor-header decodes, not yet hardware-validated thresholds\n");
 
@@ -1025,7 +1025,7 @@ static ssize_t watchdog_ms_show(struct device *dev,
 	ret = sc8547_watchdog_ms(reg);
 	if (ret < 0)
 		return sysfs_emit(buf, "reserved_code_%u\n",
-				  FIELD_GET(SC8547_WATCHDOG_MASK, reg));
+				  (unsigned int)FIELD_GET(SC8547_WATCHDOG_MASK, reg));
 
 	return sysfs_emit(buf, "%d\n", ret);
 }
@@ -1134,7 +1134,7 @@ static int sc8547_probe(struct i2c_client *client)
 	sc->psy_desc.num_properties = ARRAY_SIZE(sc8547_psy_props);
 	sc->psy_desc.get_property = sc8547_psy_get_property;
 	psy_cfg.drv_data = sc;
-	psy_cfg.of_node = client->dev.of_node;
+	psy_cfg.fwnode = dev_fwnode(&client->dev);
 
 	sc->psy = devm_power_supply_register(&client->dev, &sc->psy_desc, &psy_cfg);
 	if (IS_ERR(sc->psy))
