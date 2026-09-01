@@ -20,6 +20,9 @@ instead of merging the whole development branch.
   charge-pump control.
 - Documentation is written before or together with each write-capable stage so
   the test and merge contract does not depend on unwritten context.
+- Focused Linux-v7.2 `W=1` CI is the compile gate for charging changes; the
+  repository-wide build may still fail because pogo/touchscreen are separate
+  workstreams.
 
 ## Hardware topology
 
@@ -36,14 +39,16 @@ ocp_reg = <0xb>;
 ovp_reg = <0x36>;
 ```
 
-The downstream virtual charge-pump layer connects the two devices in parallel
-and assigns a 3000 mA input-current budget to each path.
+The downstream virtual charge-pump layer connects the two devices in parallel,
+uses CP index 0 as the main CP, and assigns a nominal 3000 mA input-current
+budget to each path. These values are reverse-engineering evidence only and are
+not automatic limits/requests in the standalone driver.
 
 ## Important silicon compatibility rule
 
 SC8547 and SC8547A share the core charge-pump and ADC data map used by this
-port. In particular, VBUS/IBUS/VBAT/VOUT/VAC/TDIE data locations and scales are
-shared in the Oplus source.
+port. VBUS/IBUS/VBAT/VOUT/VAC/TDIE data locations and scales are shared in the
+Oplus source.
 
 They are **not** register-for-register identical for control programming.
 Known differences include the `REG05` IBUS-UCP deglitch field and downstream
@@ -61,31 +66,26 @@ experimental write path until its control compatibility is established.
 
 Do not infer electrical thresholds from downstream comments alone.
 
-The common Oplus SC8547 header describes BAT_OVP (`REG00[5:0]`) as:
+The common Oplus SC8547 header describes BAT_OVP (`REG00[5:0]`) as 3500 mV +
+25 mV/code. Under that definition code `0x36` decodes to 4850 mV, while some
+downstream comments near the project configuration describe 4.65 V.
 
-- base: 3500 mV
-- step: 25 mV
+The common header describes the low nibble of `REG05` as 1200 mA +
+300 mA/code. Project code `0x0b` therefore decodes to 4500 mA by that formula,
+while some downstream comments describe 3.6 A.
 
-Under that definition code `0x36` would decode to 4850 mV. Some downstream
-source comments near the same configuration state 4.65 V instead.
-
-A second example exists for IBUS OCP: the common header describes the low
-nibble of `REG05` as 1200 mA + code * 300 mA. Project code `0x0b` therefore
-decodes to 4500 mA by that header formula, while some nearby downstream source
-comments describe 3.6 A. These discrepancies are preserved as evidence rather
-than silently resolved.
-
-Because the source comments, encoded project values, and header formulas are
-not fully self-consistent, the development driver keeps raw values visible and
-does not automatically derive a protection profile from the project values.
+These discrepancies are preserved as evidence rather than silently resolved.
+The development driver keeps raw values visible and does not automatically
+derive a protection profile from project `ovp_reg`/`ocp_reg` values.
 
 ## Stage 0 - baseline telemetry
 
-Status: implemented on `main`.
+Status: implemented on `main`, not yet hardware-validated in this development
+cycle.
 
-Writes performed automatically:
+Automatic write:
 
-- ADC enable only (`REG11[7]`)
+- ADC enable only (`REG11[7]`).
 
 Features:
 
@@ -98,46 +98,25 @@ Features:
 
 ### Test gate
 
-For both `0x6f` devices verify:
-
-1. probe succeeds without I2C errors;
-2. primary ID is plausibly SC8547A (`0x67` expected from downstream);
-3. voltage/current/temperature data are plausible;
-4. `charge_enabled` remains off unless firmware/downstream left it on;
-5. status/fault bits are plausible with charger unplugged and plugged.
-
-Only after this gate should Stage 0 be considered device-verified.
+For both `0x6f` devices verify stable probe, plausible primary ID (`0x67`
+expected for SC8547A), plausible ADC values, sensible status/fault bits, and no
+unexpected CP activity.
 
 ## Stage 1 - variant model and register snapshot
 
 Status: implemented on `sc8547-next`.
 
-Primary source commit:
+Source commit:
 
 - `60c230c` - variant model, runtime-ID warning, masked helpers and read-only
   register snapshot.
-
-New behavior:
-
-- explicit SC8547/SC8547A/SC8547D/unknown variant model;
-- DT-compatible versus runtime-ID mismatch warning;
-- read-only `variant` attribute;
-- read-only common-register dump;
-- internal masked helpers for ADC/CP/mode control.
 
 No new automatic CP/protection write is introduced.
 
 ### Test gate
 
-Read for both devices:
-
-```sh
-cat /sys/bus/i2c/devices/<bus>-006f/sc8547/variant
-cat /sys/bus/i2c/devices/<bus>-006f/sc8547/register_dump
-```
-
-Save both dumps with charger unplugged and with a normal 5 V source attached.
-This provides the reference state for later protection/control stages.
+Capture `variant` and `register_dump` for both devices unplugged and with a
+normal 5 V source attached.
 
 ## Stage 2 - protection model, decode only
 
@@ -146,187 +125,148 @@ Status: implemented on `sc8547-next`.
 Source commits:
 
 - `bc553aa` - read-only protection decode;
-- `f15fb5a` - explicit bitfield-helper include so the decode commit does not
-  rely on indirect includes.
+- `f15fb5a` - explicit bitfield-helper include.
 
-New read-only attribute:
+`protection_state` reports raw protection registers together with clearly
+labelled vendor-header formula decodes. It does not claim those formulas are
+electrically validated on Caihong.
 
-```sh
-cat /sys/bus/i2c/devices/<bus>-006f/sc8547/protection_state
-```
-
-It reports:
-
-- raw `REG00/01/02/04/05/08/09/0d` values;
-- BAT OVP code and vendor-header formula result;
-- BAT OCP code and vendor-header formula result;
-- AC/VBUS OVP codes and vendor-header formula results;
-- IBUS UCP/OCP enable state;
-- IBUS OCP code and vendor-header formula result;
-- variant-aware IBUS-UCP deglitch time for known SC8547/SC8547A layouts;
-- soft-start timeout code;
-- PMID2OUT UVP/OVP codes;
-- watchdog timeout code.
-
-Every calculated threshold is labelled `header_*` or `header_formula_*` in the
-sysfs output. This is deliberate: it means "decoded using the Oplus header",
-not "electrically confirmed on this board".
-
-No new automatic write is introduced in Stage 2.
+No new automatic write is introduced.
 
 ### Test gate
 
-Compare `protection_state` against:
-
-- the same device's `register_dump`;
-- downstream kernel register dump if available;
-- unplugged versus normal-5-V-source state.
-
-Specifically record whether the device actually contains project values related
-to `0x36` and `0x0b`, and whether primary/secondary differ after boot.
-
-Any decode with contradictory vendor definitions remains labelled ambiguous
-instead of being treated as authoritative.
+Compare `protection_state` against the same device's `register_dump`, any
+available downstream register dump, and unplugged/5-V states.
 
 ## Stage 3 - gated controlled hardware init
 
-Status: implemented on `sc8547-next`, **not hardware-validated**.
+Status: implemented on `sc8547-next`, Linux-v7.2 build-verified, **not
+hardware-validated**.
 
-Source commits in development history:
+Source commits:
 
-- `aa3c510` - initial gated experimental reset/init/watchdog controls;
-- `29e6c6c` - role-safe profile handling, optional primary-only fields,
-  telemetry-only shutdown safety, SC8547D/unknown write rejection;
-- `17d7037a` - Linux v7.2 `power_supply` API and strict-format compatibility.
+- `aa3c510` - initial gated reset/init/watchdog controls;
+- `29e6c6c` - role-safe profile handling and stricter fail-closed behavior;
+- `17d7037a` - Linux v7.2 API/format compatibility.
 
-Stage-3 interface documentation:
+Documentation:
 
 - `docs/sc8547-experimental-control.md`
-- latest alignment commit in the current history: `d6509c6`
 
-The experimental controls exist only with:
+Experimental init exists only with:
 
 ```dts
 southchip,allow-experimental-control;
 ```
 
-Without that property the device remains telemetry-only apart from ADC enable.
-
-Stage 3 requires explicit raw values for `REG00/02/04/05`; `REG01` and `REG0d`
-are optional because primary and secondary vendor init sequences are not
-identical. It does not synthesize a profile from downstream `ovp_reg`/`ocp_reg`
-project values.
-
-`apply_init`:
-
-1. accepts only SC8547/SC8547A control variants;
-2. fails closed before and after reset;
-3. writes only explicitly supplied generic protection registers;
-4. leaves CP disabled and watchdog disabled;
-5. enables ADC;
-6. reads every written register back;
-7. marks init complete only after exact readback.
-
-Stage 3 also exposes masked watchdog control after successful init, but still
-has **no writable CP-enable or charge-mode interface**.
+It requires explicit raw protection bytes, keeps CP disabled, performs exact
+readback, and exposes watchdog control only after successful init.
 
 ### Test gate
 
-After init and before any Stage-4 code is considered device-safe:
-
-1. CP remains disabled;
-2. ADC remains functional;
-3. no unexpected fault bits are asserted;
-4. raw protection registers match the explicitly requested profile;
-5. omitted optional registers were not intentionally overwritten;
-6. basic PMIC/pmic-glink charging still works.
+After `apply_init`, CP must remain disabled, ADC must remain plausible, written
+protection bytes must read back exactly, no unexpected fault may appear, and
+normal PMIC/pmic-glink charging must remain functional.
 
 ## Stage 4 - manual single-pump control
 
-Status: interface/test plan documented; source implementation is the next code
-stage and must remain development-only until Stage 3 passes real hardware.
+Status: implemented on `sc8547-next` in source commit `8033a03`, focused
+Linux-v7.2 `W=1` CI **passes**, but the stage remains **not hardware-validated**.
 
-Design document:
+Documentation:
 
 - `docs/sc8547-stage4-manual-control.md`
-- initial design commit: `ffd115b`
+- design commit `ffd115b`
 
-Stage 4 adds a **second** opt-in:
+Stage 4 adds a second opt-in:
 
 ```dts
 southchip,allow-experimental-cp-enable;
 ```
 
-It also requires explicit VBUS/VBAT authorization windows. There are no default
+and requires explicit VBUS/VBAT authorization windows. There are no default
 voltage windows.
 
-Planned rules:
+Implemented rules:
 
-- `work_mode` changes only `REG09[7]`, only while CP is disabled;
-- `cp_enable=1` requires Stage-3 `init_done`;
-- supported silicon only;
-- valid configured VBUS/VBAT safety window;
-- adapter and battery present;
-- no blocking thermal/OVP/OCP/UCP/VBUS-error status;
-- ADC VBUS/VBAT inside the configured window;
+- mode changes only `REG09[7]` and are refused while CP is enabled;
+- enable requires Stage-3 `init_done`, supported silicon, complete window,
+  adapter/battery presence, no blocking fault and in-window ADC values;
 - enable changes only `REG07[7]`;
-- after the vendor-derived 500 ms observation interval, `REG06[2]` must report
-  switching and no new blocking fault may be present;
-- failure immediately clears `REG07[7]`;
-- disable remains straightforward and fail-closed.
+- after 500 ms the driver requires `REG06[2]` switching state and rechecks
+  faults/voltage window;
+- failed post-enable validation immediately clears `REG07[7]`;
+- disable is fail-closed and intentionally less restrictive;
+- no USB source negotiation or automatic fast-charge policy exists.
 
-No USB source negotiation or automatic charging policy exists in Stage 4.
-Only one pump is to be tested at a time.
+### Test gate
 
-### Test order
+Primary and secondary must each pass repeated controlled single-pump tests
+separately before any dual-pump write path is considered safe.
 
-1. secondary disabled, primary only;
-2. verify 2:1 mode at a controlled input voltage/current;
-3. disable primary and verify clean stop;
-4. repeat on secondary independently;
-5. only then proceed to dual-pump coordination.
+## Stage 5A - dual-pump pairing and aggregate telemetry
 
-## Stage 5 - dual-pump coordinator
+Status: next implementation stage.
 
-Planned after both individual pumps pass Stage 4.
+This sub-stage is deliberately **read-only** with respect to new dual-pump
+behavior. It introduces explicit primary/secondary pairing and aggregate state
+without adding a dual-start operation.
 
 Goals:
 
-- primary/secondary relationship;
-- ordered enable/disable;
-- aggregate telemetry;
-- per-pump fault handling;
-- fail closed to one pump or no pump as appropriate;
-- no VOOC dependency.
+- pair exactly one primary with exactly one secondary using an explicit
+  development-only DT relationship;
+- expose peer identity/variant/role;
+- expose both pumps' enable/switching/fault state together;
+- expose VBUS/VBAT and per-pump IBUS side-by-side;
+- expose aggregate IBUS as a diagnostic sum only;
+- require both devices to be bound to this driver before reporting the pair as
+  ready;
+- perform no new protection/mode/enable writes.
 
-The downstream project models the two pumps as parallel paths with a nominal
-3000 mA input-current budget per path. That value is evidence, not permission
-to immediately request 6 A from an arbitrary power source.
+Stage 5A may be hardware-tested before Stage 4 dual operation because it does
+not start either pump.
+
+## Stage 5B - gated dual-pump coordinator
+
+Status: planned after Stage 5A implementation; development-only until both
+pumps individually pass Stage 4.
+
+Goals/rules:
+
+- third explicit opt-in on the primary before dual-start controls appear;
+- both devices must have Stage-3 init complete and Stage-4 control authorized;
+- both must use the same requested work mode;
+- both preflights must pass before the first enable write;
+- primary (downstream `main_cp = <0>`) starts first and must reach validated
+  switching state before secondary is started;
+- secondary starts second and must independently pass its post-enable check;
+- if secondary fails, immediately disable secondary and primary;
+- dual stop disables secondary first, then primary;
+- any detected blocking fault during an explicit coordinator status check
+  causes a fail-closed stop of both pumps;
+- no automatic fallback to one-pump charging in the first implementation;
+- no PD/PPS/VOOC/UFCS policy is introduced.
+
+A later, separately reviewed revision may consider graceful one-pump fallback,
+but first bring-up should prefer deterministic shutdown over degraded charging.
 
 ## Stage 6 - USB-PD/PPS policy integration
 
-Planned after dual-pump operation is stable.
+Planned only after dual-pump hardware operation is stable.
 
 Goals:
 
-- connect CP control to ordinary USB-PD/PPS negotiation;
-- request source voltage/current before starting a direct-charge path;
-- coordinate battery voltage, requested VBUS and CP ratio;
-- ramp current rather than immediately requesting the final level;
+- negotiate source voltage/current before CP start;
+- coordinate requested VBUS with battery voltage and 2:1/bypass mode;
+- ramp current instead of immediately requesting the final level;
 - continuously handle thermal/fault/input-collapse conditions;
 - fall back to normal PMIC charging on failure.
 
-This stage is where the driver becomes useful for non-proprietary high-power
-charging rather than only laboratory CP control.
-
 ## Stage 7 - proprietary protocol work
 
-Optional/later.
-
-Primary SC8547A contains VOOC/DPDM and UFCS-related functionality in the Oplus
-source. These protocol blocks are deliberately not required for the generic
-charge-pump driver. If ported, they should be separate layers with separate
-review/testing.
+Optional/later. VOOC/SuperVOOC/UFCS blocks remain separate from generic CP
+bring-up and require their own design/review/testing.
 
 ## Suggested cherry-pick sequence
 
@@ -334,41 +274,28 @@ When hardware testing becomes available, move changes to `main` in this order:
 
 1. `60c230c` - Stage 1 variant/snapshot support;
 2. `bc553aa`, then `f15fb5a` - Stage 2 protection decode/include fix;
-3. Stage 3 source series (`aa3c510`, `29e6c6c`, `17d7037a`) only after Stage
-   0-2 data have been reviewed; if cherry-picking the historical series rather
-   than a future squashed commit, preserve this order;
-4. Stage 4 manual-control commit(s) only after Stage 3 passes the hardware gate;
-5. Stage 5 dual-pump coordinator;
-6. Stage 6 PD/PPS integration.
+3. `aa3c510`, `29e6c6c`, `17d7037a` - Stage 3 source series, only after Stage
+   0-2 data review;
+4. `8033a03` - Stage 4 manual single-pump control, only after Stage 3 passes on
+   hardware;
+5. Stage 5A pairing/aggregate-telemetry commit(s);
+6. Stage 5B coordinator commit(s), only after both single pumps pass Stage 4;
+7. Stage 6 PD/PPS integration.
 
-Documentation-only commits may be cherry-picked at any time.
-
-Never cherry-pick a later control stage merely because it compiles; each stage
-assumes the previous hardware gate has passed.
+Documentation-only and CI-only commits may be cherry-picked earlier.
+Never promote a write-capable stage solely because it compiles.
 
 ## Build verification
 
-The repository contains two CI paths:
+The repository has a focused SC8547 workflow that clones torvalds Linux v7.2
+and builds only `sc8547_cp.ko` with `W=1`. This is the charging workstream's
+compile gate while unrelated pogo/touchscreen code remains independent.
 
-1. the existing full out-of-tree build against torvalds Linux v7.2;
-2. a focused SC8547-only Linux v7.2 `W=1` workflow, added so unrelated
-   touchscreen/pogo build failures cannot hide charging-driver status.
+- CI definition commit: `4a0df97`.
+- Stage-4 source commit `8033a03`: focused Linux-v7.2 `W=1` run passed.
+- The repository-wide Linux-v7.2 workflow for the same commit still fails on
+  unrelated pogo/touchscreen compilation issues; that does not change the
+  focused SC8547 result.
 
-The first v7.2 full-module run exposed two SC8547-specific compatibility issues:
-
-- strict `%u` formatting of `FIELD_GET()` results;
-- `power_supply_config.of_node` removal in favor of `fwnode`.
-
-Both were fixed in `17d7037a`.
-
-The full-module workflow can still fail on existing touchscreen/pogo warnings or
-APIs; those failures are outside the charging workstream. The focused workflow
-is the authoritative compile signal for `charging/sc8547.c` while those modules
-remain independent.
-
-Focused Linux-v7.2 CI definition commit:
-
-- `4a0df97` - clone Linux v7.2 and build only `sc8547_cp.ko` with `W=1`.
-
-The exact Caihong Linux 7.2 kernel configuration/tree remains the final target
-compile environment and must still be tested locally when available.
+The exact Caihong Linux 7.2 configuration/tree remains the final target compile
+and hardware environment.
