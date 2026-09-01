@@ -45,4 +45,4 @@ jobs:
             M="$GITHUB_WORKSPACE" \
             W=1 \
             KBUILD_MODPOST_WARN=1 \
-            sc8547_cp.ko sc8547_dual.ko
+            sc8547_cp.ko sc8547_dual.ko sc8547_policy_diag.ko
