@@ -6,6 +6,9 @@ nt36532e_ts-y := touchscreen/nt36532e.o
 obj-m += oneplus_pogo.o
 oneplus_pogo-y := pogo/oneplus_pogo.o
 
+obj-m += sc8547_cp.o
+sc8547_cp-y := charging/sc8547.o
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 .PHONY: all clean
