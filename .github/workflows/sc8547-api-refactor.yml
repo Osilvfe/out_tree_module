@@ -1,0 +1,35 @@
+name: SC8547 one-shot API refactor
+
+on:
+  push:
+    branches:
+      - sc8547-next
+    paths:
+      - ".github/workflows/sc8547-api-refactor.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sc8547-next
+          fetch-depth: 0
+
+      - name: Apply exact refactor
+        run: python3 scripts/refactor_sc8547_shared_api.py
+
+      - name: Commit refactor
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add charging/sc8547.c
+          git diff --cached --exit-code && { echo "No refactor changes produced"; exit 1; } || true
+          git commit -m "Share SC8547 Stage 4 safety API"
+          git push origin HEAD:sc8547-next
