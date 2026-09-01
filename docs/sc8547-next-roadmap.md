@@ -206,50 +206,72 @@ separately before any dual-pump write path is considered safe.
 
 ## Stage 5A - dual-pump pairing and aggregate telemetry
 
-Status: next implementation stage.
+Status: implemented on `sc8547-next`, focused Linux-v7.2 `W=1` CI **passes**,
+not hardware-validated.
 
-This sub-stage is deliberately **read-only** with respect to new dual-pump
-behavior. It introduces explicit primary/secondary pairing and aggregate state
-without adding a dual-start operation.
+Architecture/documentation:
 
-Goals:
+- `docs/sc8547-stage5-dual-coordinator.md`
+- `1801dae` - align documentation to a separate virtual coordinator node.
 
-- pair exactly one primary with exactly one secondary using an explicit
-  development-only DT relationship;
-- expose peer identity/variant/role;
-- expose both pumps' enable/switching/fault state together;
-- expose VBUS/VBAT and per-pump IBUS side-by-side;
-- expose aggregate IBUS as a diagnostic sum only;
-- require both devices to be bound to this driver before reporting the pair as
-  ready;
-- perform no new protection/mode/enable writes.
+Source/build commits:
 
-Stage 5A may be hardware-tested before Stage 4 dual operation because it does
-not start either pump.
+- `18581b0` - add read-only `sc8547_dual` platform coordinator;
+- `ec05245` - build `sc8547_dual.ko`;
+- `6986e8c` - require physical primary/secondary role match;
+- `edf0998` - focused CI builds both `sc8547_cp.ko` and `sc8547_dual.ko`.
+
+Stage 5A mirrors the downstream virtual-CP layering with a separate DT node:
+
+```dts
+charge-pump-coordinator {
+    compatible = "southchip,sc8547-dual-experimental";
+    southchip,primary = <&cp_primary>;
+    southchip,secondary = <&cp_secondary>;
+};
+```
+
+The coordinator resolves the two I2C clients through phandles, requires them to
+be distinct, bound to the `sc8547` physical driver and labelled `primary` /
+`secondary`, then exposes only read-only paired telemetry:
+
+- peer identity/ID/variant label;
+- per-pump enable/switching/mode/fault and VBUS/VBAT/IBUS snapshot;
+- arithmetic aggregate IBUS.
+
+Stage 5A performs no protection/mode/watchdog/CP-enable write.
+
+### Test gate
+
+With both pumps disabled, validate the coordinator node, physical-device
+identity, both ADC sets and exact aggregate-IBUS arithmetic unplugged and on a
+normal 5 V source. Confirm register snapshots are unchanged merely by loading
+and reading `sc8547_dual.ko`.
 
 ## Stage 5B - gated dual-pump coordinator
 
-Status: planned after Stage 5A implementation; development-only until both
-pumps individually pass Stage 4.
+Status: design documented; next source work is to expose a small shared safety
+API from the physical driver before adding any coordinator write control.
 
-Goals/rules:
+Rules:
 
-- third explicit opt-in on the primary before dual-start controls appear;
-- both devices must have Stage-3 init complete and Stage-4 control authorized;
-- both must use the same requested work mode;
+- a third explicit opt-in belongs to the **virtual coordinator node** before
+  dual-start controls appear;
+- coordinator must call the same physical-driver preflight/enable/post-check/
+  disable helpers used by Stage 4 rather than duplicating raw SMBus writes;
+- both devices must have Stage-3 init complete and Stage-4 authorization ready;
 - both preflights must pass before the first enable write;
 - primary (downstream `main_cp = <0>`) starts first and must reach validated
-  switching state before secondary is started;
-- secondary starts second and must independently pass its post-enable check;
-- if secondary fails, immediately disable secondary and primary;
+  switching state before secondary starts;
+- secondary starts second and must independently pass post-enable validation;
+- if secondary fails, disable secondary and primary;
 - dual stop disables secondary first, then primary;
-- any detected blocking fault during an explicit coordinator status check
-  causes a fail-closed stop of both pumps;
-- no automatic fallback to one-pump charging in the first implementation;
+- first implementation has no degraded one-pump fallback;
 - no PD/PPS/VOOC/UFCS policy is introduced.
 
-A later, separately reviewed revision may consider graceful one-pump fallback,
-but first bring-up should prefer deterministic shutdown over degraded charging.
+The shared physical-driver API refactor itself should preserve Stage-4 behavior
+and may be compiled/reviewed independently before the coordinator receives any
+new writable attribute.
 
 ## Stage 6 - USB-PD/PPS policy integration
 
@@ -278,8 +300,10 @@ When hardware testing becomes available, move changes to `main` in this order:
    0-2 data review;
 4. `8033a03` - Stage 4 manual single-pump control, only after Stage 3 passes on
    hardware;
-5. Stage 5A pairing/aggregate-telemetry commit(s);
-6. Stage 5B coordinator commit(s), only after both single pumps pass Stage 4;
+5. Stage 5A source/build series: `18581b0`, `ec05245`, `6986e8c` (plus relevant
+   documentation; CI-only `edf0998` is optional for local cherry-picks);
+6. Stage 5B shared-API/coordinator commit(s), only after both single pumps pass
+   Stage 4;
 7. Stage 6 PD/PPS integration.
 
 Documentation-only and CI-only commits may be cherry-picked earlier.
@@ -287,15 +311,16 @@ Never promote a write-capable stage solely because it compiles.
 
 ## Build verification
 
-The repository has a focused SC8547 workflow that clones torvalds Linux v7.2
-and builds only `sc8547_cp.ko` with `W=1`. This is the charging workstream's
-compile gate while unrelated pogo/touchscreen code remains independent.
+The focused workflow clones torvalds Linux v7.2 and builds the charging modules
+with `W=1`. It is the charging workstream's compile gate while unrelated
+pogo/touchscreen code remains independent.
 
-- CI definition commit: `4a0df97`.
-- Stage-4 source commit `8033a03`: focused Linux-v7.2 `W=1` run passed.
-- The repository-wide Linux-v7.2 workflow for the same commit still fails on
-  unrelated pogo/touchscreen compilation issues; that does not change the
-  focused SC8547 result.
+- original focused CI definition: `4a0df97`;
+- Stage-4 source `8033a03`: `sc8547_cp.ko` focused v7.2 build passed;
+- Stage-5A CI update `edf0998`: focused build now checks both
+  `sc8547_cp.ko` and `sc8547_dual.ko`;
+- Stage-5A head including role validation (`6986e8c`) passed that focused build.
 
-The exact Caihong Linux 7.2 configuration/tree remains the final target compile
-and hardware environment.
+The repository-wide Linux-v7.2 workflow may still fail on unrelated
+pogo/touchscreen compilation issues. The exact Caihong Linux 7.2 configuration
+and real tablet remain the final target compile/hardware environment.
