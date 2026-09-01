@@ -1,13 +1,14 @@
 # SC8547 Stage 5 dual-pump coordinator
 
-This document defines the development-only dual-SC8547 bring-up plan for
-OnePlus Pad Pro (`caihong`). Stage 5 is split into a read-only virtual
-coordinator (5A) and a write-capable coordinator (5B).
+This document defines the development-only dual-SC8547 bring-up for OnePlus
+Pad Pro (`caihong`). Stage 5 is split into a read-only virtual coordinator (5A)
+and an explicitly gated write-capable coordinator (5B).
 
-The split is deliberate: pair discovery and aggregate diagnostics can be
-validated before there is any code that starts two charge pumps together.
+Neither stage is an automatic charging policy. Stage 5B is laboratory control
+only and must not be promoted to the stable/test branch merely because it
+compiles.
 
-## Downstream evidence and architecture choice
+## Downstream evidence and architecture
 
 Caihong downstream describes two parallel CP paths:
 
@@ -18,36 +19,43 @@ Caihong downstream describes two parallel CP paths:
 - downstream nominal input-current budget: 3000 mA for each CP.
 
 Downstream also represents the pair through a separate `virtual_cp` layer.
-Stage 5 follows that architectural idea: the two physical I2C devices remain
-independent, while a separate platform device references both of them.
+This port follows the same layering: physical I2C devices remain independent
+and a separate platform device references both of them.
 
-The standalone driver does not treat the downstream 3000 mA values as
-permission to draw 6 A and Stage 5 does not negotiate USB source voltage or
-current.
+The downstream 3000 mA values are recorded as evidence only. Stage 5 never
+requests 6 A, negotiates a source contract, or treats those values as generic
+safe limits.
 
-## Stage 5A: explicit pair + read-only aggregate telemetry
+## Physical-device prerequisites
 
-### DT relationship
-
-The two physical nodes remain normal SC8547-family devices:
+Each physical device uses the normal SC8547-family driver and its existing
+bring-up properties. Example labels:
 
 ```dts
 cp_secondary: charger@6f {
     compatible = "southchip,sc8547";
     reg = <0x6f>;
     southchip,role = "secondary";
-    /* Stage 0-4 development properties only when needed. */
+
+    /* Stage 3/4 experimental properties only when testing writes. */
 };
 
 cp_primary: charger@6f {
     compatible = "southchip,sc8547a";
     reg = <0x6f>;
     southchip,role = "primary";
-    /* Stage 0-4 development properties only when needed. */
+
+    /* Stage 3/4 experimental properties only when testing writes. */
 };
 ```
 
-A separate coordinator node identifies the pair:
+For Stage 5B, **both** physical nodes must independently have their Stage-3 raw
+profile, Stage-3 opt-in, Stage-4 opt-in and explicit VBUS/VBAT safety windows.
+The coordinator does not provide or override those per-chip safety parameters.
+
+## Stage 5A: explicit pair + aggregate telemetry
+
+The virtual node identifies the two physical devices by phandle:
 
 ```dts
 sc8547_dual: charge-pump-coordinator {
@@ -57,60 +65,51 @@ sc8547_dual: charge-pump-coordinator {
 };
 ```
 
-All three `southchip,*-experimental` concepts used in this development branch
-are local bring-up interfaces, not proposed upstream bindings.
+These `*-experimental` interfaces are local bring-up interfaces, not proposed
+upstream bindings.
 
-Phandles are used instead of bus-number/address assumptions because both chips
-use I2C address `0x6f` on different buses.
+Phandles are required because both chips use I2C address `0x6f` on different
+buses. The coordinator requires distinct clients, both bound to the `sc8547`
+physical driver, with exact `primary` and `secondary` role strings.
 
-The coordinator probe does not require both I2C clients to be available. Peer
-resolution occurs when telemetry is read, so the physical CP drivers continue
-to probe and expose baseline telemetry independently.
+### Stage-5A module and sysfs
 
-### Module and sysfs layout
-
-Stage 5A builds a separate module:
+The separate module is:
 
 ```text
 sc8547_dual.ko
 ```
 
-The coordinator platform device exposes:
+The platform device exposes:
 
 ```text
 /sys/bus/platform/devices/<coordinator>/sc8547_dual/
 ```
 
-Read-only attributes:
+Always-read-only attributes:
 
-- `peer`: physical device names, IDs and coarse silicon-variant labels;
-- `pair_state`: one snapshot containing enable/switching/mode/fault state and
-  VBUS/VBAT/IBUS for both pumps;
-- `aggregate_ibus_ua`: arithmetic sum of the two IBUS ADC values.
+- `peer`
+- `pair_state`
+- `aggregate_ibus_ua`
+- `last_result`
 
-The aggregate current is diagnostic only. It is not a current limit, a source
-request, battery current, or proof that the two parallel paths share current
-evenly.
+`pair_state` obtains both physical snapshots through the shared physical-driver
+API. It reports, per pump:
 
-### Pair validation
+- device ID and variant;
+- Stage-3 initialization state;
+- Stage-4 authorization state;
+- enable/switching/mode;
+- blocking-fault state;
+- VBUS/VBAT/IBUS.
 
-A Stage-5A pair is usable only when:
-
-1. both phandles resolve to I2C clients;
-2. the two phandles do not refer to the same device;
-3. both clients are currently bound to the `sc8547` physical driver;
-4. primary has `southchip,role = "primary"`;
-5. secondary has `southchip,role = "secondary"`;
-6. both clients respond to the common status/ADC register reads.
-
-If either physical device is unavailable/unbound, `peer` reports unavailable
-and the snapshot/current attributes fail rather than inventing data.
-
-Stage 5A performs no protection, mode, watchdog or CP-enable write.
+`aggregate_ibus_ua` is only the arithmetic sum of both IBUS ADC readings. It is
+not battery current, a source-current request, a limit, or proof of equal current
+sharing.
 
 ### Stage-5A test gate
 
-With both CPs disabled, load both modules and collect:
+With both CPs disabled:
 
 ```sh
 modprobe sc8547_cp
@@ -120,23 +119,42 @@ cd /sys/bus/platform/devices/<coordinator>/sc8547_dual
 cat peer
 cat pair_state
 cat aggregate_ibus_ua
+cat last_result
 ```
 
-Repeat unplugged and with a normal 5 V source. Verify that:
+Repeat unplugged and on a normal 5 V source. Confirm the correct physical pair,
+plausible ADC values and exact aggregate-current arithmetic. Loading/reading
+`sc8547_dual.ko` without Stage-5B opt-in must not create mode/enable controls or
+change physical register state.
 
-- the physical devices/buses correspond to the intended primary/secondary;
-- IDs/variant labels are plausible;
-- both ADC sets are plausible;
-- `aggregate_ibus_ua` equals the two displayed per-pump IBUS values summed;
-- no control/protection register changes merely from loading/reading the
-  coordinator.
+## Shared physical-driver safety API
 
-Stage 5A may be promoted independently because it adds no dual-pump write path.
+Stage 5B does **not** reproduce Stage-4 SMBus/register write logic. The physical
+`sc8547_cp` module exports a development-branch internal API declared in:
+
+```text
+charging/sc8547_api.h
+```
+
+The API provides:
+
+- structured state snapshot;
+- manual mode set while disabled;
+- Stage-4 preflight without enabling;
+- single-pump enable including Stage-4 post-enable validation;
+- fail-closed single-pump disable.
+
+The Stage-4 physical-device sysfs controls use the same functions. The virtual
+coordinator therefore cannot bypass the physical driver's initialization,
+variant, voltage-window, fault or post-enable checks.
+
+`manual_preflight()` is intentionally observational. `manual_enable()` repeats
+preflight immediately before the masked enable write so a two-pump coordinator
+does not rely on stale earlier state.
 
 ## Stage 5B: gated dual start/stop
 
-Stage 5B will extend the **coordinator node**, not either physical I2C node.
-Writable controls must not appear unless the coordinator contains a third
+Writable virtual controls appear only when the coordinator node adds the third
 explicit opt-in:
 
 ```dts
@@ -148,111 +166,164 @@ sc8547_dual: charge-pump-coordinator {
 };
 ```
 
-Both physical devices must independently have the Stage-3/4 properties needed
-for their own controlled initialization and single-pump authorization windows.
+Without this property, `work_mode` and `dual_enable` are absent.
 
-### Stage-5B physical-driver API requirement
+### Stage-5B sysfs
 
-Stage 5B must not duplicate the Stage-4 safety logic by performing arbitrary
-SMBus writes in the coordinator. Before implementing dual writes, the physical
-`sc8547_cp` module will expose a small internal/exported API for:
+With the opt-in present:
 
-- obtaining a referenced SC8547 device from an I2C client;
-- checking whether Stage-3 init and Stage-4 authorization are ready;
-- setting mode while disabled;
-- running the existing Stage-4 preflight;
-- enabling one pump and performing its post-enable validation;
-- disabling one pump fail-closed;
-- reading a structured state snapshot.
+```text
+sc8547_dual/work_mode
+sc8547_dual/dual_enable
+sc8547_dual/last_result
+```
 
-The sysfs implementation and coordinator will both use the same helpers. There
-must be one safety implementation, not two diverging copies.
+`work_mode` accepts:
 
-### Planned Stage-5B controls
+```text
+2:1
+bypass
+```
 
-The coordinator `sc8547_dual/` group gains development-only controls:
+It updates primary then secondary through the physical API and is allowed only
+while both pumps are initialized, Stage-4-authorized, disabled, non-switching
+and free of blocking faults. If the secondary mode write fails, the coordinator
+best-effort restores the primary's previous mode; no pump has been started at
+that point.
 
-- `work_mode`: common requested `2:1` or `bypass` mode;
-- `dual_enable`: `0` or `1`;
-- `last_result`: last coordinator operation/result for bring-up diagnostics.
+`dual_enable` accepts `0` or `1`.
 
-There is no automatic charger policy.
+`last_result` records the coordinator stage/reason and errno from the latest
+write operation. It is diagnostic, not a stable ABI.
 
-### Dual-enable preflight
+## Dual-enable preflight
 
-Before the first enable write, require:
+Before the first enable write, Stage 5B requires:
 
-1. explicit Stage-5B opt-in;
-2. valid/bound physical pair;
-3. supported silicon on both devices;
-4. Stage-3 `init_done` on both;
-5. Stage-4 CP-enable authorization/window complete on both;
-6. both CPs disabled and not switching;
-7. both existing Stage-4 preflights pass independently;
-8. both devices are configured for the same requested work mode.
+1. the virtual Stage-5B opt-in;
+2. a valid primary/secondary pair;
+3. Stage-3 initialization complete on both;
+4. Stage-4 authorization/window complete on both;
+5. both pumps currently disabled and not switching;
+6. no blocking fault in the initial snapshots;
+7. both devices configured to the same work mode;
+8. physical-driver Stage-4 preflight succeeds independently for primary and
+   secondary.
 
 If either preflight fails, neither pump is enabled.
 
-### Start order
+## Start order and rollback
 
-The first implementation uses a deterministic order consistent with downstream
-`main_cp = <0>`:
+The implementation follows downstream `main_cp = <0>` with deterministic order:
 
-1. run both preflights;
-2. start primary only;
-3. wait for primary's existing Stage-4 post-enable validation;
-4. if primary fails, disable primary and stop;
-5. start secondary;
-6. wait for secondary's existing Stage-4 post-enable validation;
-7. if secondary fails, disable secondary and then primary;
-8. reread both states before reporting success.
+1. snapshot both pumps;
+2. preflight primary;
+3. preflight secondary;
+4. enable primary through `sc8547_manual_enable()`;
+5. primary's physical driver waits the Stage-4 500 ms observation interval and
+   validates switching/fault/window state;
+6. only after primary succeeds, enable secondary the same way;
+7. reread both snapshots and require both enabled, switching and fault-free.
 
-There is intentionally no first-version degraded one-pump fallback after a
-secondary failure. Initial dual bring-up fails closed to both pumps off.
+Rollback rules:
 
-### Stop order
+- primary enable failure: best-effort disable primary;
+- secondary enable failure: disable secondary, then primary;
+- final pair validation failure: disable secondary, then primary;
+- first implementation never continues in a degraded one-pump state after a
+  dual-start failure.
 
-Dual stop runs in reverse:
+## Stop order
+
+Writing `0` to `dual_enable` performs reverse-order shutdown:
 
 1. disable secondary;
-2. verify its enable bit cleared;
-3. disable primary;
-4. verify its enable bit cleared.
+2. disable primary.
 
-Both disable attempts run even if the first reports an I2C error. The first
-error is returned only after both shutdown attempts have been made.
+Both attempts run even if the first reports an error. The first error is
+returned after both shutdown attempts have been made.
 
-### Concurrency/locking rule
+The platform coordinator also performs the same best-effort dual stop on driver
+remove and system shutdown when Stage-5B opt-in is present.
 
-Coordinator write operations must use one documented lock order: physical
-primary first, physical secondary second. No helper may hold the secondary lock
-and then acquire the primary lock.
+## Concurrency model
 
-### Fault policy
+The virtual coordinator serializes its own operations with one coordinator
+mutex. It does not expose or directly acquire physical-driver private mutexes.
+Each physical API call takes the appropriate physical lock internally.
 
-During explicit coordinator operations/checks, any blocking Stage-4 fault on
-either pump causes both pumps to be disabled. Continuous monitoring belongs to
-a later IRQ/policy stage; Stage 5B alone remains a laboratory control surface.
+A concurrent physical Stage-4 sysfs operation may cause a coordinator operation
+to fail, but it cannot bypass physical safety checks: `manual_enable()` always
+rechecks preflight immediately before writing the enable bit. On partial dual
+failure the coordinator attempts reverse-order fail-closed shutdown.
 
-## What Stage 5 does not do
+## Initial Stage-5B hardware test order
+
+Do not start here until **each** pump has independently passed Stage 4.
+
+Recommended sequence:
+
+```sh
+cd /sys/bus/platform/devices/<coordinator>/sc8547_dual
+
+cat pair_state
+cat last_result
+
+# Select the already individually tested ratio.
+echo '2:1' > work_mode
+cat work_mode
+cat pair_state
+
+# Only with a controlled source and both physical Stage-4 windows satisfied:
+echo 1 > dual_enable
+cat dual_enable
+cat pair_state
+cat last_result
+
+# Stop before changing anything else.
+echo 0 > dual_enable
+cat dual_enable
+cat pair_state
+cat last_result
+```
+
+Acceptance for a first successful run:
+
+- before start, both physical pumps are initialized/authorized and off;
+- selected modes match;
+- primary reaches validated switching before secondary is attempted;
+- after success, both report enable=1 and switching=1 without blocking faults;
+- reported ADC values remain inside each physical Stage-4 safety window;
+- stop returns both to enable=0;
+- no unexpected PMIC/basic-charging regression is observed afterwards.
+
+Also deliberately exercise failure paths with a setup that stays within safe
+laboratory bounds: for example, remove Stage-4 authorization from one device and
+confirm dual start is refused before any pump is enabled. Do **not** manufacture
+OVP/OCP/thermal faults merely to test rollback.
+
+## What Stage 5 still does not do
 
 Stage 5 does not:
 
-- request USB-PD/PPS voltage/current;
+- request or negotiate USB-PD/PPS voltage/current;
 - ramp source current;
-- choose battery charge-current targets;
+- select battery charge-current targets;
 - implement VOOC/SuperVOOC/UFCS;
 - automatically decide when the second CP should enter/leave;
-- implement a full thermal policy;
-- claim the downstream 3000 mA-per-CP values are safe generic limits.
+- continuously monitor faults via IRQ/policy work;
+- implement thermal charging policy;
+- claim downstream 3000 mA-per-CP values are generic safe limits.
 
-Those policy decisions belong to Stage 6 or later.
+Those responsibilities belong to Stage 6 or later.
 
-## Merge/test rule
+## Merge rule
 
-- Stage 5A read-only coordinator may be tested/cherry-picked after the earlier
-  telemetry stages are sound.
+- Stage 5A read-only code can be tested/promoted independently after baseline
+  telemetry is sound.
+- Shared-API refactoring may be reviewed independently because it is intended to
+  preserve Stage-4 behavior.
 - Stage 5B write-capable coordination must not move to `main` until primary and
-  secondary have each independently passed Stage 4 on real hardware.
-- Linux-v7.2 focused `W=1` CI is necessary but never substitutes for hardware
-  gates.
+  secondary have each passed Stage 4 on real hardware.
+- Focused Linux-v7.2 `W=1` CI is required, but successful compilation never
+  replaces the hardware gates.
