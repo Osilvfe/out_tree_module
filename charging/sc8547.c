@@ -8,6 +8,7 @@
  * thresholds.
  */
 
+#include <linux/bitfield.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
@@ -540,9 +541,8 @@ static int sc8547_ucp_deglitch_us(struct sc8547_device *sc, unsigned int reg05)
 {
 	unsigned int code;
 
-	if (sc->variant == SC8547_VARIANT_SC8547) {
+	if (sc->variant == SC8547_VARIANT_SC8547)
 		return reg05 & SC8547_UCP_DEGLITCH_SC8547 ? 5000 : 10;
-	}
 
 	if (sc->variant != SC8547_VARIANT_SC8547A)
 		return -EINVAL;
