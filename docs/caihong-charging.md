@@ -1,5 +1,17 @@
 # OnePlus Pad Pro (caihong) charging bring-up
 
+## Development branches
+
+- `main`: conservative/testable baseline. Keep this branch suitable for actual
+  hardware bring-up.
+- `sc8547-next`: forward-development branch. New control paths land here first
+  and are intended to be cherry-picked to `main` stage by stage after testing.
+
+The detailed development/test/merge gates are maintained in
+[`docs/sc8547-next-roadmap.md`](sc8547-next-roadmap.md). Do not merge later
+charge-pump control stages merely because they compile; each stage has a
+hardware validation gate.
+
 ## Hardware confirmed from downstream DT
 
 Caihong project `23926` uses two Southchip SC8547-family charge pumps at I2C
@@ -9,15 +21,22 @@ address `0x6f`, on separate QUP I2C hubs:
 - hub 0: secondary `SC8547`/SC8547A-compatible device, downstream compatible
   `slave_vphy_sc8547`
 
+Both downstream SC8547 nodes specify:
+
+```dts
+ocp_reg = <0xb>;
+ovp_reg = <0x36>;
+```
+
 The Oplus charging framework connects the two charge-pump ICs in parallel and
 configures a 3000 mA input-current budget for each path. The primary chip also
 contains Oplus VOOC PHY handling in the downstream driver; this standalone
 mainline port deliberately separates the generic charge-pump hardware from the
 proprietary VOOC protocol.
 
-## Current standalone driver scope
+## Current `main` scope
 
-`sc8547_cp.ko` currently performs a safe bring-up only:
+`sc8547_cp.ko` on `main` performs a safe bring-up only:
 
 - 8-bit I2C regmap
 - device-ID read from register `0x36`
@@ -31,15 +50,27 @@ proprietary VOOC protocol.
 - `power_supply` registration for basic telemetry
 - read-only bring-up attributes below the I2C device's `sc8547/` sysfs group
 
-The driver intentionally does **not** yet alter OVP/OCP/UCP thresholds, switch
+The driver intentionally does **not** alter OVP/OCP/UCP thresholds, switch
 charge-pump mode, enable the charge pump, configure the watchdog, or implement
-VOOC PHY commands. Those writes must be added only after the real Caihong
-register state is captured and the downstream initialization sequence is
-translated.
+VOOC PHY commands.
 
-The current source has been compiled successfully against Linux 6.12.96
+The baseline source has been compiled successfully against Linux 6.12.96
 headers with `W=1`. It still needs a compile/test against the exact Caihong
 Linux 7.2 build tree before being considered target-kernel verified.
+
+## `sc8547-next` additions
+
+The development branch currently adds, without introducing new automatic
+charge-pump/protection writes:
+
+- explicit SC8547/SC8547A/SC8547D/unknown silicon variant model;
+- warning when DT compatible and runtime device ID disagree;
+- read-only `variant` attribute;
+- read-only `register_dump` of the common charge-pump/ADC register space;
+- masked internal helpers that preserve variant-specific low bits when later
+  control stages use CP enable/mode/ADC bits.
+
+These changes are the Stage 1 commit in the roadmap.
 
 ## Bring-up DTS
 
@@ -78,7 +109,7 @@ For comparison, the downstream aliases are also accepted by the driver:
 
 Use the `southchip,*` compatibles in the mainline DTS while doing this port.
 
-## First hardware test
+## First hardware test (`main`)
 
 Build and install `sc8547_cp.ko`, boot with the two I2C nodes enabled, then
 collect:
@@ -104,9 +135,21 @@ millicelsius.
 
 Expected primary ID from the downstream SC8547A definition is `0x67`. Do not
 enable high-voltage charging based only on successful probe; first verify that
-both devices report plausible ADC values and capture registers `0x00..0x20`,
-`0x2b..0x33`, `0x36`, and `0x3a` from the running downstream kernel if
-possible.
+both devices report plausible ADC values.
+
+## Stage 1 test (`sc8547-next`)
+
+In addition to the baseline test, capture:
+
+```sh
+cd /sys/bus/i2c/devices/<bus>-006f/sc8547
+cat variant
+cat register_dump
+```
+
+Capture `register_dump` for both pumps with the charger unplugged and again with
+a normal 5 V source attached. Those snapshots are the reference for later
+protection/init work.
 
 ## Downstream register facts already verified
 
@@ -125,22 +168,39 @@ Relevant registers used by the Oplus SC8547/SC8547A drivers:
 - `0x1f..0x20`: die-temperature ADC, 0.5 C/LSB
 - `0x36`: device ID
 
-Downstream Caihong uses `ocp_reg = <0x0b>` and `ovp_reg = <0x36>` for the
-charge-pump configuration. These values are recorded here as reverse-engineering
-evidence only; the standalone driver does not currently write them.
+### SC8547 versus SC8547A
 
-The downstream primary initialization also writes several additional registers
-before fast charging (including protection limits and watchdog configuration).
-Those writes are deliberately not copied wholesale: the next stage will decode
-each field and keep VOOC-PHY-only registers separate from generic charge-pump
-control.
+The core ADC/data map above is shared in the Oplus source, so one common
+telemetry implementation is appropriate. Control programming is not completely
+identical. One confirmed difference is `REG05` IBUS-UCP fall-deglitch encoding:
+SC8547 uses a one-bit field while SC8547A exposes a two-bit field with extra
+50/100 ms choices. The downstream secondary driver also preserves different
+`REG07` low-bit defaults depending on whether runtime detection identifies an
+SC8547A.
 
-## Next implementation steps
+For that reason future control code uses masked updates for shared bits rather
+than copying whole downstream register bytes unnecessarily.
 
-1. Translate primary and secondary reset/protection initialization separately.
-2. Add watchdog control.
-3. Add an explicitly gated manual 2:1/bypass and enable interface for lab
-   testing.
-4. Coordinate the primary and secondary CP paths.
-5. Integrate the charge-pump pair with the normal USB-PD/PPS charging policy.
-6. Treat VOOC/SuperVOOC PHY as a later, separate layer.
+### Protection-value ambiguity
+
+Caihong uses raw project value `ovp_reg = <0x36>` on both pumps. The Oplus
+common header defines BAT_OVP (`REG00[5:0]`) as 3500 mV + code * 25 mV, which
+would decode raw code `0x36` as 4850 mV. However, comments in parts of the
+vendor initialization source describe the configured BAT_OVP as 4.65 V.
+
+This inconsistency is intentionally documented rather than silently resolved.
+Until register behavior is confirmed on hardware, the development driver must
+show raw protection values and decoded values but must not automatically apply
+an assumed interpretation.
+
+## Development order
+
+See `docs/sc8547-next-roadmap.md` for the authoritative sequence. In short:
+
+1. variant model and register snapshots;
+2. protection decode only;
+3. controlled reset/init and watchdog, CP still off;
+4. explicitly gated single-pump manual control;
+5. dual-pump coordination;
+6. normal USB-PD/PPS policy integration;
+7. optional VOOC/SuperVOOC/UFCS layers later.
