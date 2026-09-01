@@ -24,34 +24,57 @@ southchip,allow-experimental-control;
 ```
 
 Without this property, the extra sysfs group is absent and the device remains
-telemetry-only apart from ADC enable.
+telemetry-only apart from ADC enable. The telemetry-only shutdown path also
+performs no experimental CP/watchdog write.
 
 The opt-in property is intentionally verbose. It is a laboratory bring-up flag,
 not a hardware description property intended for an upstream binding.
+
+## Supported silicon for Stage 3
+
+Experimental control currently accepts only:
+
+- SC8547
+- SC8547A
+
+SC8547D and unknown IDs remain readable through the telemetry path but reject
+`apply_init`. This is intentional until their write-side compatibility has been
+confirmed.
 
 ## Raw protection profile
 
 Because the Oplus source has inconsistent comments/formulas for some project
 values, Stage 3 does not convert requested millivolts/milliamps into register
-codes. Instead, a test profile must explicitly provide the exact raw bytes to
-write.
+codes. Instead, a test profile explicitly provides exact raw bytes.
 
-The planned properties are:
+### Required raw bytes
 
 ```dts
 southchip,experimental-reg00 = <0xXX>; /* BAT OVP */
-southchip,experimental-reg01 = <0xXX>; /* BAT OCP */
 southchip,experimental-reg02 = <0xXX>; /* AC/VAC OVP */
 southchip,experimental-reg04 = <0xXX>; /* VBUS OVP */
 southchip,experimental-reg05 = <0xXX>; /* IBUS UCP/OCP */
+```
+
+All four are required before `apply_init` can succeed.
+
+### Optional raw bytes
+
+```dts
+southchip,experimental-reg01 = <0xXX>; /* BAT OCP */
 southchip,experimental-reg0d = <0xXX>; /* PMID2OUT UVP/OVP */
 ```
 
-All six properties are required before an experimental init can be executed.
-Values greater than `0xff` are rejected.
+These are optional because the Oplus primary and secondary initialization
+sequences do not write exactly the same register set. In particular, forcing a
+primary-only write into the secondary path would defeat the purpose of keeping
+the port conservative.
 
-The driver must not silently substitute downstream defaults when any property
-is missing.
+An optional property that is absent is left untouched by Stage 3. If present,
+it is written and included in readback verification.
+
+Every supplied value must fit in one byte (`0x00..0xff`). The driver never
+silently substitutes downstream defaults for a missing required property.
 
 ## Why raw bytes are required
 
@@ -78,42 +101,50 @@ When opt-in is present, Stage 3 exposes a separate group:
 .../<bus>-006f/sc8547_experimental/
 ```
 
-Planned attributes:
+Attributes:
 
-- `profile_raw` (read-only): exact raw profile parsed from DT, or `incomplete`.
-- `init_state` (read-only): whether the experimental init has completed.
+- `profile_raw` (read-only): required raw bytes and any optional bytes parsed
+  from DT, or `incomplete`.
+- `init_state` (read-only): `not_initialized` or `initialized`.
 - `apply_init` (write-only): writing `1` performs the controlled init.
 - `watchdog_ms` (read/write): watchdog timeout; accepted values are 0, 200,
   500, 1000, 5000 and 30000 ms.
+
+`watchdog_ms` may be written only after `init_state` is `initialized`.
 
 There is intentionally no `charge_enable` and no writable `charge_mode` in
 Stage 3.
 
 ## Controlled init sequence
 
-Writing `1` to `apply_init` should perform the following sequence:
+Writing `1` to `apply_init` performs the following sequence:
 
-1. reject unknown silicon variants;
-2. reject an incomplete raw profile;
+1. reject silicon variants other than SC8547/SC8547A;
+2. reject an incomplete/invalid required raw profile;
 3. clear `REG07[7]` with a masked update so CP is disabled;
-4. disable the watchdog with a masked update;
-5. issue the common register reset bit;
-6. write only the generic charge-pump protection registers supplied in DT:
-   `REG00`, `REG01`, `REG02`, `REG04`, `REG05`, `REG0d`;
-7. keep CP disabled after the writes;
-8. enable ADC;
-9. read back the six protection registers;
-10. mark init complete only when every readback matches the requested raw byte.
+4. disable the watchdog with a masked `REG09[2:0]` update;
+5. issue the common `REG07[6]` register reset bit;
+6. wait briefly for reset handling;
+7. fail closed again after reset;
+8. write required `REG00`, `REG02`, `REG04`, `REG05`;
+9. write `REG01` and/or `REG0d` only when explicitly supplied;
+10. fail closed again so CP and watchdog remain off;
+11. enable ADC;
+12. read back every register that Stage 3 wrote;
+13. mark init complete only if every readback matches exactly.
+
+Any failure leaves `init_state` at `not_initialized` and performs a best-effort
+CP-disable/watchdog-disable sequence.
 
 The sequence deliberately does **not** write VOOC/DPDM/UFCS registers such as
 `0x21/0x22/0x2b/0x30/0x31/0x33` or SC8547A UFCS registers at `0x40+`.
 
 It also avoids copying whole `REG07` bytes (`0x85`, `0x81`, etc.). CP enable is
-controlled by a masked bit update so variant-specific low bits survive.
+controlled only by a masked bit update so variant-specific low bits survive.
 
 ## Watchdog control
 
-Stage 3 may change only `REG09[2:0]` for watchdog timeout. It must preserve:
+Stage 3 changes only `REG09[2:0]` for watchdog timeout. It preserves:
 
 - `REG09[7]` charge-pump ratio mode;
 - POR/UCP-related status/mask bits in the same register.
@@ -131,6 +162,9 @@ Accepted mapping from the Oplus common header:
 
 Codes 6 and 7 are treated as reserved/unsupported.
 
+The shutdown callback performs a best-effort CP-disable and watchdog-disable
+only for nodes that explicitly enabled experimental control.
+
 ## Example development DTS
 
 The following is a **template only**. Do not copy placeholder values or assume
@@ -144,14 +178,20 @@ charger@6f {
 
     southchip,allow-experimental-control;
 
+    /* required */
     southchip,experimental-reg00 = <0xXX>;
-    southchip,experimental-reg01 = <0xXX>;
     southchip,experimental-reg02 = <0xXX>;
     southchip,experimental-reg04 = <0xXX>;
     southchip,experimental-reg05 = <0xXX>;
+
+    /* optional: only reproduce them when justified for this path */
+    southchip,experimental-reg01 = <0xXX>;
     southchip,experimental-reg0d = <0xXX>;
 };
 ```
+
+For a secondary test profile, omit optional registers that are not part of the
+specific downstream init sequence being reproduced.
 
 ## Stage-3 test procedure
 
@@ -163,6 +203,7 @@ cat sc8547/register_dump
 cat sc8547/protection_state
 cat sc8547_experimental/profile_raw
 cat sc8547_experimental/init_state
+cat sc8547_experimental/watchdog_ms
 ```
 
 Save the output.
@@ -184,7 +225,8 @@ Acceptance criteria:
 - `init_state` becomes `initialized`;
 - `charge_enabled` stays `0`;
 - `switching` stays `0`;
-- requested raw protection bytes read back exactly;
+- every requested raw byte reads back exactly;
+- omitted optional registers were not intentionally overwritten by the init;
 - ADC values remain plausible;
 - no unexpected OVP/OCP/UCP/thermal fault appears;
 - normal PMIC/pmic-glink charging remains functional.
@@ -194,6 +236,6 @@ considered.
 
 ## Merge rule
 
-Do not cherry-pick the Stage-3 write-control commit to `main` before Stage 0-2
+Do not cherry-pick Stage-3 write-control commits to `main` before Stage 0-2
 have been tested on the real tablet and the raw profile has been reviewed.
 The documentation may be merged earlier.
