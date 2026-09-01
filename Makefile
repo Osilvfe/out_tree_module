@@ -9,6 +9,9 @@ oneplus_pogo-y := pogo/oneplus_pogo.o
 obj-m += sc8547_cp.o
 sc8547_cp-y := charging/sc8547.o
 
+obj-m += sc8547_dual.o
+sc8547_dual-y := charging/sc8547_dual.o
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 .PHONY: all clean
