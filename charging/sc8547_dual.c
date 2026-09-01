@@ -10,6 +10,8 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
 
 #define SC8547_REG_STATUS_06		0x06
@@ -144,6 +146,17 @@ static bool sc8547_dual_client_bound(struct i2c_client *client)
 	       !strcmp(client->dev.driver->name, "sc8547");
 }
 
+static bool sc8547_dual_role_matches(struct i2c_client *client,
+				     const char *expected)
+{
+	const char *role;
+
+	if (device_property_read_string(&client->dev, "southchip,role", &role))
+		return false;
+
+	return !strcmp(role, expected);
+}
+
 static int sc8547_dual_get_clients(struct sc8547_dual *dual,
 				   struct i2c_client **primary,
 				   struct i2c_client **secondary)
@@ -161,7 +174,9 @@ static int sc8547_dual_get_clients(struct sc8547_dual *dual,
 	}
 
 	if (p == s || !sc8547_dual_client_bound(p) ||
-	    !sc8547_dual_client_bound(s)) {
+	    !sc8547_dual_client_bound(s) ||
+	    !sc8547_dual_role_matches(p, "primary") ||
+	    !sc8547_dual_role_matches(s, "secondary")) {
 		put_device(&s->dev);
 		put_device(&p->dev);
 		return -ENODEV;
@@ -200,7 +215,7 @@ static ssize_t peer_show(struct device *dev,
 		goto out_err;
 
 	len = sysfs_emit(buf,
-		"primary=%s id=0x%02x variant=%s secondary=%s id=0x%02x variant=%s\n",
+		"primary=%s role=primary id=0x%02x variant=%s secondary=%s role=secondary id=0x%02x variant=%s\n",
 		dev_name(&primary->dev), p.id, sc8547_dual_variant_name(p.id),
 		dev_name(&secondary->dev), s.id, sc8547_dual_variant_name(s.id));
 	sc8547_dual_put_clients(primary, secondary);
