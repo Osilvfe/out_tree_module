@@ -62,14 +62,18 @@ The common Oplus SC8547 header describes BAT_OVP (`REG00[5:0]`) as:
 - step: 25 mV
 
 Under that definition code `0x36` would decode to 4850 mV. Some downstream
-source comments near the same configuration state 4.65 V instead. Because the
-source comments, encoded project value, and header formula are not fully
-self-consistent, the development driver must keep raw values visible and must
-not automatically program this protection profile until hardware behavior is
-verified.
+source comments near the same configuration state 4.65 V instead.
 
-The same rule applies to any other threshold where the vendor comments and
-register definitions disagree.
+A second example exists for IBUS OCP: the common header describes the low
+nibble of `REG05` as 1200 mA + code * 300 mA. Project code `0x0b` therefore
+decodes to 4500 mA by that header formula, while some nearby downstream source
+comments describe 3.6 A. These discrepancies are preserved as evidence rather
+than silently resolved.
+
+Because the source comments, encoded project values, and header formulas are
+not fully self-consistent, the development driver keeps raw values visible and
+does not automatically program this protection profile until hardware behavior
+is verified.
 
 ## Stage 0 - baseline telemetry
 
@@ -128,33 +132,50 @@ This provides the reference state for later protection/control stages.
 
 ## Stage 2 - protection model, decode only
 
-Planned next.
+Status: implemented on `sc8547-next` in commit `bc553aa`.
 
-Goals:
+New read-only attribute:
 
-- define the generic SC8547 protection register fields;
-- decode current raw protection settings to human-readable values;
-- preserve raw register values beside decoded values;
-- model SC8547 versus SC8547A field differences;
-- do **not** apply a new protection profile automatically.
+```sh
+cat /sys/bus/i2c/devices/<bus>-006f/sc8547/protection_state
+```
 
-This stage is intentionally read-only so it can be tested before enabling any
-high-power path.
+It reports:
+
+- raw `REG00/01/02/04/05/08/09/0d` values;
+- BAT OVP code and vendor-header formula result;
+- BAT OCP code and vendor-header formula result;
+- AC/VBUS OVP codes and vendor-header formula results;
+- IBUS UCP/OCP enable state;
+- IBUS OCP code and vendor-header formula result;
+- variant-aware IBUS-UCP deglitch time for known SC8547/SC8547A layouts;
+- soft-start timeout code;
+- PMID2OUT UVP/OVP codes;
+- watchdog timeout code.
+
+Every calculated threshold is labelled `header_*` or `header_formula_*` in the
+sysfs output. This is deliberate: it means "decoded using the Oplus header",
+not "electrically confirmed on this board".
+
+No new automatic write is introduced in Stage 2.
 
 ### Test gate
 
-Compare decoded values against:
+Compare `protection_state` against:
 
-- raw register dump;
+- the same device's `register_dump`;
 - downstream kernel register dump if available;
-- observed normal charging state.
+- unplugged versus normal-5-V-source state.
+
+Specifically record whether the device actually contains project values related
+to `0x36` and `0x0b`, and whether primary/secondary differ after boot.
 
 Any decode with contradictory vendor definitions remains labelled ambiguous
 instead of being treated as authoritative.
 
 ## Stage 3 - controlled hardware init
 
-Planned after Stage 2.
+Next development stage.
 
 Goals:
 
@@ -163,8 +184,14 @@ Goals:
 - preserve VOOC/DPDM/UFCS registers;
 - keep CP disabled after init;
 - add watchdog programming helpers;
-- require an explicit development-only DT opt-in before applying an unverified
-  board profile.
+- require an explicit development-only DT opt-in before exposing unverified
+  write controls;
+- require explicit raw protection values for any experimental protection write
+  rather than silently assuming that `0x36`/`0x0b` comments are correct.
+
+The intended development interface is fail-closed: normal DTS nodes remain
+read-only/telemetry-only. Experimental write controls should not even appear
+unless a dedicated opt-in property is present.
 
 ### Test gate
 
@@ -173,7 +200,7 @@ After init and before CP enable:
 1. CP remains disabled;
 2. ADC remains functional;
 3. no unexpected fault bits are asserted;
-4. raw protection registers match the intended profile;
+4. raw protection registers match the explicitly requested profile;
 5. basic PMIC/pmic-glink charging still works.
 
 ## Stage 4 - manual single-pump control
@@ -247,12 +274,23 @@ review/testing.
 
 When hardware testing becomes available, move changes to `main` in this order:
 
-1. Stage 1 variant/snapshot commit;
-2. Stage 2 decode-only commit(s);
+1. `60c230c` - Stage 1 variant/snapshot support;
+2. `bc553aa` - Stage 2 protection decode;
 3. Stage 3 init/watchdog commit(s) only after protection values are confirmed;
 4. Stage 4 manual-control commit(s) after safe lab tests;
 5. Stage 5 dual-pump coordinator;
 6. Stage 6 PD/PPS integration.
 
+Documentation-only commits may be cherry-picked at any time.
+
 Never cherry-pick a later control stage merely because it compiles; each stage
 assumes the previous hardware gate has passed.
+
+## Build verification notes
+
+Earlier baseline/Stage-1 source was compiled successfully against Linux 6.12.96
+headers with `W=1`. The execution environment used for this development session
+currently cannot resolve `github.com`, so a fresh clone-based build of every
+new commit is not always possible. When that happens, the commit remains marked
+as development-only until it is compiled either locally against available
+headers or on the actual Caihong Linux 7.2 tree.
