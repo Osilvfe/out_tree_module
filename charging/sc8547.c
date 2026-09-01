@@ -2,10 +2,12 @@
 /*
  * Southchip SC8547/SC8547A charge-pump bring-up driver.
  *
- * Standalone mainline-style port for OnePlus Pad Pro (caihong). The default
- * path remains conservative: probe enables ADC conversion and exposes
- * telemetry/state. Experimental write controls are hidden unless explicitly
- * enabled in DT, and Stage 3 still never exposes charge-pump enable/mode writes.
+ * Standalone mainline-style port for OnePlus Pad Pro (caihong).
+ *
+ * Normal device nodes are telemetry-only apart from ADC enable.  Development
+ * write controls are hidden behind explicit DT opt-ins.  Stage 4 provides only
+ * manual single-pump lab control; there is no automatic fast-charge policy,
+ * PD/PPS negotiation, dual-pump coordination or VOOC/UFCS protocol handling.
  */
 
 #include <linux/bitfield.h>
@@ -55,6 +57,9 @@
 #define SC8547_VBUS_ERRORLO_STAT	BIT(5)
 #define SC8547_VBUS_ERRORHI_STAT	BIT(4)
 #define SC8547_CP_SWITCHING_STAT	BIT(2)
+#define SC8547_BLOCKING_06		(SC8547_TSHUT_STAT | \
+					 SC8547_VBUS_ERRORLO_STAT | \
+					 SC8547_VBUS_ERRORHI_STAT)
 
 #define SC8547_REG_CHG_CTRL		0x07
 #define SC8547_CHG_EN			BIT(7)
@@ -80,6 +85,12 @@
 #define SC8547_IBUS_UCP_FALL_STAT	BIT(2)
 #define SC8547_ADAPTER_INSERT_STAT	BIT(1)
 #define SC8547_VBAT_INSERT_STAT		BIT(0)
+#define SC8547_BLOCKING_0E		(SC8547_VOUT_OVP_STAT | \
+					 SC8547_VBAT_OVP_STAT | \
+					 SC8547_IBAT_OCP_STAT | \
+					 SC8547_VBUS_OVP_STAT | \
+					 SC8547_IBUS_OCP_STAT | \
+					 SC8547_IBUS_UCP_FALL_STAT)
 
 #define SC8547_REG_ADC_CTRL		0x11
 #define SC8547_ADC_EN			BIT(7)
@@ -98,13 +109,14 @@
 #define SC8547A_DEVICE_ID		0x67
 #define SC8547D_DEVICE_ID		0x49
 
-/* ADC scales converted from the Oplus downstream register definitions. */
 #define SC8547_IBUS_UA_PER_LSB		1875
 #define SC8547_VBUS_UV_PER_LSB		3750
 #define SC8547_VAC_UV_PER_LSB		5000
 #define SC8547_VOUT_UV_PER_LSB		1250
 #define SC8547_VBAT_UV_PER_LSB		1250
 #define SC8547_TDIE_MC_PER_LSB		500
+
+#define SC8547_POST_ENABLE_MS		500
 
 enum sc8547_variant {
 	SC8547_VARIANT_UNKNOWN,
@@ -140,6 +152,14 @@ struct sc8547_raw_profile {
 	bool complete;
 };
 
+struct sc8547_enable_window {
+	u32 vbus_min_uv;
+	u32 vbus_max_uv;
+	u32 vbat_min_uv;
+	u32 vbat_max_uv;
+	bool complete;
+};
+
 struct sc8547_device {
 	struct device *dev;
 	struct regmap *regmap;
@@ -150,7 +170,9 @@ struct sc8547_device {
 	enum sc8547_variant variant;
 	struct mutex lock;
 	struct sc8547_raw_profile profile;
+	struct sc8547_enable_window window;
 	bool allow_experimental_control;
+	bool allow_experimental_cp_enable;
 	bool init_done;
 	u8 device_id;
 };
@@ -201,8 +223,7 @@ static int sc8547_set_charge_enabled(struct sc8547_device *sc, bool enable)
 				 SC8547_CHG_EN, enable ? SC8547_CHG_EN : 0);
 }
 
-static int __maybe_unused sc8547_set_work_mode(struct sc8547_device *sc,
-					       bool bypass)
+static int sc8547_set_work_mode(struct sc8547_device *sc, bool bypass)
 {
 	return regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
 				 SC8547_CHARGE_MODE,
@@ -260,7 +281,6 @@ static int sc8547_read_adc(struct sc8547_device *sc, unsigned int reg,
 	ret = regmap_read(sc->regmap, reg, &hi);
 	if (ret)
 		return ret;
-
 	ret = regmap_read(sc->regmap, reg + 1, &lo);
 	if (ret)
 		return ret;
@@ -302,6 +322,24 @@ static int sc8547_get_tdie_mc(struct sc8547_device *sc)
 {
 	return sc8547_read_adc(sc, SC8547_REG_TDIE_ADC_H,
 			       SC8547_TDIE_H_MASK, SC8547_TDIE_MC_PER_LSB);
+}
+
+static int sc8547_read_status(struct sc8547_device *sc,
+			       unsigned int *reg06, unsigned int *reg0e)
+{
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, reg06);
+	if (ret)
+		return ret;
+
+	return regmap_read(sc->regmap, SC8547_REG_STATUS_0E, reg0e);
+}
+
+static bool sc8547_has_blocking_fault(unsigned int reg06, unsigned int reg0e)
+{
+	return !!((reg06 & SC8547_BLOCKING_06) ||
+		  (reg0e & SC8547_BLOCKING_0E));
 }
 
 static enum power_supply_property sc8547_psy_props[] = {
@@ -493,10 +531,7 @@ static ssize_t status_regs_show(struct device *dev,
 	unsigned int reg06, reg0e;
 	int ret;
 
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &reg06);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &reg0e);
+	ret = sc8547_read_status(sc, &reg06, &reg0e);
 	if (ret)
 		return ret;
 
@@ -512,10 +547,7 @@ static ssize_t faults_show(struct device *dev,
 	size_t len = 0;
 	int ret;
 
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &reg06);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &reg0e);
+	ret = sc8547_read_status(sc, &reg06, &reg0e);
 	if (ret)
 		return ret;
 
@@ -570,19 +602,16 @@ static ssize_t register_dump_show(struct device *dev,
 	unsigned int val;
 	int ret;
 
-	/* Common charge-pump/ADC register map only; do not touch UFCS buffers. */
 	ret = sc8547_dump_range(sc, buf, &len, 0x00, 0x23);
 	if (ret)
 		return ret;
 	ret = sc8547_dump_range(sc, buf, &len, 0x2b, 0x33);
 	if (ret)
 		return ret;
-
 	ret = regmap_read(sc->regmap, 0x36, &val);
 	if (ret)
 		return ret;
 	len += sysfs_emit_at(buf, len, "36:%02x\n", val);
-
 	ret = sc8547_dump_range(sc, buf, &len, 0x3a, 0x3c);
 	if (ret)
 		return ret;
@@ -688,12 +717,10 @@ static ssize_t protection_state_show(struct device *dev,
 		!(r00 & SC8547_BAT_OVP_DIS), bat_ovp_code,
 		SC8547_BAT_OVP_BASE_MV + bat_ovp_code * SC8547_BAT_OVP_STEP_MV);
 	len += sysfs_emit_at(buf, len,
-		"bat_ocp code=%u header_ma=%u\n",
-		bat_ocp_code,
+		"bat_ocp code=%u header_ma=%u\n", bat_ocp_code,
 		SC8547_BAT_OCP_BASE_MA + bat_ocp_code * SC8547_BAT_OCP_STEP_MA);
 	len += sysfs_emit_at(buf, len,
-		"ac_ovp code=%u header_formula_mv=%u\n",
-		ac_ovp_code,
+		"ac_ovp code=%u header_formula_mv=%u\n", ac_ovp_code,
 		SC8547_AC_OVP_BASE_MV + ac_ovp_code * SC8547_AC_OVP_STEP_MV);
 	len += sysfs_emit_at(buf, len,
 		"vbus_ovp enabled=%u code=%u header_mv=%u\n",
@@ -776,11 +803,14 @@ static int sc8547_read_optional_u8_property(struct device *dev,
 	u32 tmp;
 	int ret;
 
-	ret = device_property_read_u32(dev, name, &tmp);
-	if (ret) {
+	if (!device_property_present(dev, name)) {
 		*present = false;
 		return 0;
 	}
+
+	ret = device_property_read_u32(dev, name, &tmp);
+	if (ret)
+		return ret;
 	if (tmp > 0xff)
 		return -ERANGE;
 
@@ -826,6 +856,46 @@ static void sc8547_parse_experimental_profile(struct sc8547_device *sc)
 			 "experimental controls enabled but raw protection profile is incomplete/invalid\n");
 }
 
+static void sc8547_parse_enable_window(struct sc8547_device *sc)
+{
+	struct device *dev = sc->dev;
+	struct sc8547_enable_window *w = &sc->window;
+	bool requested;
+	int ret;
+
+	requested = device_property_read_bool(dev,
+				       "southchip,allow-experimental-cp-enable");
+	if (!requested)
+		return;
+
+	if (!sc->allow_experimental_control) {
+		dev_warn(dev,
+			 "CP-enable opt-in ignored without southchip,allow-experimental-control\n");
+		return;
+	}
+
+	sc->allow_experimental_cp_enable = true;
+
+	ret = device_property_read_u32(dev, "southchip,experimental-vbus-min-uv",
+				       &w->vbus_min_uv);
+	ret |= device_property_read_u32(dev, "southchip,experimental-vbus-max-uv",
+					&w->vbus_max_uv);
+	ret |= device_property_read_u32(dev, "southchip,experimental-vbat-min-uv",
+					&w->vbat_min_uv);
+	ret |= device_property_read_u32(dev, "southchip,experimental-vbat-max-uv",
+					&w->vbat_max_uv);
+	if (ret || !w->vbus_min_uv || !w->vbus_max_uv ||
+	    !w->vbat_min_uv || !w->vbat_max_uv ||
+	    w->vbus_min_uv >= w->vbus_max_uv ||
+	    w->vbat_min_uv >= w->vbat_max_uv) {
+		dev_warn(dev,
+			 "experimental CP-enable requested with incomplete/invalid voltage window\n");
+		return;
+	}
+
+	w->complete = true;
+}
+
 static int sc8547_fail_closed(struct sc8547_device *sc)
 {
 	int first = 0;
@@ -834,7 +904,6 @@ static int sc8547_fail_closed(struct sc8547_device *sc)
 	ret = sc8547_set_charge_enabled(sc, false);
 	if (ret)
 		first = ret;
-
 	ret = sc8547_set_watchdog_code(sc, 0);
 	if (ret && !first)
 		first = ret;
@@ -897,7 +966,6 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 		return -EINVAL;
 
 	sc->init_done = false;
-
 	ret = sc8547_fail_closed(sc);
 	if (ret)
 		return ret;
@@ -906,7 +974,6 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 				 SC8547_REG_RESET, SC8547_REG_RESET);
 	if (ret)
 		goto fail;
-
 	usleep_range(1000, 2000);
 
 	ret = sc8547_fail_closed(sc);
@@ -939,11 +1006,9 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 	ret = sc8547_fail_closed(sc);
 	if (ret)
 		goto fail;
-
 	ret = sc8547_set_adc_enabled(sc, true);
 	if (ret)
 		goto fail;
-
 	ret = sc8547_profile_readback(sc);
 	if (ret)
 		goto fail;
@@ -967,7 +1032,8 @@ static ssize_t profile_raw_show(struct device *dev,
 	if (!p->complete)
 		return sysfs_emit(buf, "incomplete\n");
 
-	len += sysfs_emit_at(buf, len, "required 00=%02x 02=%02x 04=%02x 05=%02x\n",
+	len += sysfs_emit_at(buf, len,
+			     "required 00=%02x 02=%02x 04=%02x 05=%02x\n",
 			     p->reg00, p->reg02, p->reg04, p->reg05);
 	if (p->has_reg01)
 		len += sysfs_emit_at(buf, len, "optional 01=%02x ", p->reg01);
@@ -987,7 +1053,8 @@ static ssize_t init_state_show(struct device *dev,
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%s\n", sc->init_done ? "initialized" : "not_initialized");
+	return sysfs_emit(buf, "%s\n",
+			  sc->init_done ? "initialized" : "not_initialized");
 }
 static DEVICE_ATTR_RO(init_state);
 
@@ -1041,7 +1108,6 @@ static ssize_t watchdog_ms_store(struct device *dev,
 	ret = kstrtouint(buf, 0, &timeout_ms);
 	if (ret)
 		return ret;
-
 	ret = sc8547_watchdog_code_from_ms(timeout_ms, &code);
 	if (ret)
 		return ret;
@@ -1061,17 +1127,260 @@ out:
 }
 static DEVICE_ATTR_RW(watchdog_ms);
 
+static ssize_t enable_window_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	const struct sc8547_enable_window *w = &sc->window;
+
+	if (!w->complete)
+		return sysfs_emit(buf, "incomplete\n");
+
+	return sysfs_emit(buf,
+		"vbus_uv=%u..%u vbat_uv=%u..%u\n",
+		w->vbus_min_uv, w->vbus_max_uv,
+		w->vbat_min_uv, w->vbat_max_uv);
+}
+static DEVICE_ATTR_RO(enable_window);
+
+static ssize_t work_mode_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int reg;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%s\n",
+			  reg & SC8547_CHARGE_MODE ? "bypass" : "2:1");
+}
+
+static ssize_t work_mode_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int reg;
+	bool bypass;
+	int ret;
+
+	if (sysfs_streq(buf, "2:1"))
+		bypass = false;
+	else if (sysfs_streq(buf, "bypass"))
+		bypass = true;
+	else
+		return -EINVAL;
+
+	mutex_lock(&sc->lock);
+	if (!sc->init_done || !sc->window.complete ||
+	    !sc8547_variant_control_supported(sc->variant)) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
+	if (ret)
+		goto out;
+	if (reg & SC8547_CHG_EN) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	ret = sc8547_set_work_mode(sc, bypass);
+	if (ret)
+		goto out;
+	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
+	if (ret)
+		goto out;
+	if (!!(reg & SC8547_CHARGE_MODE) != bypass)
+		ret = -EIO;
+out:
+	mutex_unlock(&sc->lock);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(work_mode);
+
+static int sc8547_window_check(struct sc8547_device *sc)
+{
+	const struct sc8547_enable_window *w = &sc->window;
+	int vbus_uv, vbat_uv;
+
+	vbus_uv = sc8547_get_vbus_uv(sc);
+	if (vbus_uv < 0)
+		return vbus_uv;
+	vbat_uv = sc8547_get_vbat_uv(sc);
+	if (vbat_uv < 0)
+		return vbat_uv;
+
+	if ((u32)vbus_uv < w->vbus_min_uv || (u32)vbus_uv > w->vbus_max_uv ||
+	    (u32)vbat_uv < w->vbat_min_uv || (u32)vbat_uv > w->vbat_max_uv)
+		return -ERANGE;
+
+	return 0;
+}
+
+static int sc8547_enable_preflight(struct sc8547_device *sc)
+{
+	unsigned int reg06, reg07, reg0e;
+	int ret;
+
+	if (!sc->init_done || !sc->window.complete)
+		return -EPERM;
+	if (!sc8547_variant_control_supported(sc->variant))
+		return -EOPNOTSUPP;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
+	if (ret)
+		return ret;
+	if (reg07 & SC8547_CHG_EN)
+		return -EBUSY;
+
+	ret = sc8547_read_status(sc, &reg06, &reg0e);
+	if (ret)
+		return ret;
+	if (!(reg0e & SC8547_ADAPTER_INSERT_STAT) ||
+	    !(reg0e & SC8547_VBAT_INSERT_STAT))
+		return -ENODEV;
+	if (reg06 & SC8547_CP_SWITCHING_STAT)
+		return -EBUSY;
+	if (sc8547_has_blocking_fault(reg06, reg0e))
+		return -EIO;
+
+	return sc8547_window_check(sc);
+}
+
+static int sc8547_post_enable_check(struct sc8547_device *sc)
+{
+	unsigned int reg06, reg0e;
+	int ret;
+
+	ret = sc8547_read_status(sc, &reg06, &reg0e);
+	if (ret)
+		return ret;
+	if (!(reg0e & SC8547_ADAPTER_INSERT_STAT) ||
+	    !(reg0e & SC8547_VBAT_INSERT_STAT))
+		return -ENODEV;
+	if (!(reg06 & SC8547_CP_SWITCHING_STAT))
+		return -EIO;
+	if (sc8547_has_blocking_fault(reg06, reg0e))
+		return -EIO;
+
+	return sc8547_window_check(sc);
+}
+
+static int sc8547_manual_disable(struct sc8547_device *sc)
+{
+	unsigned int reg;
+	int ret;
+
+	ret = sc8547_set_charge_enabled(sc, false);
+	if (ret)
+		return ret;
+	usleep_range(10000, 20000);
+
+	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
+	if (ret)
+		return ret;
+	if (reg & SC8547_CHG_EN)
+		return -EIO;
+
+	return 0;
+}
+
+static ssize_t cp_enable_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int reg;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", !!(reg & SC8547_CHG_EN));
+}
+
+static ssize_t cp_enable_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	mutex_lock(&sc->lock);
+	if (!enable) {
+		ret = sc8547_manual_disable(sc);
+		goto out;
+	}
+
+	ret = sc8547_enable_preflight(sc);
+	if (ret)
+		goto out;
+
+	ret = sc8547_set_charge_enabled(sc, true);
+	if (ret)
+		goto out;
+
+	msleep(SC8547_POST_ENABLE_MS);
+	ret = sc8547_post_enable_check(sc);
+	if (ret) {
+		sc8547_set_charge_enabled(sc, false);
+		goto out;
+	}
+out:
+	mutex_unlock(&sc->lock);
+	if (sc->psy)
+		power_supply_changed(sc->psy);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(cp_enable);
+
 static struct attribute *sc8547_experimental_attrs[] = {
 	&dev_attr_profile_raw.attr,
 	&dev_attr_init_state.attr,
 	&dev_attr_apply_init.attr,
 	&dev_attr_watchdog_ms.attr,
+	&dev_attr_enable_window.attr,
+	&dev_attr_work_mode.attr,
+	&dev_attr_cp_enable.attr,
 	NULL,
 };
+
+static umode_t sc8547_experimental_is_visible(struct kobject *kobj,
+					      struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+
+	if (attr == &dev_attr_enable_window.attr ||
+	    attr == &dev_attr_work_mode.attr ||
+	    attr == &dev_attr_cp_enable.attr) {
+		if (!sc || !sc->allow_experimental_cp_enable)
+			return 0;
+	}
+
+	return attr->mode;
+}
 
 static const struct attribute_group sc8547_experimental_attr_group = {
 	.name = "sc8547_experimental",
 	.attrs = sc8547_experimental_attrs,
+	.is_visible = sc8547_experimental_is_visible,
 };
 
 static int sc8547_probe(struct i2c_client *client)
@@ -1116,6 +1425,7 @@ static int sc8547_probe(struct i2c_client *client)
 			 sc8547_variant_name(sc->variant));
 
 	sc8547_parse_experimental_profile(sc);
+	sc8547_parse_enable_window(sc);
 
 	/* ADC enable alone does not start charge pumping. */
 	ret = sc8547_set_adc_enabled(sc, true);
@@ -1153,7 +1463,10 @@ static int sc8547_probe(struct i2c_client *client)
 			return dev_err_probe(&client->dev, ret,
 					     "failed to create experimental attributes\n");
 		dev_warn(&client->dev,
-			 "development-only experimental init/watchdog controls exposed; CP enable remains unavailable\n");
+			 "development-only experimental controls exposed%s\n",
+			 sc->allow_experimental_cp_enable ?
+			 " including manual single-pump enable" :
+			 " (init/watchdog only)");
 	}
 
 	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &enabled);
@@ -1172,11 +1485,12 @@ static int sc8547_probe(struct i2c_client *client)
 		 enabled & SC8547_CHG_EN ? "on" : "off",
 		 status & SC8547_CP_SWITCHING_STAT ? "yes" : "no",
 		 mode & SC8547_CHARGE_MODE ? "bypass" : "2:1",
-		 sc->allow_experimental_control ? " experimental-control" : " telemetry-only");
+		 sc->allow_experimental_control ?
+		 " experimental-control" : " telemetry-only");
 
 	if (!sc8547_variant_control_supported(sc->variant))
 		dev_warn(&client->dev,
-			 "silicon variant is not enabled for experimental control; initialization will be refused\n");
+			 "silicon variant is not enabled for experimental writes\n");
 
 	return 0;
 }
@@ -1188,7 +1502,7 @@ static void sc8547_shutdown(struct i2c_client *client)
 	if (!sc || !sc->allow_experimental_control)
 		return;
 
-	/* Best-effort fail closed; never leave a development watchdog running. */
+	/* Best-effort fail closed; never leave development CP/WDT active. */
 	sc8547_fail_closed(sc);
 }
 
