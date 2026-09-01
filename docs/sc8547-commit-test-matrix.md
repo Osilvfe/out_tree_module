@@ -102,12 +102,16 @@ not intentionally start the charge pump or rewrite protection thresholds.
 | 41 | `9ec6520` | F | Adds `sc8547_policy_diag.c`, a separate Stage-6A platform driver. It reads an explicitly named USB power supply plus `sc8547_dual_get_state()` and exposes `usb_supply`, `source_state`, `combined_state`. No `store`, `power_supply_set_property`, Glink write or CP write. | **YES, read-only**, after #39/#40 and Stage-5A telemetry. First test: CPs off, unplugged → 5 V → naturally negotiated fixed-PD → PPS-capable source observations. |
 | 42 | `756acee` | F/build | Adds `sc8547_policy_diag.ko` to OOT build. | **YES with #41** when testing Stage 6A. No independent runtime behavior. |
 | 43 | `97892e6` | C | Focused Linux-v7.2 CI now builds all three charging modules: physical, dual coordinator and Stage-6A diagnostic. | **OPTIONAL for runtime; current repo CI.** Focused v7.2 `W=1` run passed for this commit. |
+| 44 | `f0a0e9d` | D | Records the recovered downstream PPS session sequence and rollback evidence. Confirms non-SoCCP properties 34/35 with mV/mA units, APDO capability gating, conservative 5.5 V / 0.8–1.0 A start, source-VBUS ramp before CP start, switching confirmation, bounded post-start ramp, and fail-closed PPS/CP teardown. Also lists the remaining Caihong ABI/session unknowns. | **OPTIONAL but mandatory reading before designing Stage 6B.** This commit **does not unlock source writes**; first meaningful use is to review Stage-6A F0-F3 hardware captures against the downstream sequencing assumptions. |
 
 ### Meaning of the Stage-6A checkpoint
 
 At #43, source-contract **observation** is build-complete. Nothing in #38-#43
 can request another USB voltage/current contract. Nothing automatically starts
 a charge pump. This is a deliberate hardware-test checkpoint before Stage 6B.
+
+Commit #44 improves the evidence model for Stage 6B but does not change the
+Stage-6A hardware boundary. No SET/write source code exists yet.
 
 The Stage-6A DT is development-only:
 
@@ -224,7 +228,9 @@ fc32392
 756acee
 ```
 
-`97892e6` is CI-only. The Stage-6 design document is `a48fa1f`.
+`97892e6` is CI-only. Read `a48fa1f` for the Stage-6 split and `f0a0e9d` for the
+current downstream PPS-session evidence. Neither documentation commit adds a
+runtime dependency.
 
 `fc32392` was authored later on the linear development branch, after Stage-5B
 source existed, but its patch adds only the read-only exported state function
@@ -297,8 +303,11 @@ a new documented stage. Before a write-capable commit exists, the documentation
 must identify:
 
 - exact Qualcomm/Oplus firmware opcode + property semantics;
+- effective Caihong SoCCP/non-SoCCP property namespace;
 - Fixed-PDO vs PPS separation;
 - units and valid ranges;
+- capability-discovery path;
+- session enter/exit semantics;
 - success/ack condition;
 - CP-off source-only test;
 - guaranteed fallback to basic/5-V charging;
