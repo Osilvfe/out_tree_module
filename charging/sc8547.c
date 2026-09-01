@@ -2,24 +2,41 @@
 /*
  * Southchip SC8547/SC8547A charge-pump bring-up driver.
  *
- * Initial mainline-style standalone port for OnePlus Pad Pro (caihong).
- * This revision is intentionally conservative: it probes the device, enables
- * ADC conversion, exposes read-only telemetry and reports the existing charge
- * pump state. It does not automatically enable the charge pump or change any
- * protection thresholds.
+ * Standalone mainline-style port for OnePlus Pad Pro (caihong). This initial
+ * revision is intentionally conservative: it enables ADC conversion and
+ * exposes telemetry/state, but never starts the charge pump or changes the
+ * board's protection thresholds.
  */
 
-#include <linux/bitfield.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/sysfs.h>
+
+#define SC8547_REG_STATUS_06		0x06
+#define SC8547_TSHUT_STAT		BIT(6)
+#define SC8547_VBUS_ERRORLO_STAT	BIT(5)
+#define SC8547_VBUS_ERRORHI_STAT	BIT(4)
+#define SC8547_CP_SWITCHING_STAT	BIT(2)
 
 #define SC8547_REG_CHG_CTRL		0x07
 #define SC8547_CHG_EN			BIT(7)
+
 #define SC8547_REG_MODE_CTRL		0x09
 #define SC8547_CHARGE_MODE		BIT(7)
+
+#define SC8547_REG_STATUS_0E		0x0e
+#define SC8547_VOUT_OVP_STAT		BIT(7)
+#define SC8547_VBAT_OVP_STAT		BIT(6)
+#define SC8547_IBAT_OCP_STAT		BIT(5)
+#define SC8547_VBUS_OVP_STAT		BIT(4)
+#define SC8547_IBUS_OCP_STAT		BIT(3)
+#define SC8547_IBUS_UCP_FALL_STAT	BIT(2)
+#define SC8547_ADAPTER_INSERT_STAT	BIT(1)
+#define SC8547_VBAT_INSERT_STAT		BIT(0)
+
 #define SC8547_REG_ADC_CTRL		0x11
 #define SC8547_ADC_EN			BIT(7)
 
@@ -37,7 +54,7 @@
 #define SC8547A_DEVICE_ID		0x67
 #define SC8547D_DEVICE_ID		0x49
 
-/* Vendor register definitions use mV/mA units with fractional LSBs. */
+/* ADC scales converted from the Oplus downstream register definitions. */
 #define SC8547_IBUS_UA_PER_LSB		1875
 #define SC8547_VBUS_UV_PER_LSB		3750
 #define SC8547_VAC_UV_PER_LSB		5000
@@ -95,6 +112,18 @@ static int sc8547_get_vbat_uv(struct sc8547_device *sc)
 			       SC8547_ADC_12BIT_H_MASK, SC8547_VBAT_UV_PER_LSB);
 }
 
+static int sc8547_get_vout_uv(struct sc8547_device *sc)
+{
+	return sc8547_read_adc(sc, SC8547_REG_VOUT_ADC_H,
+			       SC8547_ADC_12BIT_H_MASK, SC8547_VOUT_UV_PER_LSB);
+}
+
+static int sc8547_get_vac_uv(struct sc8547_device *sc)
+{
+	return sc8547_read_adc(sc, SC8547_REG_VAC_ADC_H,
+			       SC8547_ADC_12BIT_H_MASK, SC8547_VAC_UV_PER_LSB);
+}
+
 static int sc8547_get_tdie_mc(struct sc8547_device *sc)
 {
 	return sc8547_read_adc(sc, SC8547_REG_TDIE_ADC_H,
@@ -102,6 +131,8 @@ static int sc8547_get_tdie_mc(struct sc8547_device *sc)
 }
 
 static enum power_supply_property sc8547_psy_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
@@ -117,6 +148,19 @@ static int sc8547_psy_get_property(struct power_supply *psy,
 	int ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &reg);
+		if (ret)
+			return ret;
+		val->intval = reg & SC8547_CP_SWITCHING_STAT ?
+			POWER_SUPPLY_STATUS_CHARGING : POWER_SUPPLY_STATUS_NOT_CHARGING;
+		return 0;
+	case POWER_SUPPLY_PROP_PRESENT:
+		ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &reg);
+		if (ret)
+			return ret;
+		val->intval = !!(reg & SC8547_ADAPTER_INSERT_STAT);
+		return 0;
 	case POWER_SUPPLY_PROP_ONLINE:
 		ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
 		if (ret)
@@ -139,7 +183,7 @@ static int sc8547_psy_get_property(struct power_supply *psy,
 		ret = sc8547_get_tdie_mc(sc);
 		if (ret < 0)
 			return ret;
-		/* power_supply TEMP is expressed in tenths of degree Celsius. */
+		/* POWER_SUPPLY_PROP_TEMP is in tenths of a degree Celsius. */
 		val->intval = ret / 100;
 		return 0;
 	default:
@@ -196,7 +240,52 @@ static ssize_t charge_mode_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(charge_mode);
 
-#define SC8547_ADC_ATTR(_name, _fn, _div, _unit) \
+static ssize_t switching_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &val);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", !!(val & SC8547_CP_SWITCHING_STAT));
+}
+static DEVICE_ATTR_RO(switching);
+
+static ssize_t adapter_present_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &val);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", !!(val & SC8547_ADAPTER_INSERT_STAT));
+}
+static DEVICE_ATTR_RO(adapter_present);
+
+static ssize_t battery_present_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &val);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", !!(val & SC8547_VBAT_INSERT_STAT));
+}
+static DEVICE_ATTR_RO(battery_present);
+
+#define SC8547_ADC_ATTR(_name, _fn) \
 static ssize_t _name##_show(struct device *dev, \
 			    struct device_attribute *attr, char *buf) \
 { \
@@ -204,56 +293,93 @@ static ssize_t _name##_show(struct device *dev, \
 	int ret = _fn(sc); \
 	if (ret < 0) \
 		return ret; \
-	return sysfs_emit(buf, "%d %s\n", ret / (_div), (_unit)); \
+	return sysfs_emit(buf, "%d\n", ret); \
 } \
 static DEVICE_ATTR_RO(_name)
 
-SC8547_ADC_ATTR(vbus, sc8547_get_vbus_uv, 1000, "mV");
-SC8547_ADC_ATTR(ibus, sc8547_get_ibus_ua, 1000, "mA");
-SC8547_ADC_ATTR(vbat, sc8547_get_vbat_uv, 1000, "mV");
-SC8547_ADC_ATTR(tdie, sc8547_get_tdie_mc, 1000, "C");
+SC8547_ADC_ATTR(vbus_uv, sc8547_get_vbus_uv);
+SC8547_ADC_ATTR(ibus_ua, sc8547_get_ibus_ua);
+SC8547_ADC_ATTR(vbat_uv, sc8547_get_vbat_uv);
+SC8547_ADC_ATTR(vout_uv, sc8547_get_vout_uv);
+SC8547_ADC_ATTR(vac_uv, sc8547_get_vac_uv);
+SC8547_ADC_ATTR(tdie_mc, sc8547_get_tdie_mc);
 
-static ssize_t vac_show(struct device *dev,
-			struct device_attribute *attr, char *buf)
+static ssize_t status_regs_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int reg06, reg0e;
 	int ret;
 
-	ret = sc8547_read_adc(sc, SC8547_REG_VAC_ADC_H,
-			      SC8547_ADC_12BIT_H_MASK, SC8547_VAC_UV_PER_LSB);
-	if (ret < 0)
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &reg06);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &reg0e);
+	if (ret)
 		return ret;
 
-	return sysfs_emit(buf, "%d mV\n", ret / 1000);
+	return sysfs_emit(buf, "06=0x%02x 0e=0x%02x\n", reg06, reg0e);
 }
-static DEVICE_ATTR_RO(vac);
+static DEVICE_ATTR_RO(status_regs);
 
-static ssize_t vout_show(struct device *dev,
-			 struct device_attribute *attr, char *buf)
+static ssize_t faults_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int reg06, reg0e;
+	size_t len = 0;
 	int ret;
 
-	ret = sc8547_read_adc(sc, SC8547_REG_VOUT_ADC_H,
-			      SC8547_ADC_12BIT_H_MASK, SC8547_VOUT_UV_PER_LSB);
-	if (ret < 0)
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &reg06);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &reg0e);
+	if (ret)
 		return ret;
 
-	return sysfs_emit(buf, "%d mV\n", ret / 1000);
+	if (reg06 & SC8547_TSHUT_STAT)
+		len += sysfs_emit_at(buf, len, "thermal_shutdown ");
+	if (reg06 & SC8547_VBUS_ERRORLO_STAT)
+		len += sysfs_emit_at(buf, len, "vbus_low ");
+	if (reg06 & SC8547_VBUS_ERRORHI_STAT)
+		len += sysfs_emit_at(buf, len, "vbus_high ");
+	if (reg0e & SC8547_VOUT_OVP_STAT)
+		len += sysfs_emit_at(buf, len, "vout_ovp ");
+	if (reg0e & SC8547_VBAT_OVP_STAT)
+		len += sysfs_emit_at(buf, len, "vbat_ovp ");
+	if (reg0e & SC8547_IBAT_OCP_STAT)
+		len += sysfs_emit_at(buf, len, "ibat_ocp ");
+	if (reg0e & SC8547_VBUS_OVP_STAT)
+		len += sysfs_emit_at(buf, len, "vbus_ovp ");
+	if (reg0e & SC8547_IBUS_OCP_STAT)
+		len += sysfs_emit_at(buf, len, "ibus_ocp ");
+	if (reg0e & SC8547_IBUS_UCP_FALL_STAT)
+		len += sysfs_emit_at(buf, len, "ibus_ucp_fall ");
+
+	if (!len)
+		return sysfs_emit(buf, "none\n");
+
+	buf[len - 1] = '\n';
+	return len;
 }
-static DEVICE_ATTR_RO(vout);
+static DEVICE_ATTR_RO(faults);
 
 static struct attribute *sc8547_attrs[] = {
 	&dev_attr_device_id.attr,
 	&dev_attr_role.attr,
 	&dev_attr_charge_enabled.attr,
 	&dev_attr_charge_mode.attr,
-	&dev_attr_vbus.attr,
-	&dev_attr_ibus.attr,
-	&dev_attr_vbat.attr,
-	&dev_attr_vac.attr,
-	&dev_attr_vout.attr,
-	&dev_attr_tdie.attr,
+	&dev_attr_switching.attr,
+	&dev_attr_adapter_present.attr,
+	&dev_attr_battery_present.attr,
+	&dev_attr_vbus_uv.attr,
+	&dev_attr_ibus_ua.attr,
+	&dev_attr_vbat_uv.attr,
+	&dev_attr_vout_uv.attr,
+	&dev_attr_vac_uv.attr,
+	&dev_attr_tdie_mc.attr,
+	&dev_attr_status_regs.attr,
+	&dev_attr_faults.attr,
 	NULL,
 };
 
@@ -266,7 +392,7 @@ static int sc8547_probe(struct i2c_client *client)
 {
 	struct power_supply_config psy_cfg = {};
 	struct sc8547_device *sc;
-	unsigned int id, mode, enabled;
+	unsigned int id, mode, enabled, status;
 	const char *role;
 	char *psy_name;
 	int ret;
@@ -293,7 +419,7 @@ static int sc8547_probe(struct i2c_client *client)
 		role = "standalone";
 	sc->role = role;
 
-	/* ADC telemetry is safe to enable and does not start charge pumping. */
+	/* ADC enable alone does not start charge pumping. */
 	ret = regmap_update_bits(sc->regmap, SC8547_REG_ADC_CTRL,
 				 SC8547_ADC_EN, SC8547_ADC_EN);
 	if (ret)
@@ -329,11 +455,15 @@ static int sc8547_probe(struct i2c_client *client)
 	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &mode);
 	if (ret)
 		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &status);
+	if (ret)
+		return ret;
 
 	dev_info(&client->dev,
-		 "SC8547-family ID 0x%02x role=%s, CP=%s mode=%s (ADC enabled only)\n",
+		 "SC8547-family ID 0x%02x role=%s CP=%s switching=%s mode=%s (telemetry-only)\n",
 		 sc->device_id, sc->role,
 		 enabled & SC8547_CHG_EN ? "on" : "off",
+		 status & SC8547_CP_SWITCHING_STAT ? "yes" : "no",
 		 mode & SC8547_CHARGE_MODE ? "bypass" : "2:1");
 
 	if (sc->device_id == SC8547A_DEVICE_ID)
@@ -342,7 +472,7 @@ static int sc8547_probe(struct i2c_client *client)
 		dev_info(&client->dev, "detected SC8547D-compatible silicon\n");
 	else
 		dev_info(&client->dev,
-			 "unlisted SC8547-family device ID; continuing in telemetry-only mode\n");
+			 "unlisted SC8547-family device ID; keeping telemetry-only mode\n");
 
 	return 0;
 }
@@ -350,7 +480,7 @@ static int sc8547_probe(struct i2c_client *client)
 static const struct of_device_id sc8547_of_match[] = {
 	{ .compatible = "southchip,sc8547" },
 	{ .compatible = "southchip,sc8547a" },
-	/* Downstream-compatible aliases ease Caihong bring-up. */
+	/* Downstream aliases are accepted only to simplify bring-up. */
 	{ .compatible = "oplus,sc8547a" },
 	{ .compatible = "slave_vphy_sc8547" },
 	{ }
@@ -374,6 +504,5 @@ static struct i2c_driver sc8547_driver = {
 };
 module_i2c_driver(sc8547_driver);
 
-MODULE_AUTHOR("OpenAI");
 MODULE_DESCRIPTION("Southchip SC8547/SC8547A charge-pump bring-up driver");
 MODULE_LICENSE("GPL");
