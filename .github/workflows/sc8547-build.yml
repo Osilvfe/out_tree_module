@@ -8,11 +8,13 @@ on:
     paths:
       - "Makefile"
       - "charging/**"
+      - "scripts/sc8547-stage-capture.sh"
       - ".github/workflows/sc8547-build.yml"
   pull_request:
     paths:
       - "Makefile"
       - "charging/**"
+      - "scripts/sc8547-stage-capture.sh"
       - ".github/workflows/sc8547-build.yml"
 
 jobs:
@@ -21,6 +23,12 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Validate stage capture script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n scripts/sc8547-stage-capture.sh
 
       - name: Install build dependencies
         run: |
