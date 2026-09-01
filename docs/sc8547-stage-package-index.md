@@ -196,6 +196,7 @@ Current Stage-6B research package:
 3e48606  D  UCSI vs Qualcomm/Oplus source-interface evidence
 538dad3  D  one-owner qcom_battmgr transaction/ACK constraint
 57c91c   D  exact PPS-request + fixed-5V fallback candidate contract
+cef2b43  D  gated qcom_battmgr kernel-patch design and K0→K3 test ladder
 ```
 
 Important conclusions represented by these commits:
@@ -210,14 +211,17 @@ Important conclusions represented by these commits:
 - non-SoCCP fixed-5V fallback is BAT SET `0x31`, Oplus `BATT_SET_PDO` property
   25, value 5000 mV;
 - Oplus property 25 collides numerically with a different upstream Qualcomm
-  extension meaning, so it must never be treated as generic qcom_battmgr ABI.
+  extension meaning, so it must never be treated as generic qcom_battmgr ABI;
+- the future kernel-tree bridge is split deliberately into K0 platform/ABI
+  gate, K1 validated SET-response parsing, K2 fixed-5V fallback, then K3 exact
+  PPS request. Fallback is hardware-tested before PPS elevation.
 
 There is intentionally **nothing to cherry-pick as a Stage-6B functional
 hardware write yet**.
 
 Before the first future Stage-6B functional commit exists, the gate in
-`sc8547-stage-test-plan.md` and `sc8547-stage6b-request-fallback.md` must be
-satisfied.
+`sc8547-stage-test-plan.md`, `sc8547-stage6b-request-fallback.md` and
+`sc8547-stage6b-qcom-battmgr-patch-design.md` must be satisfied.
 
 ## Stage 6C — automatic source + CP policy
 
