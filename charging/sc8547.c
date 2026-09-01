@@ -15,6 +15,37 @@
 #include <linux/regmap.h>
 #include <linux/sysfs.h>
 
+#define SC8547_REG_BAT_OVP		0x00
+#define SC8547_BAT_OVP_DIS		BIT(7)
+#define SC8547_BAT_OVP_MASK		GENMASK(5, 0)
+#define SC8547_BAT_OVP_BASE_MV		3500
+#define SC8547_BAT_OVP_STEP_MV		25
+
+#define SC8547_REG_BAT_OCP		0x01
+#define SC8547_BAT_OCP_MASK		GENMASK(5, 0)
+#define SC8547_BAT_OCP_BASE_MA		2000
+#define SC8547_BAT_OCP_STEP_MA		100
+
+#define SC8547_REG_AC_OVP		0x02
+#define SC8547_AC_OVP_MASK		GENMASK(2, 0)
+#define SC8547_AC_OVP_BASE_MV		11000
+#define SC8547_AC_OVP_STEP_MV		1000
+
+#define SC8547_REG_VBUS_OVP		0x04
+#define SC8547_VBUS_OVP_DIS		BIT(7)
+#define SC8547_VBUS_OVP_MASK		GENMASK(6, 0)
+#define SC8547_VBUS_OVP_BASE_MV	6000
+#define SC8547_VBUS_OVP_STEP_MV	50
+
+#define SC8547_REG_IBUS_PROT		0x05
+#define SC8547_IBUS_UCP_DIS		BIT(7)
+#define SC8547_IBUS_OCP_DIS		BIT(6)
+#define SC8547_IBUS_OCP_MASK		GENMASK(3, 0)
+#define SC8547_IBUS_OCP_BASE_MA	1200
+#define SC8547_IBUS_OCP_STEP_MA	300
+#define SC8547_UCP_DEGLITCH_SC8547	BIT(5)
+#define SC8547A_UCP_DEGLITCH_MASK	GENMASK(5, 4)
+
 #define SC8547_REG_STATUS_06		0x06
 #define SC8547_TSHUT_STAT		BIT(6)
 #define SC8547_VBUS_ERRORLO_STAT	BIT(5)
@@ -25,9 +56,16 @@
 #define SC8547_CHG_EN			BIT(7)
 #define SC8547_REG_RESET		BIT(6)
 
+#define SC8547_REG_SS_CTRL		0x08
+#define SC8547_SS_TIMEOUT_MASK		GENMASK(7, 5)
+
 #define SC8547_REG_MODE_CTRL		0x09
 #define SC8547_CHARGE_MODE		BIT(7)
 #define SC8547_WATCHDOG_MASK		GENMASK(2, 0)
+
+#define SC8547_REG_PMID2OUT		0x0d
+#define SC8547_PMID2OUT_UVP_MASK	GENMASK(7, 6)
+#define SC8547_PMID2OUT_OVP_MASK	GENMASK(5, 4)
 
 #define SC8547_REG_STATUS_0E		0x0e
 #define SC8547_VOUT_OVP_STAT		BIT(7)
@@ -131,9 +169,9 @@ sc8547_detect_variant(struct sc8547_device *sc, u8 device_id)
 }
 
 /*
- * Common masked control helpers.  These intentionally preserve variant-
- * specific low bits.  They are not exposed as writable userspace controls in
- * this revision; later bring-up commits can use them after protection setup is
+ * Common masked control helpers. These intentionally preserve variant-specific
+ * low bits. They are not exposed as writable userspace controls in this
+ * revision; later bring-up commits can use them after protection setup is
  * validated on hardware.
  */
 static int __maybe_unused sc8547_set_charge_enabled(struct sc8547_device *sc,
@@ -498,6 +536,143 @@ static ssize_t register_dump_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(register_dump);
 
+static int sc8547_ucp_deglitch_us(struct sc8547_device *sc, unsigned int reg05)
+{
+	unsigned int code;
+
+	if (sc->variant == SC8547_VARIANT_SC8547) {
+		return reg05 & SC8547_UCP_DEGLITCH_SC8547 ? 5000 : 10;
+	}
+
+	if (sc->variant != SC8547_VARIANT_SC8547A)
+		return -EINVAL;
+
+	code = FIELD_GET(SC8547A_UCP_DEGLITCH_MASK, reg05);
+	switch (code) {
+	case 0:
+		return 10;
+	case 1:
+		return 5000;
+	case 2:
+		return 50000;
+	case 3:
+		return 100000;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int sc8547_watchdog_ms(unsigned int reg09)
+{
+	switch (FIELD_GET(SC8547_WATCHDOG_MASK, reg09)) {
+	case 0:
+		return 0;
+	case 1:
+		return 200;
+	case 2:
+		return 500;
+	case 3:
+		return 1000;
+	case 4:
+		return 5000;
+	case 5:
+		return 30000;
+	default:
+		return -EINVAL;
+	}
+}
+
+static ssize_t protection_state_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	unsigned int r00, r01, r02, r04, r05, r08, r09, r0d;
+	unsigned int bat_ovp_code, bat_ocp_code, ac_ovp_code;
+	unsigned int vbus_ovp_code, ibus_ocp_code;
+	int deglitch_us, watchdog_ms;
+	size_t len = 0;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_BAT_OVP, &r00);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_BAT_OCP, &r01);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_AC_OVP, &r02);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_VBUS_OVP, &r04);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_PROT, &r05);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_SS_CTRL, &r08);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &r09);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, SC8547_REG_PMID2OUT, &r0d);
+	if (ret)
+		return ret;
+
+	bat_ovp_code = FIELD_GET(SC8547_BAT_OVP_MASK, r00);
+	bat_ocp_code = FIELD_GET(SC8547_BAT_OCP_MASK, r01);
+	ac_ovp_code = FIELD_GET(SC8547_AC_OVP_MASK, r02);
+	vbus_ovp_code = FIELD_GET(SC8547_VBUS_OVP_MASK, r04);
+	ibus_ocp_code = FIELD_GET(SC8547_IBUS_OCP_MASK, r05);
+	deglitch_us = sc8547_ucp_deglitch_us(sc, r05);
+	watchdog_ms = sc8547_watchdog_ms(r09);
+
+	len += sysfs_emit_at(buf, len,
+		"raw 00=%02x 01=%02x 02=%02x 04=%02x 05=%02x 08=%02x 09=%02x 0d=%02x\n",
+		r00, r01, r02, r04, r05, r08, r09, r0d);
+	len += sysfs_emit_at(buf, len,
+		"bat_ovp enabled=%u code=%u header_mv=%u\n",
+		!(r00 & SC8547_BAT_OVP_DIS), bat_ovp_code,
+		SC8547_BAT_OVP_BASE_MV + bat_ovp_code * SC8547_BAT_OVP_STEP_MV);
+	len += sysfs_emit_at(buf, len,
+		"bat_ocp code=%u header_ma=%u\n",
+		bat_ocp_code,
+		SC8547_BAT_OCP_BASE_MA + bat_ocp_code * SC8547_BAT_OCP_STEP_MA);
+	len += sysfs_emit_at(buf, len,
+		"ac_ovp code=%u header_formula_mv=%u\n",
+		ac_ovp_code,
+		SC8547_AC_OVP_BASE_MV + ac_ovp_code * SC8547_AC_OVP_STEP_MV);
+	len += sysfs_emit_at(buf, len,
+		"vbus_ovp enabled=%u code=%u header_mv=%u\n",
+		!(r04 & SC8547_VBUS_OVP_DIS), vbus_ovp_code,
+		SC8547_VBUS_OVP_BASE_MV + vbus_ovp_code * SC8547_VBUS_OVP_STEP_MV);
+	len += sysfs_emit_at(buf, len,
+		"ibus_ucp enabled=%u ibus_ocp enabled=%u code=%u header_ma=%u\n",
+		!(r05 & SC8547_IBUS_UCP_DIS), !(r05 & SC8547_IBUS_OCP_DIS),
+		ibus_ocp_code,
+		SC8547_IBUS_OCP_BASE_MA + ibus_ocp_code * SC8547_IBUS_OCP_STEP_MA);
+	if (deglitch_us >= 0)
+		len += sysfs_emit_at(buf, len, "ibus_ucp_deglitch_us=%d\n",
+				     deglitch_us);
+	else
+		len += sysfs_emit_at(buf, len,
+				     "ibus_ucp_deglitch_us=unknown_for_variant\n");
+	len += sysfs_emit_at(buf, len,
+		"ss_timeout_code=%u pmid2out_uvp_code=%u pmid2out_ovp_code=%u\n",
+		FIELD_GET(SC8547_SS_TIMEOUT_MASK, r08),
+		FIELD_GET(SC8547_PMID2OUT_UVP_MASK, r0d),
+		FIELD_GET(SC8547_PMID2OUT_OVP_MASK, r0d));
+	if (watchdog_ms >= 0)
+		len += sysfs_emit_at(buf, len, "watchdog_ms=%d\n", watchdog_ms);
+	else
+		len += sysfs_emit_at(buf, len, "watchdog_ms=reserved_code_%u\n",
+				     FIELD_GET(SC8547_WATCHDOG_MASK, r09));
+	len += sysfs_emit_at(buf, len,
+		"note=header_* values are vendor-header decodes, not yet hardware-validated thresholds\n");
+
+	return len;
+}
+static DEVICE_ATTR_RO(protection_state);
+
 static struct attribute *sc8547_attrs[] = {
 	&dev_attr_device_id.attr,
 	&dev_attr_variant.attr,
@@ -516,6 +691,7 @@ static struct attribute *sc8547_attrs[] = {
 	&dev_attr_status_regs.attr,
 	&dev_attr_faults.attr,
 	&dev_attr_register_dump.attr,
+	&dev_attr_protection_state.attr,
 	NULL,
 };
 
