@@ -30,7 +30,16 @@ struct sc8547_state {
 /*
  * Development-branch internal API shared by the physical SC8547 driver and
  * the Stage-5 virtual coordinator. This is not a userspace or upstream ABI.
- * Callers must hold a reference to the i2c_client device while using it.
+ *
+ * The physical driver owns all locking, Stage-3/4 authorization checks,
+ * voltage-window checks and post-enable fail-closed behavior. Callers must not
+ * reproduce those rules with direct register writes. They must hold a device
+ * reference to the i2c_client for the duration of each call.
+ *
+ * manual_preflight() is observational: it performs the same enable checks
+ * without starting the pump. manual_enable() repeats those checks before the
+ * actual masked enable write, so a coordinator can preflight two pumps before
+ * the first write without relying on a stale earlier result.
  */
 int sc8547_get_state(struct i2c_client *client, struct sc8547_state *state);
 int sc8547_set_manual_mode(struct i2c_client *client, bool bypass);
