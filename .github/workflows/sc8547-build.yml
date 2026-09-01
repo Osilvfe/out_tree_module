@@ -1,0 +1,37 @@
+name: SC8547 module build
+
+on:
+  push:
+    branches:
+      - main
+      - sc8547-next
+    paths:
+      - "Makefile"
+      - "charging/**"
+      - ".github/workflows/sc8547-build.yml"
+  pull_request:
+    paths:
+      - "Makefile"
+      - "charging/**"
+      - ".github/workflows/sc8547-build.yml"
+
+jobs:
+  build-sc8547:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-headers-generic
+
+      - name: Build SC8547 module with warnings enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          KDIR="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n1)"
+          test -n "$KDIR"
+          echo "KDIR=$KDIR"
+          make -C "$KDIR" M="$GITHUB_WORKSPACE" W=1 sc8547_cp.ko
