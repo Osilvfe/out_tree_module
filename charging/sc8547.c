@@ -135,6 +135,8 @@ struct sc8547_raw_profile {
 	u8 reg04;
 	u8 reg05;
 	u8 reg0d;
+	bool has_reg01;
+	bool has_reg0d;
 	bool complete;
 };
 
@@ -171,6 +173,12 @@ static const char *sc8547_variant_name(enum sc8547_variant variant)
 	default:
 		return "unknown";
 	}
+}
+
+static bool sc8547_variant_control_supported(enum sc8547_variant variant)
+{
+	return variant == SC8547_VARIANT_SC8547 ||
+	       variant == SC8547_VARIANT_SC8547A;
 }
 
 static enum sc8547_variant
@@ -761,31 +769,59 @@ static int sc8547_read_u8_property(struct device *dev, const char *name, u8 *val
 	return 0;
 }
 
+static int sc8547_read_optional_u8_property(struct device *dev,
+					    const char *name, u8 *val,
+					    bool *present)
+{
+	u32 tmp;
+	int ret;
+
+	ret = device_property_read_u32(dev, name, &tmp);
+	if (ret) {
+		*present = false;
+		return 0;
+	}
+	if (tmp > 0xff)
+		return -ERANGE;
+
+	*present = true;
+	*val = tmp;
+	return 0;
+}
+
 static void sc8547_parse_experimental_profile(struct sc8547_device *sc)
 {
 	struct device *dev = sc->dev;
-	int ret = 0;
+	bool complete = true;
 
 	sc->allow_experimental_control =
 		device_property_read_bool(dev, "southchip,allow-experimental-control");
 	if (!sc->allow_experimental_control)
 		return;
 
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg00",
-				       &sc->profile.reg00);
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg01",
-				       &sc->profile.reg01);
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg02",
-				       &sc->profile.reg02);
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg04",
-				       &sc->profile.reg04);
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg05",
-				       &sc->profile.reg05);
-	ret |= sc8547_read_u8_property(dev, "southchip,experimental-reg0d",
-				       &sc->profile.reg0d);
+	if (sc8547_read_u8_property(dev, "southchip,experimental-reg00",
+				    &sc->profile.reg00))
+		complete = false;
+	if (sc8547_read_u8_property(dev, "southchip,experimental-reg02",
+				    &sc->profile.reg02))
+		complete = false;
+	if (sc8547_read_u8_property(dev, "southchip,experimental-reg04",
+				    &sc->profile.reg04))
+		complete = false;
+	if (sc8547_read_u8_property(dev, "southchip,experimental-reg05",
+				    &sc->profile.reg05))
+		complete = false;
+	if (sc8547_read_optional_u8_property(dev, "southchip,experimental-reg01",
+					     &sc->profile.reg01,
+					     &sc->profile.has_reg01))
+		complete = false;
+	if (sc8547_read_optional_u8_property(dev, "southchip,experimental-reg0d",
+					     &sc->profile.reg0d,
+					     &sc->profile.has_reg0d))
+		complete = false;
 
-	sc->profile.complete = !ret;
-	if (!sc->profile.complete)
+	sc->profile.complete = complete;
+	if (!complete)
 		dev_warn(dev,
 			 "experimental controls enabled but raw protection profile is incomplete/invalid\n");
 }
@@ -806,29 +842,47 @@ static int sc8547_fail_closed(struct sc8547_device *sc)
 	return first;
 }
 
-static int sc8547_profile_readback(struct sc8547_device *sc)
+static int sc8547_verify_reg(struct sc8547_device *sc, unsigned int reg,
+			     u8 expected)
 {
-	const struct sc8547_raw_profile *p = &sc->profile;
 	unsigned int val;
 	int ret;
 
-#define SC8547_VERIFY_REG(_reg, _expected) \
-	do { \
-		ret = regmap_read(sc->regmap, (_reg), &val); \
-		if (ret) \
-			return ret; \
-		if (val != (_expected)) \
-			return -EIO; \
-	} while (0)
+	ret = regmap_read(sc->regmap, reg, &val);
+	if (ret)
+		return ret;
 
-	SC8547_VERIFY_REG(SC8547_REG_BAT_OVP, p->reg00);
-	SC8547_VERIFY_REG(SC8547_REG_BAT_OCP, p->reg01);
-	SC8547_VERIFY_REG(SC8547_REG_AC_OVP, p->reg02);
-	SC8547_VERIFY_REG(SC8547_REG_VBUS_OVP, p->reg04);
-	SC8547_VERIFY_REG(SC8547_REG_IBUS_PROT, p->reg05);
-	SC8547_VERIFY_REG(SC8547_REG_PMID2OUT, p->reg0d);
+	return val == expected ? 0 : -EIO;
+}
 
-#undef SC8547_VERIFY_REG
+static int sc8547_profile_readback(struct sc8547_device *sc)
+{
+	const struct sc8547_raw_profile *p = &sc->profile;
+	int ret;
+
+	ret = sc8547_verify_reg(sc, SC8547_REG_BAT_OVP, p->reg00);
+	if (ret)
+		return ret;
+	ret = sc8547_verify_reg(sc, SC8547_REG_AC_OVP, p->reg02);
+	if (ret)
+		return ret;
+	ret = sc8547_verify_reg(sc, SC8547_REG_VBUS_OVP, p->reg04);
+	if (ret)
+		return ret;
+	ret = sc8547_verify_reg(sc, SC8547_REG_IBUS_PROT, p->reg05);
+	if (ret)
+		return ret;
+	if (p->has_reg01) {
+		ret = sc8547_verify_reg(sc, SC8547_REG_BAT_OCP, p->reg01);
+		if (ret)
+			return ret;
+	}
+	if (p->has_reg0d) {
+		ret = sc8547_verify_reg(sc, SC8547_REG_PMID2OUT, p->reg0d);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -837,8 +891,8 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 	const struct sc8547_raw_profile *p = &sc->profile;
 	int ret;
 
-	if (sc->variant == SC8547_VARIANT_UNKNOWN)
-		return -ENODEV;
+	if (!sc8547_variant_control_supported(sc->variant))
+		return -EOPNOTSUPP;
 	if (!p->complete)
 		return -EINVAL;
 
@@ -862,9 +916,11 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 	ret = regmap_write(sc->regmap, SC8547_REG_BAT_OVP, p->reg00);
 	if (ret)
 		goto fail;
-	ret = regmap_write(sc->regmap, SC8547_REG_BAT_OCP, p->reg01);
-	if (ret)
-		goto fail;
+	if (p->has_reg01) {
+		ret = regmap_write(sc->regmap, SC8547_REG_BAT_OCP, p->reg01);
+		if (ret)
+			goto fail;
+	}
 	ret = regmap_write(sc->regmap, SC8547_REG_AC_OVP, p->reg02);
 	if (ret)
 		goto fail;
@@ -874,9 +930,11 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 	ret = regmap_write(sc->regmap, SC8547_REG_IBUS_PROT, p->reg05);
 	if (ret)
 		goto fail;
-	ret = regmap_write(sc->regmap, SC8547_REG_PMID2OUT, p->reg0d);
-	if (ret)
-		goto fail;
+	if (p->has_reg0d) {
+		ret = regmap_write(sc->regmap, SC8547_REG_PMID2OUT, p->reg0d);
+		if (ret)
+			goto fail;
+	}
 
 	ret = sc8547_fail_closed(sc);
 	if (ret)
@@ -904,13 +962,23 @@ static ssize_t profile_raw_show(struct device *dev,
 {
 	struct sc8547_device *sc = dev_get_drvdata(dev);
 	const struct sc8547_raw_profile *p = &sc->profile;
+	size_t len = 0;
 
 	if (!p->complete)
 		return sysfs_emit(buf, "incomplete\n");
 
-	return sysfs_emit(buf,
-		"00=%02x 01=%02x 02=%02x 04=%02x 05=%02x 0d=%02x\n",
-		p->reg00, p->reg01, p->reg02, p->reg04, p->reg05, p->reg0d);
+	len += sysfs_emit_at(buf, len, "required 00=%02x 02=%02x 04=%02x 05=%02x\n",
+			     p->reg00, p->reg02, p->reg04, p->reg05);
+	if (p->has_reg01)
+		len += sysfs_emit_at(buf, len, "optional 01=%02x ", p->reg01);
+	else
+		len += sysfs_emit_at(buf, len, "optional 01=absent ");
+	if (p->has_reg0d)
+		len += sysfs_emit_at(buf, len, "0d=%02x\n", p->reg0d);
+	else
+		len += sysfs_emit_at(buf, len, "0d=absent\n");
+
+	return len;
 }
 static DEVICE_ATTR_RO(profile_raw);
 
@@ -1106,9 +1174,9 @@ static int sc8547_probe(struct i2c_client *client)
 		 mode & SC8547_CHARGE_MODE ? "bypass" : "2:1",
 		 sc->allow_experimental_control ? " experimental-control" : " telemetry-only");
 
-	if (sc->variant == SC8547_VARIANT_UNKNOWN)
+	if (!sc8547_variant_control_supported(sc->variant))
 		dev_warn(&client->dev,
-			 "unlisted SC8547-family device ID; control path will refuse initialization\n");
+			 "silicon variant is not enabled for experimental control; initialization will be refused\n");
 
 	return 0;
 }
@@ -1117,7 +1185,7 @@ static void sc8547_shutdown(struct i2c_client *client)
 {
 	struct sc8547_device *sc = i2c_get_clientdata(client);
 
-	if (!sc)
+	if (!sc || !sc->allow_experimental_control)
 		return;
 
 	/* Best-effort fail closed; never leave a development watchdog running. */
