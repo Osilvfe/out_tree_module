@@ -2,10 +2,10 @@
 /*
  * Southchip SC8547/SC8547A charge-pump bring-up driver.
  *
- * Standalone mainline-style port for OnePlus Pad Pro (caihong). This initial
- * revision is intentionally conservative: it enables ADC conversion and
- * exposes telemetry/state, but never starts the charge pump or changes the
- * board's protection thresholds.
+ * Standalone mainline-style port for OnePlus Pad Pro (caihong). The default
+ * path remains conservative: probe enables ADC conversion and exposes
+ * telemetry/state, but never starts the charge pump or changes protection
+ * thresholds.
  */
 
 #include <linux/i2c.h>
@@ -23,9 +23,11 @@
 
 #define SC8547_REG_CHG_CTRL		0x07
 #define SC8547_CHG_EN			BIT(7)
+#define SC8547_REG_RESET		BIT(6)
 
 #define SC8547_REG_MODE_CTRL		0x09
 #define SC8547_CHARGE_MODE		BIT(7)
+#define SC8547_WATCHDOG_MASK		GENMASK(2, 0)
 
 #define SC8547_REG_STATUS_0E		0x0e
 #define SC8547_VOUT_OVP_STAT		BIT(7)
@@ -62,12 +64,36 @@
 #define SC8547_VBAT_UV_PER_LSB		1250
 #define SC8547_TDIE_MC_PER_LSB		500
 
+enum sc8547_variant {
+	SC8547_VARIANT_UNKNOWN,
+	SC8547_VARIANT_SC8547,
+	SC8547_VARIANT_SC8547A,
+	SC8547_VARIANT_SC8547D,
+};
+
+struct sc8547_chip_info {
+	enum sc8547_variant variant;
+	const char *name;
+};
+
+static const struct sc8547_chip_info sc8547_info = {
+	.variant = SC8547_VARIANT_SC8547,
+	.name = "sc8547",
+};
+
+static const struct sc8547_chip_info sc8547a_info = {
+	.variant = SC8547_VARIANT_SC8547A,
+	.name = "sc8547a",
+};
+
 struct sc8547_device {
 	struct device *dev;
 	struct regmap *regmap;
 	struct power_supply *psy;
 	struct power_supply_desc psy_desc;
+	const struct sc8547_chip_info *match_info;
 	const char *role;
+	enum sc8547_variant variant;
 	u8 device_id;
 };
 
@@ -76,6 +102,61 @@ static const struct regmap_config sc8547_regmap_config = {
 	.val_bits = 8,
 	.max_register = 0xff,
 };
+
+static const char *sc8547_variant_name(enum sc8547_variant variant)
+{
+	switch (variant) {
+	case SC8547_VARIANT_SC8547:
+		return "sc8547";
+	case SC8547_VARIANT_SC8547A:
+		return "sc8547a";
+	case SC8547_VARIANT_SC8547D:
+		return "sc8547d";
+	default:
+		return "unknown";
+	}
+}
+
+static enum sc8547_variant
+sc8547_detect_variant(struct sc8547_device *sc, u8 device_id)
+{
+	if (device_id == SC8547A_DEVICE_ID)
+		return SC8547_VARIANT_SC8547A;
+	if (device_id == SC8547D_DEVICE_ID)
+		return SC8547_VARIANT_SC8547D;
+	if (sc->match_info)
+		return sc->match_info->variant;
+
+	return SC8547_VARIANT_UNKNOWN;
+}
+
+/*
+ * Common masked control helpers.  These intentionally preserve variant-
+ * specific low bits.  They are not exposed as writable userspace controls in
+ * this revision; later bring-up commits can use them after protection setup is
+ * validated on hardware.
+ */
+static int __maybe_unused sc8547_set_charge_enabled(struct sc8547_device *sc,
+						     bool enable)
+{
+	return regmap_update_bits(sc->regmap, SC8547_REG_CHG_CTRL,
+				 SC8547_CHG_EN, enable ? SC8547_CHG_EN : 0);
+}
+
+static int __maybe_unused sc8547_set_work_mode(struct sc8547_device *sc,
+					       bool bypass)
+{
+	return regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
+				 SC8547_CHARGE_MODE,
+				 bypass ? SC8547_CHARGE_MODE : 0);
+}
+
+static int __maybe_unused sc8547_set_adc_enabled(struct sc8547_device *sc,
+						  bool enable)
+{
+	return regmap_update_bits(sc->regmap, SC8547_REG_ADC_CTRL,
+				 SC8547_ADC_EN, enable ? SC8547_ADC_EN : 0);
+}
 
 static int sc8547_read_adc(struct sc8547_device *sc, unsigned int reg,
 			   unsigned int high_mask, int scale)
@@ -183,7 +264,6 @@ static int sc8547_psy_get_property(struct power_supply *psy,
 		ret = sc8547_get_tdie_mc(sc);
 		if (ret < 0)
 			return ret;
-		/* POWER_SUPPLY_PROP_TEMP is in tenths of a degree Celsius. */
 		val->intval = ret / 100;
 		return 0;
 	default:
@@ -199,6 +279,15 @@ static ssize_t device_id_show(struct device *dev,
 	return sysfs_emit(buf, "0x%02x\n", sc->device_id);
 }
 static DEVICE_ATTR_RO(device_id);
+
+static ssize_t variant_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", sc8547_variant_name(sc->variant));
+}
+static DEVICE_ATTR_RO(variant);
 
 static ssize_t role_show(struct device *dev,
 			 struct device_attribute *attr, char *buf)
@@ -364,8 +453,54 @@ static ssize_t faults_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(faults);
 
+static int sc8547_dump_range(struct sc8547_device *sc, char *buf, size_t *len,
+			     unsigned int first, unsigned int last)
+{
+	unsigned int reg, val;
+	int ret;
+
+	for (reg = first; reg <= last; reg++) {
+		ret = regmap_read(sc->regmap, reg, &val);
+		if (ret)
+			return ret;
+		*len += sysfs_emit_at(buf, *len, "%02x:%02x\n", reg, val);
+	}
+
+	return 0;
+}
+
+static ssize_t register_dump_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct sc8547_device *sc = dev_get_drvdata(dev);
+	size_t len = 0;
+	unsigned int val;
+	int ret;
+
+	/* Common charge-pump/ADC register map only; do not touch UFCS buffers. */
+	ret = sc8547_dump_range(sc, buf, &len, 0x00, 0x23);
+	if (ret)
+		return ret;
+	ret = sc8547_dump_range(sc, buf, &len, 0x2b, 0x33);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(sc->regmap, 0x36, &val);
+	if (ret)
+		return ret;
+	len += sysfs_emit_at(buf, len, "36:%02x\n", val);
+
+	ret = sc8547_dump_range(sc, buf, &len, 0x3a, 0x3c);
+	if (ret)
+		return ret;
+
+	return len;
+}
+static DEVICE_ATTR_RO(register_dump);
+
 static struct attribute *sc8547_attrs[] = {
 	&dev_attr_device_id.attr,
+	&dev_attr_variant.attr,
 	&dev_attr_role.attr,
 	&dev_attr_charge_enabled.attr,
 	&dev_attr_charge_mode.attr,
@@ -380,6 +515,7 @@ static struct attribute *sc8547_attrs[] = {
 	&dev_attr_tdie_mc.attr,
 	&dev_attr_status_regs.attr,
 	&dev_attr_faults.attr,
+	&dev_attr_register_dump.attr,
 	NULL,
 };
 
@@ -402,6 +538,7 @@ static int sc8547_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	sc->dev = &client->dev;
+	sc->match_info = device_get_match_data(&client->dev);
 	sc->regmap = devm_regmap_init_i2c(client, &sc8547_regmap_config);
 	if (IS_ERR(sc->regmap))
 		return dev_err_probe(&client->dev, PTR_ERR(sc->regmap),
@@ -415,13 +552,20 @@ static int sc8547_probe(struct i2c_client *client)
 				     "failed to read device ID\n");
 
 	sc->device_id = id;
+	sc->variant = sc8547_detect_variant(sc, sc->device_id);
 	if (device_property_read_string(&client->dev, "southchip,role", &role))
 		role = "standalone";
 	sc->role = role;
 
+	if (sc->match_info && sc->match_info->variant != sc->variant &&
+	    sc->variant != SC8547_VARIANT_UNKNOWN)
+		dev_warn(&client->dev,
+			 "DT compatible suggests %s but device ID 0x%02x identifies %s\n",
+			 sc->match_info->name, sc->device_id,
+			 sc8547_variant_name(sc->variant));
+
 	/* ADC enable alone does not start charge pumping. */
-	ret = regmap_update_bits(sc->regmap, SC8547_REG_ADC_CTRL,
-				 SC8547_ADC_EN, SC8547_ADC_EN);
+	ret = sc8547_set_adc_enabled(sc, true);
 	if (ret)
 		return dev_err_probe(&client->dev, ret,
 				     "failed to enable ADC\n");
@@ -460,29 +604,25 @@ static int sc8547_probe(struct i2c_client *client)
 		return ret;
 
 	dev_info(&client->dev,
-		 "SC8547-family ID 0x%02x role=%s CP=%s switching=%s mode=%s (telemetry-only)\n",
-		 sc->device_id, sc->role,
+		 "%s ID=0x%02x role=%s CP=%s switching=%s mode=%s (telemetry-only)\n",
+		 sc8547_variant_name(sc->variant), sc->device_id, sc->role,
 		 enabled & SC8547_CHG_EN ? "on" : "off",
 		 status & SC8547_CP_SWITCHING_STAT ? "yes" : "no",
 		 mode & SC8547_CHARGE_MODE ? "bypass" : "2:1");
 
-	if (sc->device_id == SC8547A_DEVICE_ID)
-		dev_info(&client->dev, "detected SC8547A\n");
-	else if (sc->device_id == SC8547D_DEVICE_ID)
-		dev_info(&client->dev, "detected SC8547D-compatible silicon\n");
-	else
-		dev_info(&client->dev,
-			 "unlisted SC8547-family device ID; keeping telemetry-only mode\n");
+	if (sc->variant == SC8547_VARIANT_UNKNOWN)
+		dev_warn(&client->dev,
+			 "unlisted SC8547-family device ID; keep control path disabled until identified\n");
 
 	return 0;
 }
 
 static const struct of_device_id sc8547_of_match[] = {
-	{ .compatible = "southchip,sc8547" },
-	{ .compatible = "southchip,sc8547a" },
+	{ .compatible = "southchip,sc8547", .data = &sc8547_info },
+	{ .compatible = "southchip,sc8547a", .data = &sc8547a_info },
 	/* Downstream aliases are accepted only to simplify bring-up. */
-	{ .compatible = "oplus,sc8547a" },
-	{ .compatible = "slave_vphy_sc8547" },
+	{ .compatible = "oplus,sc8547a", .data = &sc8547a_info },
+	{ .compatible = "slave_vphy_sc8547", .data = &sc8547_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, sc8547_of_match);
