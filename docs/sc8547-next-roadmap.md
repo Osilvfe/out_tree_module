@@ -18,6 +18,8 @@ instead of merging the whole development branch.
   silently enabled by merely adding the normal device node.
 - VOOC/SuperVOOC/UFCS protocol support is intentionally separate from generic
   charge-pump control.
+- Documentation is written before or together with each write-capable stage so
+  the test and merge contract does not depend on unwritten context.
 
 ## Hardware topology
 
@@ -45,12 +47,15 @@ shared in the Oplus source.
 
 They are **not** register-for-register identical for control programming.
 Known differences include the `REG05` IBUS-UCP deglitch field and downstream
-`REG07` low-bit setup. Therefore common control code must use masked updates for
+`REG07` low-bit setup. Therefore common control code uses masked updates for
 shared bits such as CP enable and work mode, and variant-specific helpers for
 fields that differ.
 
 SC8547A additionally exposes UFCS registers starting at `0x40`; those are not
 part of the generic charge-pump bring-up.
+
+SC8547D is currently recognized for telemetry but deliberately rejected by the
+experimental write path until its control compatibility is established.
 
 ## Protection-value caution
 
@@ -72,8 +77,7 @@ than silently resolved.
 
 Because the source comments, encoded project values, and header formulas are
 not fully self-consistent, the development driver keeps raw values visible and
-does not automatically program this protection profile until hardware behavior
-is verified.
+does not automatically derive a protection profile from the project values.
 
 ## Stage 0 - baseline telemetry
 
@@ -106,7 +110,12 @@ Only after this gate should Stage 0 be considered device-verified.
 
 ## Stage 1 - variant model and register snapshot
 
-Status: implemented on `sc8547-next` in commit `60c230c`.
+Status: implemented on `sc8547-next`.
+
+Primary source commit:
+
+- `60c230c` - variant model, runtime-ID warning, masked helpers and read-only
+  register snapshot.
 
 New behavior:
 
@@ -132,7 +141,13 @@ This provides the reference state for later protection/control stages.
 
 ## Stage 2 - protection model, decode only
 
-Status: implemented on `sc8547-next` in commit `bc553aa`.
+Status: implemented on `sc8547-next`.
+
+Source commits:
+
+- `bc553aa` - read-only protection decode;
+- `f15fb5a` - explicit bitfield-helper include so the decode commit does not
+  rely on indirect includes.
 
 New read-only attribute:
 
@@ -173,52 +188,95 @@ to `0x36` and `0x0b`, and whether primary/secondary differ after boot.
 Any decode with contradictory vendor definitions remains labelled ambiguous
 instead of being treated as authoritative.
 
-## Stage 3 - controlled hardware init
+## Stage 3 - gated controlled hardware init
 
-Next development stage.
+Status: implemented on `sc8547-next`, **not hardware-validated**.
 
-Goals:
+Source commits in development history:
 
-- implement reset and generic CP initialization separately for primary and
-  secondary;
-- preserve VOOC/DPDM/UFCS registers;
-- keep CP disabled after init;
-- add watchdog programming helpers;
-- require an explicit development-only DT opt-in before exposing unverified
-  write controls;
-- require explicit raw protection values for any experimental protection write
-  rather than silently assuming that `0x36`/`0x0b` comments are correct.
+- `aa3c510` - initial gated experimental reset/init/watchdog controls;
+- `29e6c6c` - role-safe profile handling, optional primary-only fields,
+  telemetry-only shutdown safety, SC8547D/unknown write rejection;
+- `17d7037a` - Linux v7.2 `power_supply` API and strict-format compatibility.
 
-The intended development interface is fail-closed: normal DTS nodes remain
-read-only/telemetry-only. Experimental write controls should not even appear
-unless a dedicated opt-in property is present.
+Stage-3 interface documentation:
+
+- `docs/sc8547-experimental-control.md`
+- latest alignment commit in the current history: `d6509c6`
+
+The experimental controls exist only with:
+
+```dts
+southchip,allow-experimental-control;
+```
+
+Without that property the device remains telemetry-only apart from ADC enable.
+
+Stage 3 requires explicit raw values for `REG00/02/04/05`; `REG01` and `REG0d`
+are optional because primary and secondary vendor init sequences are not
+identical. It does not synthesize a profile from downstream `ovp_reg`/`ocp_reg`
+project values.
+
+`apply_init`:
+
+1. accepts only SC8547/SC8547A control variants;
+2. fails closed before and after reset;
+3. writes only explicitly supplied generic protection registers;
+4. leaves CP disabled and watchdog disabled;
+5. enables ADC;
+6. reads every written register back;
+7. marks init complete only after exact readback.
+
+Stage 3 also exposes masked watchdog control after successful init, but still
+has **no writable CP-enable or charge-mode interface**.
 
 ### Test gate
 
-After init and before CP enable:
+After init and before any Stage-4 code is considered device-safe:
 
 1. CP remains disabled;
 2. ADC remains functional;
 3. no unexpected fault bits are asserted;
 4. raw protection registers match the explicitly requested profile;
-5. basic PMIC/pmic-glink charging still works.
+5. omitted optional registers were not intentionally overwritten;
+6. basic PMIC/pmic-glink charging still works.
 
 ## Stage 4 - manual single-pump control
 
-Planned after Stage 3.
+Status: interface/test plan documented; source implementation is the next code
+stage and must remain development-only until Stage 3 passes real hardware.
 
-Goals:
+Design document:
 
-- development-only manual 2:1/bypass selection;
-- development-only CP enable/disable;
-- masked writes only for common enable/mode bits;
-- refuse enable when protection initialization has not completed;
-- refuse enable for unknown silicon variant;
-- optionally require VBUS/VBAT sanity checks before enable;
-- verify `REG06` switching state after enable and fail closed if switching does
-  not start.
+- `docs/sc8547-stage4-manual-control.md`
+- initial design commit: `ffd115b`
 
-No automatic fast-charge policy at this stage.
+Stage 4 adds a **second** opt-in:
+
+```dts
+southchip,allow-experimental-cp-enable;
+```
+
+It also requires explicit VBUS/VBAT authorization windows. There are no default
+voltage windows.
+
+Planned rules:
+
+- `work_mode` changes only `REG09[7]`, only while CP is disabled;
+- `cp_enable=1` requires Stage-3 `init_done`;
+- supported silicon only;
+- valid configured VBUS/VBAT safety window;
+- adapter and battery present;
+- no blocking thermal/OVP/OCP/UCP/VBUS-error status;
+- ADC VBUS/VBAT inside the configured window;
+- enable changes only `REG07[7]`;
+- after the vendor-derived 500 ms observation interval, `REG06[2]` must report
+  switching and no new blocking fault may be present;
+- failure immediately clears `REG07[7]`;
+- disable remains straightforward and fail-closed.
+
+No USB source negotiation or automatic charging policy exists in Stage 4.
+Only one pump is to be tested at a time.
 
 ### Test order
 
@@ -275,9 +333,11 @@ review/testing.
 When hardware testing becomes available, move changes to `main` in this order:
 
 1. `60c230c` - Stage 1 variant/snapshot support;
-2. `bc553aa` - Stage 2 protection decode;
-3. Stage 3 init/watchdog commit(s) only after protection values are confirmed;
-4. Stage 4 manual-control commit(s) after safe lab tests;
+2. `bc553aa`, then `f15fb5a` - Stage 2 protection decode/include fix;
+3. Stage 3 source series (`aa3c510`, `29e6c6c`, `17d7037a`) only after Stage
+   0-2 data have been reviewed; if cherry-picking the historical series rather
+   than a future squashed commit, preserve this order;
+4. Stage 4 manual-control commit(s) only after Stage 3 passes the hardware gate;
 5. Stage 5 dual-pump coordinator;
 6. Stage 6 PD/PPS integration.
 
@@ -286,11 +346,29 @@ Documentation-only commits may be cherry-picked at any time.
 Never cherry-pick a later control stage merely because it compiles; each stage
 assumes the previous hardware gate has passed.
 
-## Build verification notes
+## Build verification
 
-Earlier baseline/Stage-1 source was compiled successfully against Linux 6.12.96
-headers with `W=1`. The execution environment used for this development session
-currently cannot resolve `github.com`, so a fresh clone-based build of every
-new commit is not always possible. When that happens, the commit remains marked
-as development-only until it is compiled either locally against available
-headers or on the actual Caihong Linux 7.2 tree.
+The repository contains two CI paths:
+
+1. the existing full out-of-tree build against torvalds Linux v7.2;
+2. a focused SC8547-only Linux v7.2 `W=1` workflow, added so unrelated
+   touchscreen/pogo build failures cannot hide charging-driver status.
+
+The first v7.2 full-module run exposed two SC8547-specific compatibility issues:
+
+- strict `%u` formatting of `FIELD_GET()` results;
+- `power_supply_config.of_node` removal in favor of `fwnode`.
+
+Both were fixed in `17d7037a`.
+
+The full-module workflow can still fail on existing touchscreen/pogo warnings or
+APIs; those failures are outside the charging workstream. The focused workflow
+is the authoritative compile signal for `charging/sc8547.c` while those modules
+remain independent.
+
+Focused Linux-v7.2 CI definition commit:
+
+- `4a0df97` - clone Linux v7.2 and build only `sc8547_cp.ko` with `W=1`.
+
+The exact Caihong Linux 7.2 kernel configuration/tree remains the final target
+compile environment and must still be tested locally when available.
