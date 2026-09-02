@@ -190,28 +190,46 @@ is the independent read-only source-observation track.
 Status: **research/documentation only; no functional source-write commit exists
 yet.**
 
-Current Stage-6B research package:
+Current Stage-6B research/design package:
 
 ```text
 3e48606  D  UCSI vs Qualcomm/Oplus source-interface evidence
-538dad3  D  one-owner qcom_battmgr transaction/ACK constraint
+fedc9b6  D  one-owner qcom_battmgr transaction/ACK constraint
 57c91c   D  exact PPS-request + fixed-5V fallback candidate contract
 cef2b43  D  gated qcom_battmgr kernel-patch design and K0→K3 test ladder
+6aa84fd  D  refresh ownership design with SM8650 variant/gate/service details
 ```
 
-Important conclusions represented by these commits:
+`fedc9b6` is the actual ownership-document commit. An earlier version of this
+index incorrectly listed non-existent short SHA `538dad3`; do not use that
+value when constructing a test/history branch.
+
+Important conclusions represented by the Stage-6B package:
 
 - UCSI `GET_PDOS` may provide standard APDO capability observation;
 - UCSI `SET_PDOS` is not an exact PPS sink `(mV,mA)` request;
+- UCSI `SET_POWER_LEVEL` is a power ceiling/renegotiation primitive, not the
+  exact programmable PPS tuple needed by the downstream control loop;
 - an independent second BATTMGR-owner PMIC-Glink client is unsafe;
 - if Oplus private PPS properties are required, the existing qcom_battmgr
   transaction owner must be extended/refactored;
+- SM8650 PMIC-Glink falls through the `sm8650`→`sm8550` compatible chain and
+  uses SM8550-family battmgr handling, but **SoC variant alone is not sufficient
+  authorization for the Oplus property namespace**;
+- the PMIC-Glink `power-supply` auxiliary device inherits the parent's OF node,
+  so a future explicit firmware-ABI gate can live on the PMIC-Glink node and be
+  read by the existing qcom_battmgr instance;
 - non-SoCCP PPS request candidate is USB SET `0x33`, properties 34/35;
 - downstream normal-return candidate explicitly requests fixed PDO 5 V;
 - non-SoCCP fixed-5V fallback is BAT SET `0x31`, Oplus `BATT_SET_PDO` property
   25, value 5000 mV;
 - Oplus property 25 collides numerically with a different upstream Qualcomm
   extension meaning, so it must never be treated as generic qcom_battmgr ABI;
+- Linux v7.2's current SM8350/SM8550 callback does not yet provide the explicit
+  validated SET-response handling required for these private operations;
+- PMIC-Glink service-down does not make a pending property request successful;
+  a timeout/service reset leaves source-contract state unknown and requires
+  later re-observation;
 - the future kernel-tree bridge is split deliberately into K0 platform/ABI
   gate, K1 validated SET-response parsing, K2 fixed-5V fallback, then K3 exact
   PPS request. Fallback is hardware-tested before PPS elevation.
@@ -219,9 +237,33 @@ Important conclusions represented by these commits:
 There is intentionally **nothing to cherry-pick as a Stage-6B functional
 hardware write yet**.
 
-Before the first future Stage-6B functional commit exists, the gate in
-`sc8547-stage-test-plan.md`, `sc8547-stage6b-request-fallback.md` and
-`sc8547-stage6b-qcom-battmgr-patch-design.md` must be satisfied.
+Before the first future Stage-6B functional commit exists, the gates in these
+files must be satisfied:
+
+```text
+docs/sc8547-stage-test-plan.md
+docs/sc8547-stage6b-source-interface-research.md
+docs/sc8547-stage6b-qcom-battmgr-ownership.md
+docs/sc8547-stage6b-request-fallback.md
+docs/sc8547-stage6b-qcom-battmgr-patch-design.md
+```
+
+Future Stage-6B functional commits are expected to span two repositories and
+must be recorded separately:
+
+```text
+kernel tree:
+  6B-K0  explicit Oplus firmware-ABI gate/plumbing, no callable SET
+  6B-K1  validated BAT/USB SET response parser, still no electrical caller
+  6B-K2  fixed-5V fallback helper only
+  6B-K3  bounded exact PPS request helper
+
+out_tree_module:
+  6B-U0  source-only bounded test consumer, both SC8547 pumps required off
+```
+
+Do not create or test K2/K3/U0 until real Stage-6A captures and runtime DT have
+unblocked the implementation gate.
 
 ## Stage 6C — automatic source + CP policy
 
@@ -236,6 +278,34 @@ Stage 5B hardware PASS
 AND
 Stage 6B source-only hardware PASS
 ```
+
+## Cross-stage read-only evidence tooling
+
+The following commits are **optional operator/test tooling** and are not a
+charging-stage electrical capability increment:
+
+```text
+8044c92  F/tool  read-only scripts/sc8547-stage-capture.sh
+273900a  C       validate capture script syntax in focused CI
+390b2b3  D       document capture-tool usage/output and stage labels
+```
+
+The collector performs no sysfs/device-tree/kernel control write. It may be
+cherry-picked into any Stage 0-6A test branch to standardize evidence capture.
+For write-capable stages it records before/after snapshots only; the actual
+write commands remain manual and are specified by `sc8547-stage-test-plan.md`.
+
+Use environment metadata when collecting evidence:
+
+```text
+SC8547_KERNEL_COMMITS
+SC8547_DT_COMMITS
+SC8547_ADAPTER
+SC8547_CABLE
+SC8547_NOTES
+```
+
+This keeps every saved capture tied to the exact Stage package under test.
 
 ## Current clean hardware-test progression
 
@@ -266,8 +336,11 @@ Every new charging-related commit must cause one of these outcomes in the same
 development cycle:
 
 1. add it to the appropriate Stage package above; or
-2. classify it as documentation/CI/temporary and record why it is not part of
-   the clean functional cherry-pick set.
+2. classify it as documentation/CI/temporary/tooling and record why it is not
+   part of the clean electrical-capability cherry-pick set.
+
+For a write-capable Stage, the index must also state the exact previous hardware
+PASS required before the new functional commit may be tested.
 
 If a future commit cannot be assigned to one Stage, it is too broad and should
 be split before hardware testing.
