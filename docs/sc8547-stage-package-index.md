@@ -199,6 +199,7 @@ fedc9b6  D  one-owner qcom_battmgr transaction/ACK constraint
 cef2b43  D  gated qcom_battmgr kernel-patch design and K0→K3 test ladder
 6aa84fd  D  refresh ownership design with SM8650 variant/gate/service details
 8d2d993  D  narrow API identity/reference lifetime/module-linkage contract
+b83e575  D  exact common SET request/response + downstream ACK/error evidence
 ```
 
 `fedc9b6` is the actual ownership-document commit. An earlier version of this
@@ -226,6 +227,10 @@ Important conclusions represented by the Stage-6B package:
 - future exported electrical helpers use Linux microvolt/microamp units and keep
   raw opcode/property numbers and private `struct qcom_battmgr` out of the OOT
   module ABI;
+- downstream common property request is `{hdr,battery_id,property_id,value}` and
+  response is `{hdr,property_id,value,ret_code}`; no transaction ID exists;
+- downstream SET validation checks exact response size and `ret_code`, while our
+  future K1 design additionally requires expected opcode/property correlation;
 - non-SoCCP PPS request candidate is USB SET `0x33`, properties 34/35;
 - downstream normal-return candidate explicitly requests fixed PDO 5 V;
 - non-SoCCP fixed-5V fallback is BAT SET `0x31`, Oplus `BATT_SET_PDO` property
@@ -254,6 +259,7 @@ docs/sc8547-stage6b-qcom-battmgr-ownership.md
 docs/sc8547-stage6b-request-fallback.md
 docs/sc8547-stage6b-qcom-battmgr-patch-design.md
 docs/sc8547-stage6b-api-lifetime.md
+docs/sc8547-stage6b-set-response-evidence.md
 ```
 
 Future Stage-6B functional commits are expected to span two repositories and
