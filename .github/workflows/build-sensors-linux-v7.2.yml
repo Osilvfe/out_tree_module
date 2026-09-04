@@ -45,6 +45,13 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_SPI
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+
+          # With an explicit vmlinux-only goal Linux v7.2 writes the real
+          # built-in export table as vmlinux.symvers.  All APIs required by
+          # these sensor modules are forced built-in above, so feed that exact
+          # symbol table to the external-module modpost under its expected name.
+          test -s "$RUNNER_TEMP/linux/vmlinux.symvers"
+          cp "$RUNNER_TEMP/linux/vmlinux.symvers" "$RUNNER_TEMP/linux/Module.symvers"
           test -s "$RUNNER_TEMP/linux/Module.symvers"
 
       - name: Build sensor modules with strict modpost
