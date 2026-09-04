@@ -2,10 +2,9 @@
 /*
  * Giantec GT9772 voice-coil motor driver
  *
- * Initial register programming and the DAC protocol are derived from the
- * Qualcomm GT9772 actuator description used by Caihong.  The device uses an
- * 8-bit register address followed by a 16-bit big-endian value for the
- * 10-bit focus DAC at register 0x03.
+ * Register programming and the DAC protocol are derived from Qualcomm's
+ * GT9772 actuator description.  Caihong places this actuator on CCI0 master 1
+ * at downstream 8-bit slave address 0x18 (Linux 7-bit address 0x0c).
  */
 
 #include <linux/delay.h>
@@ -35,7 +34,9 @@
 #define GT9772_PARK_FOCUS_POS		40
 #define GT9772_RAMP_STEP		16
 #define GT9772_RAMP_DELAY_US		7000
-#define GT9772_POWER_SETTLE_US		2000
+#define GT9772_POWER_SETTLE_US		10000
+#define GT9772_INIT_WRITE_DELAY_US	100
+#define GT9772_POWER_DOWN_DELAY_US	1000
 
 struct gt9772 {
 	struct device *dev;
@@ -51,6 +52,13 @@ static const char * const gt9772_supply_names[] = {
 	"vaf",
 };
 
+static const struct cci_reg_sequence gt9772_init_regs[] = {
+	{ GT9772_REG_CFG_ED, GT9772_CFG_ED_VALUE },
+	{ GT9772_REG_CFG_06, GT9772_CFG_06_VALUE },
+	{ GT9772_REG_CFG_07, GT9772_CFG_07_VALUE },
+	{ GT9772_REG_CFG_08, GT9772_CFG_08_VALUE },
+};
+
 static inline struct gt9772 *to_gt9772(struct v4l2_subdev *sd)
 {
 	return container_of(sd, struct gt9772, sd);
@@ -64,24 +72,33 @@ static int gt9772_write_focus(struct gt9772 *gt9772, unsigned int value)
 
 static int gt9772_hw_init(struct gt9772 *gt9772)
 {
-	int ret = 0;
+	unsigned int i;
+	int ret;
 
-	cci_write(gt9772->regmap, GT9772_REG_CFG_ED,
-		  GT9772_CFG_ED_VALUE, &ret);
-	cci_write(gt9772->regmap, GT9772_REG_CFG_06,
-		  GT9772_CFG_06_VALUE, &ret);
-	cci_write(gt9772->regmap, GT9772_REG_CFG_07,
-		  GT9772_CFG_07_VALUE, &ret);
-	cci_write(gt9772->regmap, GT9772_REG_CFG_08,
-		  GT9772_CFG_08_VALUE, &ret);
+	for (i = 0; i < ARRAY_SIZE(gt9772_init_regs); i++) {
+		ret = cci_write(gt9772->regmap, gt9772_init_regs[i].reg,
+				gt9772_init_regs[i].val, NULL);
+		if (ret)
+			return ret;
 
-	return ret;
+		/* Qualcomm's GT9772 table specifies 100 us after each write. */
+		usleep_range(GT9772_INIT_WRITE_DELAY_US,
+			     GT9772_INIT_WRITE_DELAY_US + 100);
+	}
+
+	return 0;
 }
 
 static int gt9772_power_on(struct gt9772 *gt9772)
 {
 	int ret;
 
+	/*
+	 * Caihong exposes both VIO and VAF to the actuator node.  The generic
+	 * Qualcomm GT9772 tuning sequence explicitly waits 10 ms after VAF-on;
+	 * enabling the two board rails together here preserves the board DT
+	 * requirement while keeping that settle time.
+	 */
 	ret = regulator_bulk_enable(ARRAY_SIZE(gt9772->supplies),
 				    gt9772->supplies);
 	if (ret)
@@ -101,8 +118,14 @@ static int gt9772_power_on(struct gt9772 *gt9772)
 
 static int gt9772_power_off(struct gt9772 *gt9772)
 {
-	return regulator_bulk_disable(ARRAY_SIZE(gt9772->supplies),
-				      gt9772->supplies);
+	int ret;
+
+	ret = regulator_bulk_disable(ARRAY_SIZE(gt9772->supplies),
+				     gt9772->supplies);
+	usleep_range(GT9772_POWER_DOWN_DELAY_US,
+		     GT9772_POWER_DOWN_DELAY_US + 500);
+
+	return ret;
 }
 
 static int gt9772_set_ctrl(struct v4l2_ctrl *ctrl)
