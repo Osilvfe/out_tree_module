@@ -1,0 +1,49 @@
+name: Build camera against arm64 Linux v7.2
+
+on:
+  push:
+    paths:
+      - 'camera/**'
+      - '.github/workflows/build-camera-linux-v7.2.yml'
+  pull_request:
+    paths:
+      - 'camera/**'
+      - '.github/workflows/build-camera-linux-v7.2.yml'
+
+jobs:
+  camera:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libelf-dev libssl-dev \
+            gcc-aarch64-linux-gnu
+
+      - name: Prepare arm64 Linux v7.2 with camera APIs
+        run: |
+          git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          cfg="$RUNNER_TEMP/linux/scripts/config"
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_SUPPORT
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_CONTROLLER
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_DEV
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2_SUBDEV_API
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" prepare modules_prepare
+
+      - name: Build camera modules
+        run: |
+          make -C camera \
+            KDIR="$RUNNER_TEMP/linux" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KBUILD_MODPOST_WARN=1 \
+            -j"$(nproc)"
