@@ -66,6 +66,11 @@ jobs:
             }
           done
 
+          # External-module final linking in v7.2 needs scripts/module.lds.
+          # The kernel's modules_prepare target is the supported way to create
+          # that file and the other generated headers required by M= builds.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
 
           # With an explicit vmlinux-only goal Linux v7.2 writes the real
