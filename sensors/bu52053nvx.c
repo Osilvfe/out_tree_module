@@ -19,6 +19,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 
@@ -29,7 +30,6 @@ struct bu52053nvx {
 	struct input_dev *input;
 	unsigned int code;
 	int irq;
-	bool active_low;
 };
 
 static int bu52053nvx_read_active(struct bu52053nvx *hall)
