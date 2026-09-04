@@ -32,27 +32,41 @@ jobs:
             bc bison flex libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu
 
-      - name: Build arm64 Linux v7.2 symbol table with camera APIs
+      - name: Build minimal arm64 Linux v7.2 symbol table with camera APIs
         run: |
           git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
-          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+          # Validate only the framework used by the external Caihong camera
+          # modules instead of building the large generic arm64 defconfig.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
           cfg="$RUNNER_TEMP/linux/scripts/config"
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MODULES
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e OF
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e GPIOLIB
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e PM
+
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_SUPPORT
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_SUPPORT_FILTER
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MEDIA_SUBDRV_AUTOSELECT
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_CAMERA_SUPPORT
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MEDIA_CONTROLLER
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_DEV
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2_SUBDEV_API
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_CAMERA_SENSOR
 
-          # V4L2_CCI_I2C is a hidden symbol in Linux v7.2. Select it through
-          # an in-tree camera sensor so the normal Kconfig dependency graph
-          # also selects V4L2_CCI and REGMAP_I2C as built-ins.
+          # V4L2_CCI_I2C, V4L2_CCI and REGMAP_I2C are hidden symbols in
+          # Linux v7.2. Select them through a small in-tree camera sensor
+          # instead of writing hidden Kconfig values directly.
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_OV5693
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-          for sym in MODULES MEDIA_SUPPORT MEDIA_CONTROLLER VIDEO_DEV \
-                     VIDEO_V4L2_SUBDEV_API I2C REGULATOR VIDEO_OV5693 \
+          for sym in MODULES OF I2C GPIOLIB REGULATOR PM COMMON_CLK \
+                     MEDIA_SUPPORT MEDIA_SUPPORT_FILTER MEDIA_CAMERA_SUPPORT \
+                     MEDIA_CONTROLLER VIDEO_DEV VIDEO_V4L2_SUBDEV_API \
+                     VIDEO_CAMERA_SENSOR VIDEO_OV5693 V4L2_FWNODE V4L2_ASYNC \
                      V4L2_CCI_I2C V4L2_CCI REGMAP_I2C; do
             grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
               echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
