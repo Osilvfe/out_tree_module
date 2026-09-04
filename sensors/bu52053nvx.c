@@ -141,6 +141,16 @@ static int bu52053nvx_probe(struct platform_device *pdev)
 	hall->input->dev.parent = dev;
 	input_set_capability(hall->input, EV_SW, hall->code);
 
+	/*
+	 * Linux v7.2 has no devm_input_register_device().  Devices allocated
+	 * by devm_input_allocate_device() are marked devres-managed, and
+	 * input_register_device() installs the matching unregister devres.
+	 */
+	ret = input_register_device(hall->input);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to register input device\n");
+
 	hall->irq = gpiod_to_irq(hall->hall_gpio);
 	if (hall->irq < 0)
 		return dev_err_probe(dev, hall->irq,
@@ -156,11 +166,6 @@ static int bu52053nvx_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to request Hall IRQ\n");
-
-	ret = devm_input_register_device(dev, hall->input);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to register input device\n");
 
 	platform_set_drvdata(pdev, hall);
 
