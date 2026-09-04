@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * OnePlus Pad Pro (caihong) rear-camera lens bring-up fragment.
+ *
+ * Downstream hardware mapping:
+ *   CCI0 master 1, GT9772 at downstream 8-bit address 0x18,
+ *   VIO=L4B 1.8 V, VAF=L9B 2.8 V.
+ */
+
+&cci0 {
+	status = "okay";
+};
+
+&cci0_i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <400000>;
+
+	gt9772: lens@c {
+		compatible = "giantec,gt9772";
+		/* Downstream 8-bit address 0x18 -> Linux 7-bit address 0x0c. */
+		reg = <0x0c>;
+
+		vio-supply = <&vreg_l4b_1p8>;
+		vaf-supply = <&vreg_l9b_2p8>;
+	};
+};
+
+/*
+ * Once the rear image sensor is identified, add this property to its node:
+ *
+ *     lens-focus = <&gt9772>;
+ *
+ * Keeping that link out for now avoids inventing a rear sensor compatible.
+ */
