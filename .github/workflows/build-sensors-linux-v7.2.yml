@@ -39,6 +39,8 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e GPIOLIB
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e IIO
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_I2C
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_SPI
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
