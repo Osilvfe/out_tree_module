@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * MEMSIC MMC5603/MMC5633 I2C magnetometer backport for Linux v7.2.
+ * MEMSIC MMC5603/MMC5633 I2C magnetometer external driver for Linux v7.2.
  *
- * Derived from drivers/iio/magnetometer/mmc5633.c in upstream Linux master
- * (NXP, 2025).  Caihong exposes the mmc56x3x device on I2C, so the upstream
- * I3C/HDR transport is intentionally omitted from this out-of-tree backport.
+ * Derived from drivers/iio/magnetometer/mmc5633.c in Linux v7.2
+ * (NXP, 2025). Caihong exposes the mmc56x3x device on I2C, so the in-tree
+ * I3C/HDR transport is intentionally omitted from this out-of-tree variant.
  */
 
 #include <linux/bitfield.h>
@@ -168,7 +168,7 @@ static int mmc5633_read_measurement(struct mmc5633_data *data, int address,
 					buf + MMC5633_ALL_SIZE - 1, 1);
 
 	return regmap_bulk_read(data->regmap, MMC5633_REG_XOUT0,
-				MMC5633_ALL_SIZE);
+				buf, MMC5633_ALL_SIZE);
 }
 
 static int mmc5633_get_raw(int index, const u8 *buf, int *val)
@@ -418,5 +418,5 @@ static struct i2c_driver mmc5633_driver = {
 module_i2c_driver(mmc5633_driver);
 
 MODULE_AUTHOR("Frank Li <Frank.li@nxp.com>");
-MODULE_DESCRIPTION("MEMSIC MMC5603/MMC5633 I2C magnetometer backport");
+MODULE_DESCRIPTION("MEMSIC MMC5603/MMC5633 I2C magnetometer external driver");
 MODULE_LICENSE("GPL");
