@@ -2,6 +2,7 @@
 
 obj-m += bu52053nvx.o
 obj-m += mmc5633.o
+obj-m += tcs3701.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
