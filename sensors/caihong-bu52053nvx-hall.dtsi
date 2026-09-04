@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * OnePlus Pad Pro (caihong / OPD2404) Hall switch bring-up fragment.
+ *
+ * Qualcomm SSC registry evidence for BU52053NVX:
+ *   - SoC TLMM interrupt pin 66
+ *   - no pull
+ *   - dual-edge interrupt
+ *   - one sensor_vddio rail
+ *
+ * The SSC registry only names that rail as /pmic/client/sensor_vddio and does
+ * not expose the corresponding AP Linux regulator phandle.  The driver keeps
+ * vddio-supply optional until that board-level mapping is identified.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	bu52053_hall: hall-switch {
+		compatible = "rohm,bu52053nvx";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&bu52053_hall_default>;
+
+		/* BU52053NVX output is asserted low when a magnet is detected. */
+		hall-gpios = <&tlmm 66 GPIO_ACTIVE_LOW>;
+		linux,code = <SW_LID>;
+		wakeup-source;
+
+		/*
+		 * Add this once sensor_vddio is mapped to the mainline PMIC node:
+		 *
+		 *     vddio-supply = <&...>;
+		 */
+	};
+};
+
+&tlmm {
+	bu52053_hall_default: bu52053-hall-default-state {
+		pins = "gpio66";
+		function = "gpio";
+		input-enable;
+		bias-disable;
+	};
+};
