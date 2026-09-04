@@ -39,10 +39,8 @@ jobs:
           git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
 
           # This CI validates the external sensor modules, not an arbitrary
-          # arm64 defconfig.  Start from a small kernel and explicitly make
-          # every framework the current modules use built-in.  Missing Kconfig
-          # dependencies then become visible instead of being supplied by
-          # accident by defconfig.
+          # arm64 defconfig. Start from a small kernel and explicitly enable
+          # every framework the current modules use.
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
           cfg="$RUNNER_TEMP/linux/scripts/config"
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MODULES
@@ -53,12 +51,15 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e IIO
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_I2C
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_SPI
+
+          # REGMAP_I2C is a hidden Kconfig symbol in v7.2 and cannot be
+          # enabled directly by scripts/config. The in-tree MMC5633 option
+          # selects it through the normal Kconfig dependency graph. This also
+          # makes the CI configuration describe the exact transport under test.
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MMC5633
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C REGMAP_I2C SPI REGMAP_SPI; do
+          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C MMC5633 REGMAP_I2C; do
             grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
               echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
               exit 1
@@ -68,7 +69,7 @@ jobs:
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
 
           # With an explicit vmlinux-only goal Linux v7.2 writes the real
-          # built-in export table as vmlinux.symvers.  The frameworks required
+          # built-in export table as vmlinux.symvers. The frameworks required
           # by these sensor modules are all asserted built-in above, so this is
           # the exact kernel symbol table strict external modpost needs.
           test -s "$RUNNER_TEMP/linux/vmlinux.symvers"
