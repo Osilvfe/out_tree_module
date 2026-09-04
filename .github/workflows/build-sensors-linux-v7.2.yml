@@ -88,3 +88,12 @@ jobs:
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)"
+
+      - name: Upload arm64 Linux v7.2 sensor modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: caihong-sensors-linux-v7.2-arm64-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            sensors/*.ko
+            sensors/*.dtsi
