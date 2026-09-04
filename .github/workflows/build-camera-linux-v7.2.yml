@@ -91,3 +91,12 @@ jobs:
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)"
+
+      - name: Upload arm64 Linux v7.2 camera modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: caihong-camera-linux-v7.2-arm64-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            camera/*.ko
+            camera/*.dtsi
