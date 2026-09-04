@@ -3,11 +3,15 @@ name: Build camera against arm64 Linux v7.2
 on:
   push:
     paths:
-      - 'camera/**'
+      - 'camera/*.c'
+      - 'camera/*.h'
+      - 'camera/Makefile'
       - '.github/workflows/build-camera-linux-v7.2.yml'
   pull_request:
     paths:
-      - 'camera/**'
+      - 'camera/*.c'
+      - 'camera/*.h'
+      - 'camera/Makefile'
       - '.github/workflows/build-camera-linux-v7.2.yml'
 
 jobs:
@@ -23,7 +27,7 @@ jobs:
             bc bison flex libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu
 
-      - name: Build arm64 Linux v7.2 with camera APIs
+      - name: Build arm64 Linux v7.2 symbol table with camera APIs
         run: |
           git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
@@ -34,11 +38,11 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_DEV
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2_SUBDEV_API
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -m V4L2_CCI_I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e V4L2_CCI_I2C
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
           test -s "$RUNNER_TEMP/linux/Module.symvers"
 
       - name: Build camera modules with strict modpost
