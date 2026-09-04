@@ -13,6 +13,11 @@ on:
       - 'camera/*.h'
       - 'camera/Makefile'
       - '.github/workflows/build-camera-linux-v7.2.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: camera-linux-v7.2-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   camera:
@@ -38,11 +43,32 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_DEV
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_V4L2_SUBDEV_API
-          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e V4L2_CCI_I2C
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+
+          # V4L2_CCI_I2C is a hidden symbol in Linux v7.2. Select it through
+          # an in-tree camera sensor so the normal Kconfig dependency graph
+          # also selects V4L2_CCI and REGMAP_I2C as built-ins.
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e VIDEO_OV5693
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          for sym in MODULES MEDIA_SUPPORT MEDIA_CONTROLLER VIDEO_DEV VIDEO_V4L2 \
+                     VIDEO_V4L2_SUBDEV_API I2C REGULATOR VIDEO_OV5693 \
+                     V4L2_CCI_I2C V4L2_CCI REGMAP_I2C; do
+            grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
+              echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
+              exit 1
+            }
+          done
+
+          # Linux v7.2 external-module final linking needs scripts/module.lds.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+
+          # An explicit vmlinux goal writes the genuine built-in export table
+          # to vmlinux.symvers in v7.2. Hand that table to external modpost.
+          test -s "$RUNNER_TEMP/linux/vmlinux.symvers"
+          cp "$RUNNER_TEMP/linux/vmlinux.symvers" "$RUNNER_TEMP/linux/Module.symvers"
           test -s "$RUNNER_TEMP/linux/Module.symvers"
 
       - name: Build camera modules with strict modpost
