@@ -1,0 +1,45 @@
+name: Build sensors against arm64 Linux v7.2
+
+on:
+  push:
+    paths:
+      - 'sensors/**'
+      - '.github/workflows/build-sensors-linux-v7.2.yml'
+  pull_request:
+    paths:
+      - 'sensors/**'
+      - '.github/workflows/build-sensors-linux-v7.2.yml'
+
+jobs:
+  sensors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libelf-dev libssl-dev \
+            gcc-aarch64-linux-gnu
+
+      - name: Build arm64 Linux v7.2
+        run: |
+          git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          cfg="$RUNNER_TEMP/linux/scripts/config"
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e INPUT
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e GPIOLIB
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
+          test -s "$RUNNER_TEMP/linux/Module.symvers"
+
+      - name: Build sensor modules with strict modpost
+        run: |
+          make -C sensors \
+            KDIR="$RUNNER_TEMP/linux" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
