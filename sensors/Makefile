@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-m += bu52053nvx.o
+obj-m += mmc5633.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
