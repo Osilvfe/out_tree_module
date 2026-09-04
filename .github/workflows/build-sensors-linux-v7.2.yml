@@ -15,6 +15,11 @@ on:
       - 'sensors/Makefile'
       - 'sensors/**/Makefile'
       - '.github/workflows/build-sensors-linux-v7.2.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: sensors-linux-v7.2-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   sensors:
@@ -29,12 +34,20 @@ jobs:
             bc bison flex libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu
 
-      - name: Build arm64 Linux v7.2 symbol table with sensor APIs
+      - name: Build minimal arm64 Linux v7.2 symbol table with sensor APIs
         run: |
           git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
-          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+          # This CI validates the external sensor modules, not an arbitrary
+          # arm64 defconfig.  Start from a small kernel and explicitly make
+          # every framework the current modules use built-in.  Missing Kconfig
+          # dependencies then become visible instead of being supplied by
+          # accident by defconfig.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
           cfg="$RUNNER_TEMP/linux/scripts/config"
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MODULES
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e OF
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e INPUT
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e GPIOLIB
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
@@ -44,12 +57,20 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGMAP_SPI
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C REGMAP_I2C SPI REGMAP_SPI; do
+            grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
+              echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
+              exit 1
+            }
+          done
+
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
 
           # With an explicit vmlinux-only goal Linux v7.2 writes the real
-          # built-in export table as vmlinux.symvers.  All APIs required by
-          # these sensor modules are forced built-in above, so feed that exact
-          # symbol table to the external-module modpost under its expected name.
+          # built-in export table as vmlinux.symvers.  The frameworks required
+          # by these sensor modules are all asserted built-in above, so this is
+          # the exact kernel symbol table strict external modpost needs.
           test -s "$RUNNER_TEMP/linux/vmlinux.symvers"
           cp "$RUNNER_TEMP/linux/vmlinux.symvers" "$RUNNER_TEMP/linux/Module.symvers"
           test -s "$RUNNER_TEMP/linux/Module.symvers"
