@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * OnePlus Pad Pro (caihong) front-camera bring-up fragment.
+ *
+ * Hardware mapping comes from the OnePlus downstream Caihong camera overlay:
+ *   CCI0 master 0, CSIPHY4, MCLK4 @ 19.2 MHz, reset GPIO7,
+ *   DOVDD=L4B 1.8 V, AVDD=L16B 2.8 V, DVDD=L2G 1.2 V.
+ *
+ * The regulator labels below follow normal mainline Qualcomm naming.  If the
+ * Caihong board DTS uses different labels for the same PMIC rails, only those
+ * three phandles need to be renamed.
+ */
+
+#include <dt-bindings/clock/qcom,sm8650-camcc.h>
+#include <dt-bindings/gpio/gpio.h>
+
+&camss {
+	/* Same CSIPHY rails used by other upstream SM8650 camera boards. */
+	vdd-csiphy35-0p9-supply = <&vreg_l2i_0p88>;
+	vdd-csiphy35-1p2-supply = <&vreg_l3i_1p2>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@4 {
+			reg = <4>;
+
+			caihong_csiphy4_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&caihong_front_cam_ep>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	status = "okay";
+};
+
+/* Downstream cci-master = CCI_MASTER_0. */
+&cci0_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <400000>;
+
+	front_camera: camera@36 {
+		compatible = "smartsens,sc820cs";
+		/* Downstream 8-bit address 0x6c -> Linux 7-bit address 0x36. */
+		reg = <0x36>;
+
+		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam4_default>;
+		pinctrl-names = "default";
+
+		dovdd-supply = <&vreg_l4b_1p8>;
+		avdd-supply = <&vreg_l16b_2p8>;
+		dvdd-supply = <&vreg_l2g_1p2>;
+
+		port {
+			caihong_front_cam_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				/*
+				 * 366 MHz is derived from known SC820CS 732 Mbps/lane
+				 * 4-lane configurations.  Streaming remains disabled in
+				 * the initial driver, so this is not yet relied upon.
+				 */
+				link-frequencies = /bits/ 64 <366000000>;
+				remote-endpoint = <&caihong_csiphy4_ep>;
+			};
+		};
+	};
+};
