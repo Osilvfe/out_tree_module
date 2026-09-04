@@ -1,7 +1,7 @@
 # Caihong SM8650 camera port
 
 This directory tracks camera bring-up for the OnePlus Pad Pro
-(`oneplus,caihong`) on Linux 7.2.
+(`oneplus,caihong`, project 23926) on Linux 7.2.
 
 ## Architecture decision
 
@@ -13,8 +13,8 @@ Linux 7.2 already contains the SM8650 camera infrastructure we need:
 - an upstream SM8650 camera DT binding and working SM8650 camera-card examples.
 
 Therefore this port does **not** import the Android Qualcomm Spectra/CRM/CPAS
-camera stack into mainline.  That downstream stack remains a hardware and
-behaviour reference only.  Importing it would duplicate native CAMSS/CCI,
+camera stack into mainline. That downstream stack remains a hardware and
+behaviour reference only. Importing it would duplicate native CAMSS/CCI,
 preserve the CamX packet/request ABI and add unnecessary Android/GKI coupling.
 
 The mainline plan is instead:
@@ -26,45 +26,59 @@ The mainline plan is instead:
 4. use the existing PM8550 flash driver rather than porting the downstream flash
    layer.
 
-## Downstream reference
+## Downstream and device-image references
 
 Hardware information comes from:
 
-- repository: `OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650`
+- OnePlus OSS repository:
+  `OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650`
 - branch: `oneplus/sm8650_b_16.0.0_pad_pro`
 - camera driver reference: `vendor/qcom/opensource/camera-kernel`
 - common camera DT: `vendor/qcom/proprietary/camera-devicetree/pineapple-camera.dtsi`
-- Caihong overlay: `vendor/qcom/proprietary/camera-devicetree/oplus/caihong-camera-overlay.dts`
+- Caihong overlay:
+  `vendor/qcom/proprietary/camera-devicetree/oplus/caihong-camera-overlay.dts`
   and `caihong_camera_overlay_common.dtsi`
+- Caihong vendor camera metadata, especially
+  `/odm/etc/camera/CameraHWConfiguration.config` and the QTI sensor-module
+  blobs under `/odm/lib64/camera/`.
 
-## Caihong hardware confirmed from downstream DT
+## Caihong camera hardware
 
 Caihong uses camera CCI0 for both physical cameras:
 
-| Camera | CCI | mainline bus | CSIPHY | MCLK | Reset | Other confirmed hardware |
-| --- | --- | --- | --- | --- | --- | --- |
-| rear (`cell-index = 0`) | CCI0 master 1 | `cci0_i2c1` | CSIPHY1 | MCLK1, 19.2 MHz | GPIO82 | GT9772 actuator, rear EEPROM, PM8550 flash |
-| front (`cell-index = 1`) | CCI0 master 0 | `cci0_i2c0` | CSIPHY4 | MCLK4, 19.2 MHz | GPIO7 | EEPROM/module name `sc820cs_caihong` |
+| Camera | Sensor | CCI | mainline bus | CSIPHY | MCLK | Reset | Other confirmed hardware |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rear (`cell-index = 0`, camera id 0) | SmartSens **SC1320CS** | CCI0 master 1 | `cci0_i2c1` | CSIPHY1 | MCLK1, 19.2 MHz | GPIO82 | GT9772 actuator, rear EEPROM, PM8550 flash |
+| front (`cell-index = 1`, camera id 1) | SmartSens **SC820CS** | CCI0 master 0 | `cci0_i2c0` | CSIPHY4 | MCLK4, 19.2 MHz | GPIO7 | front EEPROM |
 
-The front module is identified as SmartSens SC820CS by the downstream Caihong
-EEPROM/module naming. Public SC820CS implementations consistently identify the
-sensor by registers `0x3107`/`0x3108`, chip ID `0xd154`. The downstream-style
-8-bit I2C address `0x6c` maps to Linux 7-bit address `0x36`.
+The sensor models are no longer inferred only from EEPROM names. Caihong's own
+`CameraHWConfiguration.config` explicitly lists:
 
-The rear image-sensor model is not named in the generic downstream
-`qcom,cam-sensor` node and is deliberately not guessed. It must be identified
-from camera metadata, EEPROM/probe information or hardware probing before a
-rear V4L2 sensor driver is selected.
+```text
+Name[0] = sc1320cs
+Name[1] = sc820cs
+```
+
+and its camera-id tables identify camera id 0 as rear and camera id 1 as front.
+The vendor image also contains matching QTI sensor-module/tuning blobs for both
+SC1320CS and SC820CS.
+
+The downstream camera rails are:
+
+- L4B: 1.8 V camera I/O;
+- L16B: 2.8 V camera analog;
+- L2G: 1.2 V camera digital/core;
+- L9B: 2.8 V rear autofocus/actuator rail.
 
 Downstream pineapple camera hardware relevant to comparison/debugging:
 
-- CCI0: `0x0ac15000`, IRQ 426, 37.5 MHz source clock
-- CSIPHY1: `0x0ace6000`, IRQ 478
-- CSIPHY4: `0x0acec000`, IRQ 122
+- CCI0: `0x0ac15000`, IRQ 426, 37.5 MHz source clock;
+- CSIPHY1: `0x0ace6000`, IRQ 478;
+- CSIPHY4: `0x0acec000`, IRQ 122.
 
 These resources already have mainline SM8650 counterparts.
 
-## Current front-camera milestone
+## Front SC820CS milestone
 
 `sc820cs.c` is intentionally a safe **probe-only** V4L2 driver. It currently:
 
@@ -82,10 +96,43 @@ mode tables are useful references, but they are not assumed to be Caihong's
 exact tuning/configuration.
 
 `caihong-front-sc820cs.dtsi` maps the front sensor onto mainline
-`cci0_i2c0 -> CAMSS CSIPHY4`. Some regulator phandle labels may require a simple
-rename when this fragment is merged into the actual Caihong board DTS; the
-underlying downstream rails are confirmed as 1.8 V I/O, 2.8 V analog and 1.2 V
-core.
+`cci0_i2c0 -> CAMSS CSIPHY4`. The downstream-style 8-bit SC820CS address `0x6c`
+corresponds to Linux 7-bit address `0x36`; this remains an item to verify on the
+actual Caihong bus together with the chip ID.
+
+## Rear SC1320CS milestone
+
+The rear sensor is now conclusively identified as SC1320CS. SmartSens documents
+it as a 13 MP, 4224x3134, 30 fps MIPI sensor.
+
+The remaining probe parameters are deliberately still marked unknown until they
+are recovered from Caihong's QTI `com.qti.sensormodule.lce_sc1320cs.bin` or from
+a read-only hardware probe:
+
+- 7-bit CCI/I2C slave address;
+- chip-ID register address/data width;
+- expected chip-ID value/mask.
+
+Do **not** copy an SC1320CS address or ID from an unrelated phone and call it a
+Caihong value. The first rear driver should mirror the front strategy: power,
+reset, read-only identification and media-subdevice registration before any
+mode table is written.
+
+## GT9772 autofocus milestone
+
+`gt9772.c` implements the rear Giantec GT9772 as a V4L2 lens subdevice using
+Linux's `v4l2-cci` helpers. Qualcomm's GT9772 actuator data confirms:
+
+- downstream 8-bit slave address `0x18`, therefore Linux 7-bit `0x0c`;
+- 10-bit focus DAC;
+- focus register `0x03` with 16-bit data;
+- initialization writes `ED=AB`, `06=84`, `07=01`, `08=55`;
+- initial/park code 40;
+- approximately 10 ms rail settle time and 100 us after each initialization
+  register write.
+
+`caihong-rear-gt9772.dtsi` places it on `cci0_i2c1` and uses the confirmed
+camera I/O and AF rails (L4B 1.8 V, L9B 2.8 V).
 
 ## Build and CI
 
@@ -95,25 +142,27 @@ The camera directory can be built separately from the rest of this repository:
 make -C camera KDIR=/path/to/linux
 ```
 
-A dedicated CI workflow builds it against arm64 Linux v7.2 with
-`MEDIA_CONTROLLER` and `VIDEO_V4L2_SUBDEV_API` enabled. This is deliberately
-separate from the repository-wide build because several older non-camera
-bring-up drivers currently have their own v7.2 Werror/API cleanup pending.
+The dedicated camera CI cross-builds an arm64 Linux v7.2 kernel with the
+required media-controller/V4L2/CCI options, generates a real `Module.symvers`,
+and then builds `sc820cs.ko` and `gt9772.ko` with strict modpost. It is kept
+separate from the repository-wide build because older unrelated touchscreen,
+pogo and charging bring-up modules currently have their own v7.2 cleanup work.
 
 ## Next stages
 
-1. Get the probe-only `sc820cs.ko` clean under the dedicated arm64 v7.2 CI.
-2. Merge the front-camera DT graph into the real Caihong DTS and confirm:
-   - CCI0 probe;
-   - regulator/clock/reset sequencing;
-   - SC820CS chip ID `0xd154`;
-   - media graph registration.
-3. Recover/validate Caihong SC820CS mode programming before enabling stream.
-4. Add exposure, analogue gain, VBLANK and test-pattern V4L2 controls.
-5. Identify and bring up the rear image sensor on `cci0_i2c1 -> CSIPHY1`.
-6. Add GT9772 as a V4L2 lens subdevice if no suitable mainline driver exists.
-7. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
-   facilities wherever possible.
+1. Finish strict arm64-v7.2 CI for `sc820cs.ko` + `gt9772.ko`.
+2. Merge the front-camera graph into the real Caihong DTS and confirm CCI0,
+   clocks, rails, reset and SC820CS ID `0xd154` on hardware.
+3. Recover SC1320CS probe address/ID from the Caihong sensor-module blob or a
+   read-only bus probe, then add a safe rear probe-only V4L2 driver.
+4. Recover/validate Caihong SC820CS and SC1320CS mode programming before
+   enabling streaming.
+5. Add exposure, analogue gain, VBLANK and test-pattern controls only after the
+   correct mode tables are proven.
+6. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
+   facilities wherever practical.
+7. Bring up the complete media graph under libcamera before considering any
+   downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,
 register/resource comparison and userspace-behaviour archaeology, but it is no
