@@ -3,37 +3,80 @@
 This directory tracks ordinary sensor bring-up separately from the Qualcomm
 camera stack.
 
-## Important downstream architecture distinction
+## Architecture: the physical sensors are SSC-owned downstream
 
-The OnePlus `vendor/oplus/sensor` tree is mostly an Android/Qualcomm sensor
-support layer (`sensor_devinfo`, tracing, virtual sensors and command plumbing),
-not a collection of standalone accelerometer/gyro/ALS Linux I2C drivers.
-On SM8650 many physical sensors are expected to be owned by the Qualcomm sensor
-DSP/SSC path.
+The OnePlus Pad Pro (`caihong`, project 23926) device tree includes
+`sensor/caihong-sensor-23926.dtsi`.  That file does **not** describe physical
+accelerometer, gyroscope, magnetometer or ALS devices on AP-visible I2C/SPI
+buses.  It only creates the Oplus sensor-feedback SMEM endpoint and
+`sensor-devinfo` node.
 
-Blindly importing that Oplus layer into mainline would therefore not create
-normal Linux IIO devices. The preferred Linux 7.2 strategy is:
+That matches the OnePlus `vendor/oplus/sensor` implementation: the Oplus kernel
+code is an Android/Qualcomm sensor support layer (devinfo, tracing, virtual
+sensors and command plumbing).  `sensor-devinfo` asks the sensor hub for
+`CUST_ACTION_GET_SENSOR_INFO` and receives the physical device name from SSC;
+it is not the physical sensor driver itself.
 
-1. identify every physical sensor IC and its bus/interrupt/power topology from
-   Caihong DT, firmware metadata and hardware probing;
-2. check whether Linux 7.2 already has a matching IIO/input driver;
-3. add only missing chip support as an out-of-tree driver;
-4. use standard IIO/input bindings and interfaces where practical;
-5. treat SSC/remoteproc integration as a separate problem for sensors that are
-   not directly accessible from the application processor.
+For mainline Linux the preferred architecture is therefore:
 
-ST's `vendor/st/opensource` content in this OnePlus source branch is NFC/eSE
-(`st21nfc`/`st54spi_gpio`), not the tablet IMU stack, so it is intentionally not
-copied here as a motion-sensor driver.
+1. recover the actual SSC registry hardware configuration;
+2. map SSC bus instances/power rails/pins back to AP-visible resources;
+3. reuse or backport upstream Linux IIO/input drivers wherever possible;
+4. use standard Linux interfaces rather than importing the Oplus private
+   sensor framework;
+5. keep SSC/remoteproc coexistence and bus ownership as a separate bring-up
+   problem.
 
-## Next evidence to collect
+## Hardware recovered from Caihong vendor sensor registry
 
-- exact accelerometer/gyroscope IC
-- ALS/proximity IC
-- magnetometer if fitted
-- hall/lid sensors
-- which devices are AP-attached versus SSC-owned
-- bus addresses, IRQ GPIOs and regulator rails
+The public Caihong vendor image contains
+`/odm/etc/sensor/config/json_list`.  Its hardware entries identify the active
+sensor set below.
 
-No speculative sensor module is enabled from the root Makefile until its actual
-Caihong hardware is confirmed.
+| Function | Registry hardware | Downstream bus / IRQ | Mainline plan |
+| --- | --- | --- | --- |
+| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | identify exact ICM42607-family variant, then backport the upstream IIO support that landed after Linux 7.2 |
+| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | determine MMC5603 vs MMC5633 and backport the newer upstream IIO driver |
+| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | investigate direct-IIO support; Linux 7.2 has no TCS3701-specific driver |
+| Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | `bu52053nvx.ko` in this tree exposes standard `EV_SW/SW_LID` |
+| free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
+| barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
+
+Qualcomm's SSC communication-port enum confirms registry `bus_type=0` is I2C
+and `bus_type=1` is SPI.  Its interrupt enum confirms trigger type 1 is falling
+edge, 2 is dual edge and 3 is high level.
+
+## BU52053NVX Hall bring-up
+
+`sensors/bu52053nvx.c` is intentionally small and non-Oplus-specific:
+
+- reads a GPIO only; there is no register bus for this Hall switch;
+- reports `EV_SW/SW_LID` through the Linux input subsystem;
+- handles both rising and falling edges as required by the Caihong SSC
+  registry;
+- supports wakeup;
+- supports an optional `vddio-supply` regulator.
+
+`sensors/caihong-bu52053nvx-hall.dtsi` maps the confirmed TLMM GPIO66 and uses
+`GPIO_ACTIVE_LOW`, matching the BU52053NVX output behavior.  The downstream
+registry names its rail only as `/pmic/client/sensor_vddio`, so the DTS fragment
+leaves `vddio-supply` unset until the corresponding mainline PMIC regulator
+phandle is proven.  With the property absent the driver assumes the board or
+firmware keeps that rail powered.
+
+## Next sensor work
+
+1. map SSC SPI instance 3 and I2C instance 2 to the exact SM8650 QUP serial
+   engines and pin states;
+2. identify the exact `icm4x607` silicon variant from SSC firmware/WHO_AM_I and
+   backport the matching upstream IIO driver;
+3. identify MMC5603 vs MMC5633 and backport the upstream mmc56x3x support;
+4. determine whether TCS3701 can be handed from SSC to an AP QUP controller and
+   implement/backport an IIO driver if needed;
+5. recover the PMIC regulator behind `sensor_vddio` / `sensor_vdd`;
+6. identify the barometer only from evidence (SSC registry/runtime info), not
+   from a generic SM8650 parts list.
+
+ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE
+(`st21nfc`/`st54spi_gpio`), not this tablet's IMU stack, and remains intentionally
+out of this sensor port.
