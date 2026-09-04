@@ -142,26 +142,43 @@ The camera directory can be built separately from the rest of this repository:
 make -C camera KDIR=/path/to/linux
 ```
 
-The dedicated camera CI cross-builds an arm64 Linux v7.2 kernel with the
-required media-controller/V4L2/CCI options, generates a real `Module.symvers`,
-and then builds `sc820cs.ko` and `gt9772.ko` with strict modpost. It is kept
-separate from the repository-wide build because older unrelated touchscreen,
-pogo and charging bring-up modules currently have their own v7.2 cleanup work.
+The dedicated camera CI uses a minimal arm64 Linux v7.2 configuration with the
+required media-controller/V4L2/CCI, I2C, regulator, GPIO, clock and runtime-PM
+frameworks built in. It runs `modules_prepare`, builds a real `vmlinux`, hands
+the genuine v7.2 `vmlinux.symvers` export table to external modpost, and then
+builds the out-of-tree camera modules with strict modpost.
+
+The initial camera milestone is now CI-clean: run `33865161174` successfully
+compiled and final-linked both modules through the complete external-module
+pipeline:
+
+```text
+CC [M]  sc820cs.o
+CC [M]  gt9772.o
+MODPOST Module.symvers
+CC [M]  sc820cs.mod.o
+CC [M]  gt9772.mod.o
+LD [M]  sc820cs.ko
+LD [M]  gt9772.ko
+```
+
+This proves Linux-v7.2 arm64 source/API and exported-symbol compatibility. It
+does **not** by itself prove the Caihong electrical mapping or successful probe
+on hardware.
 
 ## Next stages
 
-1. Finish strict arm64-v7.2 CI for `sc820cs.ko` + `gt9772.ko`.
-2. Merge the front-camera graph into the real Caihong DTS and confirm CCI0,
+1. Merge the front-camera graph into the real Caihong DTS and confirm CCI0,
    clocks, rails, reset and SC820CS ID `0xd154` on hardware.
-3. Recover SC1320CS probe address/ID from the Caihong sensor-module blob or a
+2. Recover SC1320CS probe address/ID from the Caihong sensor-module blob or a
    read-only bus probe, then add a safe rear probe-only V4L2 driver.
-4. Recover/validate Caihong SC820CS and SC1320CS mode programming before
+3. Recover/validate Caihong SC820CS and SC1320CS mode programming before
    enabling streaming.
-5. Add exposure, analogue gain, VBLANK and test-pattern controls only after the
+4. Add exposure, analogue gain, VBLANK and test-pattern controls only after the
    correct mode tables are proven.
-6. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
+5. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
    facilities wherever practical.
-7. Bring up the complete media graph under libcamera before considering any
+6. Bring up the complete media graph under libcamera before considering any
    downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,
