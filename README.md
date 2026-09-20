@@ -14,14 +14,19 @@ The touchscreen driver is written against the DTS currently used by Caihong:
 `spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
 coordinate transform properties, and optional `novatek,pen-support`.
 
-The pogo driver remains in the tree, but current work is focused on charging.
+The latest project checkpoint and hardware caveats are summarized in
+[`docs/current-status.md`](docs/current-status.md). Device-specific DTS
+fragments live under [`dts/`](dts/), and unavoidable kernel-side bridge
+patches are isolated under [`patches/linux/`](patches/linux/).
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is
-on hub 0. The current standalone driver is deliberately telemetry-only: it
-enables the ADC, reads status/fault/voltage/current data, and never enables the
-charge pump or rewrites protection limits during probe. See
-[`docs/caihong-charging.md`](docs/caihong-charging.md).
+on hub 0. Probe remains passive, but the driver now also contains explicitly
+gated experimental control and bounded pulse interfaces used through the
+Stage 7D13 hardware checkpoint. Automatic charging is paused after an
+unresolved one-sided primary-IBUS excursion; none of these controls should be
+enabled as a production policy. See [`docs/current-status.md`](docs/current-status.md)
+and [`docs/caihong-charging.md`](docs/caihong-charging.md).
 
 ## Build
 
@@ -64,9 +69,12 @@ The existing node is sufficient. Uncomment the pen flag when testing stylus:
 };
 ```
 
-## SC8547 telemetry DTS
+## SC8547 DTS
 
-Use this only for the current safe bring-up stage:
+The frozen experimental board fragment is
+[`dts/sm8650-oneplus-caihong-sc8547.dtsi`](dts/sm8650-oneplus-caihong-sc8547.dtsi).
+For telemetry-only use, omit all `southchip,allow-experimental-*` properties
+and their experimental limits. A minimal passive shape is:
 
 ```dts
 &i2c_hub_0 {
@@ -96,10 +104,11 @@ The `southchip,role` property is currently a local bring-up aid and is not an
 upstream binding. The driver also accepts the downstream-compatible strings
 `oplus,sc8547a` and `slave_vphy_sc8547` for comparison/testing.
 
-## Pogo DTS skeleton
+## Pogo DTS
 
-Do **not** copy GPIO numbers from another OnePlus tablet. Fill in the Caihong
-values only after pin identification:
+The current Caihong UART/pin assignment is preserved in
+[`dts/sm8650-oneplus-caihong-pogo.dtsi`](dts/sm8650-oneplus-caihong-pogo.dtsi).
+Its serdev child is equivalent to:
 
 ```dts
 &uart7 {
@@ -107,12 +116,19 @@ values only after pin identification:
 
     pogo {
         compatible = "oneplus,caihong-pogo";
-        current-speed = <BAUD_TO_CONFIRM>;
-        wake-gpios = <&tlmm WAKE_GPIO GPIO_ACTIVE_LOW>;
-        tx-enable-gpios = <&tlmm TX_ENABLE_GPIO GPIO_ACTIVE_HIGH>;
-        touchpad-size-x = <TOUCHPAD_X_MAX>;
-        touchpad-size-y = <TOUCHPAD_Y_MAX>;
+        current-speed = <921600>;
+        power-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+        wake-gpios = <&tlmm 137 GPIO_ACTIVE_LOW>;
+        tx-enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+        touchpad-size-x = <2764>;
+        touchpad-size-y = <1630>;
+        touchpad-resolution-x = <23>;
+        touchpad-resolution-y = <23>;
         oneplus,crc-ibm-init = <0xc596>;
     };
 };
 ```
+
+The board fragment selects GENI FIFO mode. Apply the isolated serial-core
+patch in `patches/linux/` before using it; the serdev module cannot change the
+parent UART transfer mode after probe.
