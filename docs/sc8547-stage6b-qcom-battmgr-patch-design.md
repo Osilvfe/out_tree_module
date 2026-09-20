@@ -1,10 +1,10 @@
 # Stage 6B gated qcom_battmgr extension design
 
-This document defines the **minimum kernel-tree change** that may be implemented
-later if Caihong hardware evidence confirms that exact PPS control requires the
-Oplus battery-manager extension ABI.
-
-It is design only. It intentionally does not create a source-write patch yet.
+This document defines and records the **minimum kernel-tree change** used to
+validate Caihong's Oplus battery-manager PPS extension ABI.  The local kernel
+tree now contains narrowly gated, fixed-value development endpoints; it still
+does not expose an arbitrary voltage/current control or start either charge
+pump.
 
 ## Why a qcom_battmgr patch is likely required
 
@@ -169,10 +169,15 @@ Before sending any PPS SET, the future helper must at minimum require:
 ```text
 service_up == true
 USB online
-USB type observed as PD_PPS
+UCSI reports an active USB-PD contract
+partner PDO data proves a compatible PPS APDO
 explicit Oplus firmware-extension gate
 requested voltage/current within an authorization range
 ```
+
+Do not use `qcom-battmgr-usb/usb_type` as the Caihong protocol gate.  Runtime
+testing showed it selecting `SDP` while the same connection's PMIC-Glink UCSI
+port reported `power_operation_mode=usb_power_delivery`.
 
 The authorization range should not be a hard-coded guess from downstream
 comments. It should ultimately be intersected with real source APDO capability
@@ -310,6 +315,26 @@ First possible write test: while already on a normal PD source and CPs off,
 request the known-safe fixed 5-V contract and verify ACK + observed ~5 V. Do not
 implement PPS request in the same first-write commit.
 
+The Caihong development tree now implements this test behind the separate
+`oneplus,pps-fixed-5v` board-DT opt-in. It exposes only:
+
+```text
+/sys/class/power_supply/qcom-battmgr-usb/device/oneplus_fixed_5v
+```
+
+The attribute accepts only the literal value `5000`. Before sending the
+downstream `BATT_SET_PDO` request it verifies USB-online state, issues a fresh
+read-buffer request, and requires a real fixed 5-V PDO. The response path checks
+the expected opcode and property ID and propagates the firmware return code.
+It does not expose a voltage parameter, send a PPS request, or enable a charge
+pump.
+
+This K2 path passed on Caihong on 2026-09-02. Firmware acknowledged the 5-V
+request, both SC8547 instances remained disabled and non-switching, and their
+independent ADCs measured approximately 4.83 V. Their `vbus_low` status is
+expected at fixed 5 V because the charge-pump input threshold is higher; it is
+not a failed PD fallback while the pumps remain off.
+
 ### 6B-K3 — PPS request helper
 
 Only after K2 fallback passes:
@@ -322,9 +347,41 @@ Only after K2 fallback passes:
 First PPS experiment: both CPs off, one conservative APDO-supported request,
 verify it, then immediately call K2 fallback and verify 5 V/basic charging.
 
+The current Caihong development tree implements this first experiment behind
+the additional board-DT opt-in `oneplus,pps-5v5-1a`. The write-only
+`oneplus_pps_5v5_1a` attribute accepts only `1`, refreshes USB-online and source
+capability state, requires both a fixed 5-V PDO and a PPS APDO covering 5.5 V at
+1 A, then sends the vendor ABI's voltage property followed by its current
+property. If the current-property transaction fails after voltage succeeds, it
+immediately invokes the independently tested K2 fixed-5-V fallback. It never
+enables either SC8547.
+
+K3 passed on Caihong on 2026-09-02.  With both pumps reporting
+`charge_enabled=0` and `switching=0`, the firmware acknowledged both SET
+transactions.  Both independent SC8547 ADCs moved from approximately 4.93 V to
+5.32 V for the 5.5-V/1-A request, then returned to approximately 4.93 V after
+the K2 fixed-5-V command.  Pump IBUS remained approximately 20 mA and no pump
+was enabled.  This proves the source-request and fallback wire ABI; it does not
+yet prove charge-pump operation.
+
+### 6B-K4 — source-only bounded ramp
+
+The next local test remains source-only.  The additional board-DT opt-in
+`oneplus,pps-ramp-9v-1a` exposes the write-only
+`oneplus_pps_ramp_9v_1a` endpoint.  It accepts only `1`, requires a single
+advertised PPS APDO to cover the entire 5.5--9.0-V range at 1 A, and requests
+5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5 and 9.0 V in order.  Each voltage/current
+pair uses the downstream voltage-then-current ABI and is followed by a 500-ms
+settling interval.  Any failed transaction invokes the already-validated fixed
+5-V fallback.
+
+K4 deliberately has no connection to the SC8547 control API.  It leaves both
+pumps off and holds the final 9-V/1-A source request only long enough for manual
+telemetry collection; the operator then invokes `oneplus_fixed_5v` explicitly.
+
 ### 6B-U0 — source-only out-of-tree test consumer
 
-Only after K3 source bridge has independent evidence:
+Only after the bounded K4 source ramp has independent evidence:
 
 ```text
 - bounded manual request/fallback interface
@@ -336,9 +393,8 @@ This split is intentional: fallback is tested before PPS elevation.
 
 ## Implementation gate
 
-Do not create 6B-K0/K1/K2/K3 source commits until real Stage-6A data is
-available for Caihong and the runtime/compiled DT confirms the intended Oplus
-firmware path.
-
-The patch design can continue to be refined now; electrical write code waits for
-those hardware facts.
+K0--K3 have passed the intended staged hardware gates.  K4 must pass with both
+pumps off and a verified return to fixed 5 V before any source request is
+connected to Stage-4 single-pump control.  Dual-pump and automatic-policy work
+remain blocked behind a successful single-pump test and full fault/thermal
+rollback handling.

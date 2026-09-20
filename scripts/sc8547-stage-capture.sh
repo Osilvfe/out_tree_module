@@ -17,6 +17,8 @@ Examples:
   sc8547-stage-capture.sh 4 primary-before-enable
   sc8547-stage-capture.sh 5A 5v
   sc8547-stage-capture.sh 6A pps-adapter
+  sc8547-stage-capture.sh 7C five-minute-pass
+  sc8547-stage-capture.sh 7C active-unplug
 
 Optional environment strings copied into test-context.txt:
   SC8547_KERNEL_COMMITS
@@ -41,7 +43,7 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%d-%H%M%S)
 out=${3:-"sc8547-stage-${stage}-${label}-${stamp}"}
 
 case "$stage" in
-	0|1|2|3|4|5A|5B|6A|6B) ;;
+	0|1|2|3|4|5A|5B|6A|6B|7A|7B|7C) ;;
 	*)
 		echo "unsupported stage label: $stage" >&2
 		usage >&2
@@ -177,7 +179,7 @@ done
 # Physical SC8547 devices
 # ---------------------------------------------------------------------------
 physical_attrs='device_id variant role charge_enabled charge_mode switching adapter_present battery_present vbus_uv ibus_ua vbat_uv vout_uv vac_uv tdie_mc status_regs faults register_dump protection_state'
-experimental_attrs='profile_raw init_state apply_init watchdog_ms enable_window work_mode cp_enable'
+experimental_attrs='profile_raw init_state apply_init watchdog_ms enable_window work_mode cp_enable pulse_result pulse_diagnostics'
 
 physical_index=0
 for dev in /sys/bus/i2c/devices/*-006f; do
@@ -249,6 +251,18 @@ if [ -d "$usb" ]; then
 	capture_group "$usb" qcom-battmgr-usb \
 		online usb_type voltage_now voltage_max current_now current_max \
 		input_current_limit type
+
+	# The Stage-7 coordinator result is attached to the battmgr device rather
+	# than the power-supply class directory. Reading the RW result endpoint is
+	# observational; this collector never writes its manual trigger.
+	battmgr_device="$usb/device"
+	if [ -d "$battmgr_device" ]; then
+		capture_group "$battmgr_device" qcom-battmgr-device \
+			oneplus_pps_capabilities oneplus_pps_dual_500ms
+	else
+		printf '%s not found.\n' "$battmgr_device" > \
+			"$out/qcom-battmgr-device-NOT-FOUND.txt"
+	fi
 else
 	printf '%s not found.\n' "$usb" > "$out/qcom-battmgr-usb-NOT-FOUND.txt"
 fi
@@ -259,7 +273,10 @@ write_header "$psys" "/sys/class/power_supply inventory"
 for psy in /sys/class/power_supply/*; do
 	[ -e "$psy" ] || continue
 	printf '\n[%s]\n' "$(basename "$psy")" >> "$psys"
-	for attr in type online usb_type voltage_now voltage_max current_now current_max input_current_limit; do
+	for attr in type status health charge_type present online usb_type \
+		voltage_now voltage_ocv voltage_max current_now current_max \
+		power_now input_current_limit charge_counter capacity temp \
+		internal_resistance cycle_count; do
 		append_attr "$psy" "$attr" "$psys"
 	done
 done
@@ -270,9 +287,18 @@ done
 pdout="$out/usb-power-delivery.txt"
 write_header "$pdout" "/sys/class/usb_power_delivery readable capability tree"
 if [ -d /sys/class/usb_power_delivery ]; then
-	find -L /sys/class/usb_power_delivery -maxdepth 8 -print 2>&1 >> "$pdout" || true
+	# Follow each class entry supplied on the command line, but never follow
+	# symlinks encountered below it. Generic sysfs device/subsystem links form
+	# cycles and are not PD capability evidence.
+	for pdnode in /sys/class/usb_power_delivery/*; do
+		[ -e "$pdnode" ] || continue
+		find -H "$pdnode" -maxdepth 8 -print 2>&1 >> "$pdout" || true
+	done
 	printf '\n[readable files]\n' >> "$pdout"
-	find -L /sys/class/usb_power_delivery -maxdepth 8 -type f -print 2>/dev/null |
+	for pdnode in /sys/class/usb_power_delivery/*; do
+		[ -e "$pdnode" ] || continue
+		find -H "$pdnode" -maxdepth 8 -type f -print 2>/dev/null
+	done |
 	while IFS= read -r f; do
 		[ -r "$f" ] || continue
 		printf '\n--- %s ---\n' "$f" >> "$pdout"
@@ -286,12 +312,15 @@ fi
 typecout="$out/typec.txt"
 write_header "$typecout" "/sys/class/typec readable inventory"
 if [ -d /sys/class/typec ]; then
-	find -L /sys/class/typec -maxdepth 6 -print 2>&1 >> "$typecout" || true
+	for tcnode in /sys/class/typec/*; do
+		[ -e "$tcnode" ] || continue
+		find -H "$tcnode" -maxdepth 6 -print 2>&1 >> "$typecout" || true
+	done
 	printf '\n[common readable fields]\n' >> "$typecout"
 	for node in /sys/class/typec/*; do
 		[ -e "$node" ] || continue
 		printf '\n[%s]\n' "$(basename "$node")" >> "$typecout"
-		for attr in data_role power_role port_type preferred_role usb_power_delivery_revision usb_typec_revision; do
+		for attr in data_role power_role power_operation_mode port_type preferred_role usb_power_delivery_revision usb_typec_revision; do
 			append_attr "$node" "$attr" "$typecout"
 		done
 	done
@@ -334,6 +363,7 @@ write_header "$summary" "capture summary"
 	printf 'dual_groups=%d\n' "$dual_index"
 	printf 'policy_groups=%d\n' "$policy_index"
 	printf 'qcom_battmgr_usb=%s\n' "$([ -d "$usb" ] && echo present || echo absent)"
+	printf 'qcom_battmgr_device=%s\n' "$([ -d "${battmgr_device:-}" ] && echo present || echo absent)"
 	printf 'usb_power_delivery=%s\n' "$([ -d /sys/class/usb_power_delivery ] && echo present || echo absent)"
 	printf '\nREAD-ONLY CAPTURE COMPLETE.\n'
 	printf 'No sysfs/control write was issued by this script.\n'

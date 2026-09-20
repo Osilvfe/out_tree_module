@@ -82,6 +82,30 @@ When the PPM advertises:
 UCSI_CAP_PDO_DETAILS
 ```
 
+### Caihong runtime result
+
+Caihong's PMIC-Glink UCSI `GET_CAPABILITY` response decoded as:
+
+```text
+attributes      = 0x00004046
+num_connectors  = 1
+features        = 0x0000
+BC version      = 1.20
+PD version      = 3.0
+Type-C version  = 1.3
+```
+
+The charger can establish a PD connection, and UCSI reports a valid RDO
+operating current, but `UCSI_CAP_PDO_DETAILS` is absent.  Consequently
+`src_pdos[]` remains empty, the UCSI power-supply voltage/max fields read zero,
+and no partner `source-capabilities`/PPS APDO tree is registered.  This is a
+firmware capability limitation, not evidence that VBUS is actually zero.
+
+For Caihong, Stage 6A therefore has to use the downstream read-only PPS
+capability query (or another independently proven firmware interface) to learn
+APDO limits.  It must not fabricate PDOs from the adapter name or from the RDO
+current alone.
+
 UCSI core sends `UCSI_GET_PDOS` for the partner source PDOs.
 
 The returned PDOs are registered through the Linux USB Power Delivery class.
@@ -269,6 +293,61 @@ word 0: imax
 word 1: vmax
 word 2+: PDO data
 ```
+
+The Pad Pro source used to verify this ABI is the shallow clone at:
+
+```text
+external/oneplus-sm8650-pad-pro
+branch: oneplus/sm8650_b_16.0.0_pad_pro
+commit: 0a4a245d2786bf25a9683cfc3839d6ee5b8562e4
+```
+
+The verified wire definitions are:
+
+```text
+owner                         PMIC_GLINK_OWNER_BATTMGR (32778)
+type                          request/response (1)
+opcode                        0x10004
+request payload               u32 data_size = 512 bytes
+response payload              u32 data[128], u32 data_size
+downstream timeout            500 ms
+maximum consumed PDO entries  7
+```
+
+Mainline Caihong now has a DT-gated, read-only diagnostic implementation in
+`drivers/power/supply/qcom_battmgr.c`. It uses the existing battery-manager
+Glink client and serializes against normal battery-property requests. Reading
+the following attribute sends exactly one capability request:
+
+```sh
+cat /sys/class/power_supply/qcom-battmgr-usb/device/oneplus_pps_capabilities
+```
+
+The output contains the raw `imax`, `vmax`, and up to seven raw PDO words, plus
+a convenience decode for fixed PDOs and PPS APDOs. This interface has no write
+attribute, sends no property SET request, changes no source contract, and does
+not enable either charge pump.
+
+### Caihong Stage-6A hardware result
+
+The read-buffer request was verified on Caihong on 2026-09-02. With the tested
+PD/PPS adapter connected, firmware returned:
+
+```text
+fixed:  5 V / 3 A
+fixed:  9 V / 3 A
+fixed: 12 V / 3 A
+fixed: 15 V / 3 A
+fixed: 20 V / 5 A
+PPS:    5-11 V / 5 A
+PPS:    5-20 V / 5 A
+```
+
+After disconnect, the same request completed successfully but all seven PDO
+words were zero. This proves that the buffer reflects source attachment rather
+than a hard-coded adapter table. `imax` and `vmax` were zero in both captures;
+they must not be used as capability bounds before their downstream meaning is
+independently established.
 
 This private read-buffer protocol is useful as evidence for what the Oplus
 charger firmware supplies to its PPS policy. It should **not** be reimplemented

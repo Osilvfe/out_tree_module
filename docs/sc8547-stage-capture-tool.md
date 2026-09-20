@@ -31,6 +31,8 @@ Examples:
 ./scripts/sc8547-stage-capture.sh 5A unplugged
 ./scripts/sc8547-stage-capture.sh 5B dual-enabled
 ./scripts/sc8547-stage-capture.sh 6A pps-adapter
+./scripts/sc8547-stage-capture.sh 7C five-minute-pass
+./scripts/sc8547-stage-capture.sh 7C active-unplug
 ```
 
 ## Optional test metadata
@@ -59,13 +61,18 @@ The output directory contains, when available:
   - `sc8547_dual`
   - `sc8547_policy_diag`
 - both I2C `0x6f` physical SC8547 sysfs groups;
-- visible experimental attributes, **read only**;
+- visible experimental attributes, **read only**, including each pump's
+  `pulse_result` and full `pulse_diagnostics` when present;
 - virtual dual-pump state;
 - Stage-6A policy diagnostics;
 - `qcom-battmgr-usb` source properties;
-- a complete power-supply inventory;
+- the battmgr-side `oneplus_pps_dual_500ms` result when present;
+- a complete power-supply inventory including battery terminal voltage, OCV,
+  current, capacity and temperature where exported;
 - `/sys/class/usb_power_delivery` capability tree;
 - Type-C role/revision inventory;
+- Type-C power-operation mode, which distinguishes a negotiated PD contract
+  (`usb_power_delivery`) from default/Type-C current advertisement;
 - runtime DT paths/properties related to battmgr/SoCCP;
 - final `dmesg` capture;
 - a concise `SUMMARY.txt`.
@@ -204,6 +211,54 @@ source-bridge-preflight
 When the future kernel-tree bridge exists, the operator plan will define
 separate captures around fixed-5V fallback and one conservative PPS request.
 The collector itself will remain read-only.
+
+### Stage 7C
+
+Stage 7C remains a manually triggered, five-minute maximum experiment. Run the
+collector after the manual trigger has returned; it reads but never writes the
+`oneplus_pps_dual_500ms` endpoint. Recommended labels for the next lifecycle
+tests are:
+
+```text
+five-minute-pass
+active-unplug
+replug-before-restart
+replug-five-minute-pass
+manual-stop
+```
+
+The first stable C19 run and its post-prepare recovery are already qualified.
+The next priority is detach/replug lifecycle behavior, not higher power, full
+charge, automatic attach start, suspend or an intentionally heated run.
+
+For an active-unplug test, collect only after the write has returned. A safe
+result must show both pumps off, successful cleanup and a low-current or
+USB-offline termination. The latest two-second `usb_online` monitor value may
+still be the pre-detach sample when a 500-ms pump guard detects the collapse
+first. Treat that ordering as expected, and use physical `pulse_diagnostics`
+to distinguish it from an unexplained pump stop.
+
+After reconnecting, take `replug-before-restart` before issuing another manual
+start. Both pumps must be off, the USB supply must be online again, and no run
+may start automatically. Then run one ordinary five-minute test and collect
+`replug-five-minute-pass`; this checks that detach cleanup left no stale pump,
+profile or battmgr state.
+
+Full-charge qualification and automatic sustained charging remain explicitly
+out of scope.
+
+### Stage 7D
+
+Stage 7D starts with a manually triggered ten-minute endurance gate. It keeps
+the same `oneplus_pps_dual_500ms` endpoint and all Stage-7C electrical and
+lifecycle guards; only the bounded hold and physical worker windows are longer.
+Use the label `ten-minute-pass` after a natural-duration run. A passing D0
+capture has 1200 hold samples, 301 two-second system checks, successful physical
+completion and zero off-guard, cleanup and fixed-5-V errors. Manual stop remains
+available and must continue to report `-ECANCELED`.
+
+This stage still has no automatic attach start and does not qualify full-charge,
+suspend or heated operation.
 
 ## Before/after comparison rule
 

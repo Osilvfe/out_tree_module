@@ -51,6 +51,16 @@ Supported USB types include normal PD and `POWER_SUPPLY_USB_TYPE_PD_PPS`.
 Current mainline can therefore observe a firmware-reported PD/PPS state and
 associated voltage/current values.
 
+### Caihong runtime caveat
+
+On Caihong, a known PD-capable source produced
+`power_operation_mode=usb_power_delivery` through PMIC-Glink UCSI while
+`qcom-battmgr-usb/usb_type` still selected `SDP`.  The UCSI result proves that
+a PD contract exists, so the upstream SM8350 USB-type property mapping is not a
+reliable PD/PPS gate with this OnePlus charger firmware.  Stage 6 must use UCSI
+contract state and partner PDO/APDO capability evidence for protocol gating;
+the battmgr voltage/current fields remain useful telemetry.
+
 Important limitation: the USB `power_supply_desc` has `get_property` but no USB
 `set_property` callback. Linux v7.2 therefore has no established public
 power-supply interface for this port to request a new PD/PPS contract.
@@ -463,10 +473,12 @@ Record adapter/cable identity alongside the direct qcom-battmgr sysfs values and
 Stage-6A combined snapshot. This is evidence for Stage 6B, not permission to
 send SET messages.
 
-## Stage 6B — future source-request bridge, not implemented
+## Stage 6B — gated source-request bridge under hardware validation
 
-Stage 6B is a separate write-capable stage only after the firmware ABI/session
-semantics are confirmed.
+The local Caihong kernel now contains fixed-value Stage-6B development controls.
+The read-buffer, fixed-5-V fallback and 5.5-V/1-A requests have been validated
+on hardware with both SC8547s off.  Arbitrary requests and automatic pump
+control remain prohibited.
 
 The bridge should **not** initially be a generic "set voltage/current" API.
 Downstream evidence now suggests the minimum sensible abstraction is a source
@@ -481,11 +493,11 @@ exit PPS session
 verify return to basic/normal charging
 ```
 
-The first hardware tests must keep both SC8547s disabled:
+Stage-6B hardware tests keep both SC8547s disabled:
 
 1. observe stable basic/5-V state;
 2. prove capability discovery/eligibility;
-3. enter PPS using the verified firmware interface;
+3. enter PPS using the gated firmware interface;
 4. issue one deliberately conservative low-power request;
 5. require positive request completion and independently verify VBUS;
 6. exit PPS and verify restoration of basic/normal charging;
@@ -494,29 +506,367 @@ The first hardware tests must keep both SC8547s disabled:
 9. only after this may any CP policy consume the bridge.
 
 A source bridge that cannot demonstrably exit and restore a safe/basic state
-must never be connected to automatic CP start.
+must never be connected to automatic CP start.  The next test ramps only the
+source from 5.5 V to 9.0 V in 0.5-V steps at 1 A, then requires an explicit
+verified fixed-5-V fallback; it still cannot enable a pump.
 
-## Stage 6C — future CP/source policy and ramp
+## Stage 6C0 — asynchronous single-primary policy
 
-Only after Stage 5B and Stage 6B are independently hardware-validated should an
-automatic policy be considered.
+Stage 6C0 is now implemented as a development-only policy in the Caihong
+`qcom_battmgr` branch. It is intentionally narrower than the eventual dual-pump
+policy and does not require Stage 5B: the secondary pump has not passed its
+individual switching gate, so Stage 6C0 requires both pumps to be off and only
+starts the already-validated primary.
 
-The first policy must be deliberately limited:
+The DT opt-in is:
 
-- one already-validated CP ratio;
-- conservative initial source current;
-- source capability/session confirmed before CP preparation;
-- source VBUS ramped near the required `VBAT × ratio` region before CP start;
-- CP start followed by explicit switching confirmation;
-- gradual voltage/current changes instead of jumps to final power;
-- continuous source/CP fault and VBUS/VBAT/IBUS observation;
-- reverse-order CP shutdown before source-session fallback;
-- no VOOC/SuperVOOC/UFCS mixed into the generic PD/PPS state machine.
+```text
+oneplus,pps-policy-2to1-1a
+```
 
-The downstream 5.5 V / 0.8–1.0 A startup is useful evidence for conservative
-bring-up, **not automatically the final values for our implementation**. Actual
-Stage-6B/6C first-test values will be documented only after Stage-6A hardware
-captures and firmware-ABI confirmation.
+The resulting device attribute is:
+
+```text
+oneplus_pps_policy_2to1_1a
+```
+
+Writing `1` queues an asynchronous policy run and returns immediately. Writing
+`0` requests cancellation. A run is capped at 15 minutes and retains all of
+the earlier electrical bounds:
+
+- 2:1 mode only;
+- one primary SC8547A only; secondary must be present and off;
+- source request capped at 1 A;
+- advertised fixed 5 V and compatible PPS APDO checked before source ramp;
+- gauge-derived target and bounded source ramp completed before CP start;
+- physical driver confirms start and samples the CP every 500 ms;
+- physical checks cover switching/fault state, VAC/VBUS/VBAT, 2:1 error, IBUS
+  and die temperature;
+- policy checks USB attachment, charger-service availability, gauge VBAT and
+  battery temperature every 2 seconds;
+- policy VBAT stop is 4.30 V and the initial battery-temperature window is
+  10.0–45.0 degrees C;
+- every exit completes pump disable/profile restoration before the source is
+  requested back to fixed 5 V.
+
+The policy deliberately holds the requested current at 1 A during this first
+stage. Dynamic current optimization and dual-pump operation remain prohibited.
+Initial PPS elevation is still gradual; changing the settled source contract
+while the primary is active is deferred until this lifecycle and rollback stage
+has passed hardware testing.
+
+The physical driver remains policy-free. Its only Stage-6C0 addition is a
+lock-free cancellation flag checked by the existing bounded run. Cancellation
+does not write a register directly; within one 500-ms sample it enters the same
+tested disable/readback/restore path used by Stage 4AV.
+
+### Stage-6C0 hardware gates
+
+Test in this order:
+
+1. start the asynchronous policy, observe `state=active`, then request a user
+   stop after at least 60 seconds;
+2. require `reason=user`, policy `rc=0`, pump `cp_run_rc=-ECANCELED`, all cleanup
+   return codes zero and both physical pumps off;
+3. run again and allow either the 15-minute duration or the 4.30-V policy limit
+   to stop it; both are controlled completions;
+4. repeat the physical cable-detach test while active; a negative operational
+   result is expected, but pump cleanup and final off-state are mandatory;
+5. do not proceed to dynamic source retargeting or dual-pump policy until these
+   normal and fault exits are repeatable.
+
+## Stage 6C1 — low-current UCP/soft-start-timeout correction
+
+The first Stage-6C0 natural hardware run stopped after about 79 seconds even
+though VBUS/VBAT ratio, die temperature, USB attachment and service telemetry
+were valid. The pre-restore reject dump identified the actual transition:
+
+```text
+REG05=1b REG08=e0 REG09=34 REG0F=04 REG07=00
+```
+
+`REG0F[2]` is the IBUS UCP-fall flag and `REG09[5]` is its rise flag; neither is
+a watchdog flag. The vendor low-current helper disables UCP and the coupled
+REG08 soft-start timeout until measured input current exceeds 600 mA. Since the
+fixed 1-A validation policy has measured only about 0.2--0.4 A, Stage 6C1 uses
+the same `REG05=9b`, `REG08=00` state throughout this deliberately low-power
+run. IBUS OCP, voltage protections, the watchdog and both software monitor
+loops remain enabled.
+
+Stage 6C1 crossed the former UCP failure point and remained switching through
+119 seconds, proving the low-current correction. It then rejected one
+pump-local `VBAT=4478750` uV sample while qcom-gauge remained near 4.164 V. The
+single impossible sample produced a 617500-uV 2:1 ratio error and exposed that
+the ADC high and low bytes were still fetched through separate I2C transfers.
+
+## Stage 6C2 — coherent ADC read and numeric-range confirmation
+
+Stage 6C2 keeps the C1 low-current protection state and does not widen an
+electrical limit. Each ADC high/low pair is now fetched with one continuous I2C
+read. If pump status and fault registers remain healthy but a numeric software
+window rejects the sample, the driver takes two additional samples 10--20 ms
+apart. A recovered transient is counted; three consecutive out-of-range
+samples still stop and restore the pump. Hardware/status faults, I2C errors and
+cancellation retain immediate fail-closed behavior. The policy also exposes
+`state=stopping` as soon as the physical run returns, before slower monitor and
+source cleanup completes.
+
+Both C2 hardware gates passed. Explicit cancellation after approximately three
+minutes produced 359 valid 500-ms samples, no ADC range recheck, expected
+physical `-ECANCELED`, zero cleanup/restore errors and final pump-off state. The
+natural run then completed all 1800 samples with policy `reason=duration`, no
+ADC range recheck, valid voltage/current/temperature ranges and clean fixed-5-V
+fallback.
+
+## Stage 6C3 — one bounded active PPS step
+
+C3 isolates the next untested boundary without implementing dynamic tracking.
+At monitor check 15, it issues exactly one `+20 mV` source request at the same
+1-A ceiling, then waits 500 ms and requires the primary pump to remain enabled
+and switching. The new request must remain within the advertised APDO and the
+existing 9.4-V source ceiling. Pre/post pump-side VBUS and the request result are
+retained in one concise policy line. A request or verification failure cancels
+the physical run and restores fixed 5 V before reporting `source-retarget`.
+
+Both C3 gates passed. The cancellation gate requested `8910 -> 8930` mV at
+monitor check 15, retained valid pump-side VBUS and switching after 500 ms,
+then continued through 374 physical samples before clean cancellation and
+fixed-5-V fallback. The duration gate requested `8890 -> 8910` mV, completed
+all 1800 physical samples with no ADC range recheck, and restored the pump and
+source cleanly. Its observed IBUS remained below both the 1-A source request
+and 1.2-A physical monitor ceiling; die temperature remained at or below 38
+degrees C.
+
+## Stage 6C4 — three bounded active PPS steps
+
+C4 isolates repeated active source requests without adding a feedback policy.
+It performs exactly three `+20 mV` requests at monitor checks 15, 30 and 45,
+for a maximum cumulative increase of 60 mV. Each request retains the C3 APDO
+and 9.4-V bounds, waits 500 ms, rereads pump-side VBUS and requires the primary
+pump to remain enabled and switching. The current request stays at 1 A and the
+secondary remains off.
+
+The compact policy report records attempted/completed counts, the first source
+voltage, final requested voltage, last pre/post VBUS and the last result. Any
+failed request or post-request pump check immediately cancels the physical run
+and enters the already-tested fixed-5-V fallback. C4 does not derive a target
+from gauge or pump ADC values and issues no further source request after the
+third step.
+
+The first hardware gate is a run long enough to complete all three steps,
+followed by explicit cancellation and full off-state verification. A natural
+duration run follows only after that gate passes. Gauge-driven source tracking
+is deferred to C5 or later. Dual-pump policy additionally requires both
+physical pumps to pass their individual Stage-4 tests and Stage 5B to pass
+independently. No Stage 6C variant may mix VOOC/SuperVOOC/UFCS into this generic
+PD/PPS state machine.
+
+The C4 cancellation gate passed. All three active requests completed and moved
+the source from 8990 to 9050 mV; the last 500-ms pump-side confirmation remained
+valid. The pump then continued through 357 valid samples before explicit
+cancellation, with no ADC range recheck and with clean pump/profile/source
+rollback. The duration gate also passed: all three requests moved the source
+from 8970 to 9030 mV, the physical run completed all 1800 samples with no ADC
+range recheck, IBUS remained below 522 mA, die temperature remained at or below
+37.5 degrees C, and all cleanup/fixed-5-V results were zero.
+
+## Stage 6C5 — one bounded active PPS down-step
+
+C5 validates the remaining request direction before bidirectional feedback is
+introduced. At monitor check 15 it requests exactly one `-20 mV` source step,
+then uses the same 500-ms pump-side VBUS, enable and switching confirmation as
+C3/C4. It requires the target to remain within the advertised APDO and existing
+source limits. The source-current request remains 1 A, the primary is the only
+active pump, and every electrical and software monitor limit is unchanged.
+
+There is no second request and no feedback decision in C5. Any request or
+post-request verification error cancels the physical run and restores fixed 5
+V. The first hardware gate observes at least one minute after the down-step and
+then explicitly cancels; natural duration follows only if cancellation and all
+cleanup paths pass. Current-driven bidirectional feedback remains deferred to
+C6 or later.
+
+The C5 natural duration gate passed. The active request moved the source from
+9010 to 8990 mV and retained valid pump-side VBUS and switching after 500 ms.
+All 1800 physical samples completed without ADC range recheck; pump/profile
+cleanup and fixed-5-V fallback all returned zero. An earlier attempt had failed
+before pump startup with `-ENODEV` and no monitor/down-step activity; replugging
+the source restored the qcom online state and the same image then passed.
+
+## Stage 6C6 — three bounded IBUS-feedback decisions
+
+C6 connects the separately validated up/down request paths to a deliberately
+limited current decision. At monitor checks 15, 30 and 45 it reads the primary
+SC8547 IBUS ADC. With a 1-A target and a 100-mA deadband, it requests `+20 mV`
+below 0.9 A, `-20 mV` above 1.1 A, or holds the source request between those
+thresholds. There are exactly three decisions, so at most three source writes
+and at most 60 mV cumulative movement are possible.
+
+Every actual source write retains APDO/9.4-V bounds and the 500-ms VBUS plus
+enable/switching confirmation. A hold performs no source write but still
+requires the pump to be active. The source request remains capped at 1 A, the
+physical IBUS software limit remains 1.2 A, the secondary remains off, and all
+existing battery/source/temperature cleanup rules are unchanged. This stage is
+not a continuous tracker and does not increase requested current.
+
+The C6 cancellation gate passed. All three IBUS decisions selected `+20 mV`
+from measured current below 0.9 A; all three requests completed and moved the
+source from 9010 to 9070 mV. The pump continued through 270 valid samples before
+explicit cancellation, with no ADC range recheck and clean pump/profile/source
+rollback. The natural duration gate also passed: three requests moved the
+source from 9110 to 9170 mV, all 1800 samples completed without ADC range
+recheck, IBUS remained below 269 mA, die temperature remained at or below 37.5
+degrees C, and all cleanup/fixed-5-V results were zero.
+
+## Stage 6C7 — six bounded IBUS-feedback decisions
+
+C7 changes only the decision-count ceiling. It retains C6's 30-second cadence,
+1-A target, 100-mA deadband and 20-mV bidirectional step, but allows six
+decisions at monitor checks 15, 30, 45, 60, 75 and 90. Thus at most six source
+writes and 120 mV cumulative movement are possible. APDO/9.4-V bounds,
+post-write pump confirmation, the 1.2-A physical IBUS stop, single-primary
+topology and all cleanup rules are unchanged. Continuous feedback and higher
+requested current remain deferred.
+
+The C7 natural duration gate passed. All six low-IBUS decisions selected
+`+20 mV`, all six requests completed the exact 9010-to-9130-mV movement, and
+the physical run completed all 1800 samples without an ADC range recheck.
+Observed IBUS was 22.5--495 mA and die temperature was 36--38 degrees C. Policy
+completion, pump/profile cleanup and fixed-5-V restoration all returned zero.
+
+## Stage 6C8 — conservative 1.25-A source-current request
+
+C8 changes one electrical input after C7 passed: the policy's PPS current
+request rises from 1.0 to 1.25 A. The existing manual `*_1a` diagnostics remain
+at 1 A; only the policy-owned ramp and its active feedback requests use the new
+current. The same APDO check must explicitly admit 1.25 A before any ramp.
+
+The six decision points, 20-mV bidirectional step, 1-A feedback target with
+100-mA deadband, 120-mV cumulative movement ceiling, 1.2-A physical IBUS stop,
+single-primary topology, 4.30-V VBAT stop, 10--45-degree-C battery window and
+all fail-closed cleanup rules remain unchanged. The first gate is a 240-second
+run followed by explicit cancellation. A natural 15-minute run is allowed only
+after that cancellation and rollback gate passes.
+
+The C8 natural duration gate passed directly. The intended 1.25-A policy limit
+was active, all six upward requests completed the exact 9010-to-9130-mV
+movement, and all 1800 physical samples completed without an ADC range recheck.
+Observed IBUS was 315--553.125 mA and die temperature was 34--37.5 degrees C.
+Policy completion, pump/profile cleanup and fixed-5-V restoration all returned
+zero.
+
+## Stage 6C9 — conservative 1.5-A source-current request
+
+C9 raises only the policy-owned PPS current request from 1.25 to 1.5 A. The
+six feedback decisions, 20-mV step, 1-A target/deadband, 1.2-A physical IBUS
+stop, APDO/9.4-V bounds, single-primary topology and every thermal/VBAT/cleanup
+rule remain unchanged. Existing manual `*_1a` endpoints still use 1 A.
+
+To shorten iteration, the first gate runs about 210 seconds: enough to complete
+the sixth decision at roughly 180 seconds and observe it for about 30 seconds,
+then explicitly cancel. A 15-minute run is deferred until a current request
+brings IBUS near the existing 0.9--1.1-A feedback deadband.
+
+The C9 natural duration gate passed directly. The intended 1.5-A policy limit
+was active, all six upward requests completed the exact 9010-to-9130-mV
+movement, and all 1800 physical samples completed without an ADC range recheck.
+Observed IBUS was 603.75--836.25 mA and die temperature was 37--40 degrees C.
+Policy completion and all rollback operations returned zero. The ending gauge
+voltage was about 4.283 V, so another current gate requires a discharged battery
+to avoid immediately reaching the unchanged 4.30-V stop.
+
+## Stage 6C10 — 1.75-A target-window probe
+
+C10 raises only the policy-owned PPS current request from 1.5 to 1.75 A. C9's
+836.25-mA observed peak was still below the 0.9-A lower decision threshold, so
+this next 250-mA request increment probes whether the established six-step
+feedback reaches its 0.9--1.1-A hold window.
+
+All voltage feedback, APDO/9.4-V bounds, the 1.2-A physical IBUS stop,
+single-primary topology, 4.30-V VBAT stop, temperature window and cleanup rules
+remain unchanged. Start only with gauge VBAT at or below about 4.20 V. Run about
+210 seconds, then explicitly cancel; do not perform another natural 15-minute
+run at this boundary.
+
+The C10 cancellation gate passed after 444 valid physical samples. All six
+decisions held the 8810-mV source request without a write, measured IBUS stayed
+inside 939.375--1095 mA, die temperature stayed within 36--38.5 degrees C, and
+all ADC-recheck and cleanup counters remained zero. This establishes 1.75 A as
+the bounded single-primary source-current request; it must not be raised again.
+One final natural 15-minute gate remains, using the same image and a starting
+gauge voltage at or below about 4.00 V to avoid truncation by the 4.30-V stop.
+
+The attempted accelerated detach closeout did not pass. After source removal,
+samples 258 and 516 still showed the primary pump enabled and switching at only
+22.5-mA IBUS. Residual VAC/VBUS remained above the physical voltage floor, so
+the run waited for eventual hardware protection at sample 667 instead of
+actively stopping. Cleanup and final off-state were correct, but C10 therefore
+qualifies only the 1.75-A target window; detach handling remains an open gate.
+
+## Stage 6C11 — input-loss guard and nonblocking reporting
+
+C11 retains the C10 1.75-A source request, six feedback decisions,
+0.9--1.1-A target window, 1.2-A physical stop and all rollback limits. The
+policy now directly reads primary IBUS every 2 seconds. Three consecutive
+readings below 500 mA stop the policy with `reason=input-loss` and use the
+existing atomic cancellation path, so a stale qcom `USB_ONLINE` value cannot
+leave the pump enabled indefinitely. The threshold remains below C10's
+939.375-mA observed minimum and is debounced for roughly 6 seconds.
+
+C11 also adds an atomic physical-run flag and changes `pulse_result` plus
+`pulse_diagnostics` to use a nonblocking mutex acquisition. While the physical
+run owns the mutex, reads immediately report `running=1 busy=1`.
+
+The first gate is short: verify both active reads, remove source power without
+writing the user-stop endpoint, and require automatic cancellation in about
+6--8 seconds. The physical result must be `-ECANCELED`, cleanup must complete
+and both pumps must be off. No 15-minute run is required.
+
+Hardware passed this gate. The operator confirmed automatic pump shutdown a
+few seconds after source removal and correct final policy, cancellation and
+primary/secondary off-state outputs. The stale-`USB_ONLINE` detach gap exposed
+by C10 is therefore closed.
+
+## Stage 6C12 — self-contained primary startup
+
+C12 removes the remaining manual `apply_init` prerequisite from policy startup.
+When the controlled primary-pump target/preparation path first runs after boot,
+it applies the same hardware-validated fail-closed profile before preparing the
+pump. A profile write or readback failure still aborts startup before source
+elevation or pump enable.
+
+No electrical or lifecycle limit changes from C11. The gate is a fresh-boot
+policy start without writing `apply_init`, followed by an explicit stop after
+about 20 seconds and full off-state verification. This isolates startup
+ownership before any later cable-insertion auto-start work.
+
+Hardware passed this gate. Without `apply_init`, the policy entered active
+operation, held primary IBUS in the validated target window and stopped cleanly
+on the user request. The final policy was complete with zero cleanup/restore
+errors, the physical run was cancelled cleanly after 60 samples, and all pump
+outputs were reported correct and off.
+
+## Stage 6C13 — attach-triggered auto-start
+
+C13 adds an explicit DT opt-in that polls source state every 5 seconds and
+automatically starts the qualified C12 policy once per physical attachment.
+Startup requires primary-pump presence and at least 4-V pump-side VBUS,
+Qualcomm USB online state, VBAT no higher than 4.20 V and the existing
+10--45-degree-C battery-temperature window. A connection receives at most
+three startup attempts. Reaching the active state disarms automatic startup;
+a user stop also keeps it disarmed until a real detach is observed.
+
+No electrical limit changes from C12. The short gate boots unplugged, confirms
+the idle/armed state, plugs a validated PPS source without any sysfs setup or
+start write, verifies automatic active operation, then explicitly stops and
+requires no same-attachment restart plus complete pump/source rollback.
+
+Hardware passed the complete lifecycle. The first attachment started
+automatically; physical removal triggered the three-check input-loss guard,
+stopped the pump, cleaned up without error and rearmed exactly once. A second
+attachment started automatically and reached roughly 1.04--1.06-A primary
+IBUS. User stop then completed cleanly with the pump off, `armed:0`, `starts:2`
+and no restart while that source remained attached.
 
 ## Merge discipline for Stage 6
 
