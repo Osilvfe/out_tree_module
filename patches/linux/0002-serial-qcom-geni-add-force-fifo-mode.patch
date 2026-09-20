@@ -1,0 +1,128 @@
+diff --git a/Documentation/devicetree/bindings/serial/qcom,serial-geni-qcom.yaml b/Documentation/devicetree/bindings/serial/qcom,serial-geni-qcom.yaml
+index ed7b3909d87d..79ea1c998e61 100644
+--- a/Documentation/devicetree/bindings/serial/qcom,serial-geni-qcom.yaml
++++ b/Documentation/devicetree/bindings/serial/qcom,serial-geni-qcom.yaml
+@@ -54,6 +54,13 @@ properties:
+   power-domains:
+     maxItems: 1
+ 
++  qcom,force-fifo-mode:
++    type: boolean
++    description:
++      Use programmed-I/O FIFO transfers instead of DMA. This is intended for
++      devices whose UART-connected peripheral is incompatible with the DMA
++      receive path.
++
+   reg:
+     maxItems: 1
+ 
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index 1e39122ec09f..2027a915111a 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -147,6 +147,7 @@ struct qcom_geni_serial_port {
+ 	bool rx_tx_swap;
+ 	bool cts_rts_swap;
+ 	bool manual_flow;
++	bool fifo_mode;
+ 
+ 	struct qcom_geni_private_data private_data;
+ 	const struct qcom_geni_device_data *dev_data;
+@@ -155,6 +156,7 @@ struct qcom_geni_serial_port {
+ 
+ static const struct uart_ops qcom_geni_console_pops;
+ static const struct uart_ops qcom_geni_uart_pops;
++static const struct uart_ops qcom_geni_uart_fifo_pops;
+ static struct uart_driver qcom_geni_console_driver;
+ static struct uart_driver qcom_geni_uart_driver;
+ 
+@@ -574,7 +576,9 @@ static void qcom_geni_serial_console_write(struct console *co, const char *s,
+ 		uart_port_unlock_irqrestore(uport, flags);
+ }
+ 
+-static void handle_rx_console(struct uart_port *uport, u32 bytes, bool drop)
++#endif /* CONFIG_SERIAL_QCOM_GENI_CONSOLE */
++
++static void handle_rx_fifo(struct uart_port *uport, u32 bytes, bool drop)
+ {
+ 	u32 i;
+ 	unsigned char buf[sizeof(u32)];
+@@ -610,12 +614,6 @@ static void handle_rx_console(struct uart_port *uport, u32 bytes, bool drop)
+ 	if (!drop)
+ 		tty_flip_buffer_push(tport);
+ }
+-#else
+-static void handle_rx_console(struct uart_port *uport, u32 bytes, bool drop)
+-{
+-
+-}
+-#endif /* CONFIG_SERIAL_QCOM_GENI_CONSOLE */
+ 
+ static void handle_rx_uart(struct uart_port *uport, u32 bytes)
+ {
+@@ -783,7 +781,7 @@ static void qcom_geni_serial_handle_rx_fifo(struct uart_port *uport, bool drop)
+ 		total_bytes += last_word_byte_cnt;
+ 	else
+ 		total_bytes += BYTES_PER_FIFO_WORD;
+-	handle_rx_console(uport, total_bytes, drop);
++	handle_rx_fifo(uport, total_bytes, drop);
+ }
+ 
+ static void qcom_geni_serial_stop_rx_fifo(struct uart_port *uport)
+@@ -1235,7 +1233,8 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
+ 	geni_se_config_packing(&port->se, BITS_PER_BYTE, BYTES_PER_FIFO_WORD,
+ 			       false, true, true);
+ 	geni_se_init(&port->se, UART_RX_WM, port->rx_fifo_depth - 2);
+-	geni_se_select_mode(&port->se, port->dev_data->mode);
++	geni_se_select_mode(&port->se, port->fifo_mode ? GENI_SE_FIFO :
++							 port->dev_data->mode);
+ 	port->setup = true;
+ 
+ 	return 0;
+@@ -1799,6 +1798,24 @@ static const struct uart_ops qcom_geni_uart_pops = {
+ 	.pm = qcom_geni_serial_pm,
+ };
+ 
++static const struct uart_ops qcom_geni_uart_fifo_pops = {
++	.tx_empty = qcom_geni_serial_tx_empty,
++	.stop_tx = qcom_geni_serial_stop_tx_fifo,
++	.start_tx = qcom_geni_serial_start_tx_fifo,
++	.stop_rx = qcom_geni_serial_stop_rx_fifo,
++	.start_rx = qcom_geni_serial_start_rx_fifo,
++	.set_termios = qcom_geni_serial_set_termios,
++	.startup = qcom_geni_serial_startup,
++	.request_port = qcom_geni_serial_request_port,
++	.config_port = qcom_geni_serial_config_port,
++	.shutdown = qcom_geni_serial_shutdown,
++	.flush_buffer = qcom_geni_serial_flush_buffer_fifo,
++	.type = qcom_geni_serial_get_type,
++	.set_mctrl = qcom_geni_serial_set_mctrl,
++	.get_mctrl = qcom_geni_serial_get_mctrl,
++	.pm = qcom_geni_serial_pm,
++};
++
+ static int qcom_geni_serial_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
+@@ -1839,6 +1856,12 @@ static int qcom_geni_serial_probe(struct platform_device *pdev)
+ 	port->dev_data = data;
+ 	port->se.dev = &pdev->dev;
+ 	port->se.wrapper = dev_get_drvdata(pdev->dev.parent);
++	if (!data->console &&
++	    of_property_read_bool(pdev->dev.of_node, "qcom,force-fifo-mode")) {
++		port->fifo_mode = true;
++		uport->ops = &qcom_geni_uart_fifo_pops;
++		dev_info(&pdev->dev, "using FIFO transfer mode\n");
++	}
+ 
+ 	ret = port->dev_data->resources_init(uport);
+ 	if (ret)
+@@ -1858,7 +1881,7 @@ static int qcom_geni_serial_probe(struct platform_device *pdev)
+ 	port->rx_fifo_depth = DEF_FIFO_DEPTH_WORDS;
+ 	port->tx_fifo_width = DEF_FIFO_WIDTH_BITS;
+ 
+-	if (!data->console) {
++	if (!data->console && !port->fifo_mode) {
+ 		port->rx_buf = devm_kzalloc(uport->dev,
+ 					    DMA_RX_BUF_SIZE, GFP_KERNEL);
+ 		if (!port->rx_buf) {

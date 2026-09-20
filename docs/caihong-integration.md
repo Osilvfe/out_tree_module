@@ -32,32 +32,37 @@ CRC is MSB-first polynomial `0x8005`, default init `0xc596`, over `F1/F2` throug
 
 The vendor implementation also establishes an important startup property: the keyboard sends a power-up sync itself roughly 400 ms after power-on and then sends heartbeat traffic roughly every 100 ms. A mainline driver therefore does **not** need to transmit an unverified startup packet during probe. TX support can be added safely for commands whose payloads are known (LED/LCD/touchpad controls) without making probe depend on a speculative handshake.
 
-Still unresolved for **caihong hardware**:
+The current Caihong board integration uses QUPv3 wrapper 1 serial engine 7 at
+`0x00a9c000`, 921600 baud, GPIO62/63 for UART TX/RX, GPIO100 for active-high
+accessory power, GPIO137 for active-low wake and GPIO14 for active-high TX
+enable. The touchpad reports a 2764x1630 range with 23x23 resolution. These
+values remain board data and are not hard-coded by the protocol driver.
 
-- whether `uart7` is physically the pogo UART (currently only the strongest candidate),
-- UART baud rate,
-- plug/wake GPIO,
-- TX/TX-enable GPIO/pinctrl,
-- accessory power path and active polarities.
-
-The driver intentionally does not hard-code those board-specific values.
-
-Suggested DTS shape once pins are confirmed:
+The complete include fragment is
+`dts/sm8650-oneplus-caihong-pogo.dtsi`. Its serdev child has this shape:
 
 ```dts
 &uart7 {
     status = "okay";
     pogo {
         compatible = "oneplus,caihong-pogo";
-        current-speed = <BAUD>;
-        wake-gpios = <&tlmm WAKE GPIO_ACTIVE_LOW>;
-        tx-enable-gpios = <&tlmm TX_EN GPIO_ACTIVE_HIGH>;
-        touchpad-size-x = <4096>;
-        touchpad-size-y = <4096>;
+        current-speed = <921600>;
+        power-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+        wake-gpios = <&tlmm 137 GPIO_ACTIVE_LOW>;
+        tx-enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+        touchpad-size-x = <2764>;
+        touchpad-size-y = <1630>;
+        touchpad-resolution-x = <23>;
+        touchpad-resolution-y = <23>;
+        oneplus,crc-ibm-init = <0xc596>;
     };
 };
 ```
 
 ## Next bring-up checkpoint
 
-For touchscreen, the next useful hardware log is the probe/firmware-download path and one raw IRQ packet after the module binds. For pogo, the highest-value evidence is the UART controller and pin state while the physical keyboard is attached; once baud/pins are known the already-decoded receive protocol can be exercised without first implementing host TX.
+For touchscreen, the next useful hardware log is the probe/firmware-download
+path and one raw IRQ packet after the module binds. For pogo, rerun a complete
+keyboard/media/touchpad/TX-control regression from the migrated external
+module. The GENI FIFO selector remains a minimal kernel-side prerequisite; see
+`patches/linux/README.md` and `docs/current-status.md`.
