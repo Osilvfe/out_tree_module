@@ -1,10 +1,12 @@
 # Caihong out-of-tree driver status
 
-Status date: 2026-09-20.
+Status date: 2026-09-21.
 
-This repository is now the archive and development home for the Caihong
-device-specific touchscreen, pogo and SC8547 work. The SC8547 charging work is
-paused at the bounded Stage 7D13 checkpoint; it is not a production charging
+This repository carries Caihong drivers that are not yet upstream and archives
+their bring-up evidence. The companion kernel tree remains the integration
+tree; device-specific code is kept in dedicated Caihong files wherever the
+generic Qualcomm drivers require a small hook. The SC8547 charging work is
+paused at the bounded Stage 7D13 checkpoint and is not a production charging
 implementation.
 
 ## SC8547
@@ -41,13 +43,13 @@ that owner. A second independent PMIC-Glink client would therefore race the
 upstream `qcom_battmgr` request completion and is not a safe out-of-tree
 solution.
 
-The frozen experimental kernel implementation is preserved as
-`patches/linux/0001-power-supply-qcom-battmgr-oneplus-pps-wip.patch`. It is
-intentionally marked WIP: it contains the complete Stage 6/7 test policy and
-must not be treated as a minimal or upstreamable core-driver change. A future
-restart should keep only a small, serialized and unit-safe PPS transport bridge
-in `qcom_battmgr`; source policy, SC8547 coordination and diagnostics belong in
-a separate device module.
+The companion kernel tree now keeps the private definitions, state and policy
+in `qcom_battmgr_caihong.h` and `qcom_battmgr_caihong_*.inc`; the generic
+`qcom_battmgr.c` retains only the integration hooks required to share its
+single serialized BATTMGR owner. The frozen pre-refactor implementation is
+preserved as `patches/linux/0001-power-supply-qcom-battmgr-oneplus-pps-wip.patch`
+for reproducibility. It is historical WIP, not the current source of truth or
+an upstreamable core-driver patch.
 
 ## Pogo keyboard and touchpad
 
@@ -68,17 +70,18 @@ touchpad         2764 x 1630, resolution 23 x 23
 CRC init         0xc596
 ```
 
-The board fragment is stored in
-`dts/sm8650-oneplus-caihong-pogo.dtsi`. The Qualcomm GENI UART driver defaults
-to DMA for a normal UART, while this accessory required the FIFO path during
-bring-up. That selection cannot be implemented by a serdev child module after
-the parent UART has probed. The minimal generic core patch is therefore kept
-separately as
-`patches/linux/0002-serial-qcom-geni-add-force-fifo-mode.patch`; all pogo
-protocol and board logic remains out of tree.
+The board data is stored directly in the companion kernel's
+`sm8650-oneplus-caihong.dts`. The Qualcomm GENI UART driver defaults to DMA for
+a normal UART, while this accessory required the FIFO path during bring-up.
+That selection cannot be implemented by a serdev child module after the parent
+UART has probed. The companion Caihong kernel tree therefore carries a small
+generic DT-selected FIFO hook, with its implementation split into
+`qcom_geni_serial_fifo.inc`; all pogo protocol logic remains in the Caihong
+module and all board data remains in the Caihong DTS. The patch under
+`patches/linux/` is the original reproducibility snapshot.
 
-The migrated external driver and DTS fragment still require a fresh hardware
-regression before they should be described as production-ready.
+The migrated external driver and board integration still require a fresh
+hardware regression before they should be described as production-ready.
 
 ## Restart criteria
 

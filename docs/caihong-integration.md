@@ -38,8 +38,8 @@ accessory power, GPIO137 for active-low wake and GPIO14 for active-high TX
 enable. The touchpad reports a 2764x1630 range with 23x23 resolution. These
 values remain board data and are not hard-coded by the protocol driver.
 
-The complete include fragment is
-`dts/sm8650-oneplus-caihong-pogo.dtsi`. Its serdev child has this shape:
+The complete board description is kept directly in the companion kernel's
+`sm8650-oneplus-caihong.dts`. Its serdev child has this shape:
 
 ```dts
 &uart7 {

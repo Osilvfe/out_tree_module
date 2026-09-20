@@ -1,7 +1,8 @@
 # out_tree_module
 
-Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
-`oneplus,caihong`).
+Linux drivers not yet merged upstream, being brought up for the OnePlus Pad
+Pro (SM8650, `oneplus,caihong`). “Out-of-tree” describes upstream status; it
+does not mean Caihong integration is removed from the companion kernel tree.
 
 ## Modules
 
@@ -15,9 +16,12 @@ The touchscreen driver is written against the DTS currently used by Caihong:
 coordinate transform properties, and optional `novatek,pen-support`.
 
 The latest project checkpoint and hardware caveats are summarized in
-[`docs/current-status.md`](docs/current-status.md). Device-specific DTS
-fragments live under [`dts/`](dts/), and unavoidable kernel-side bridge
-patches are isolated under [`patches/linux/`](patches/linux/).
+[`docs/current-status.md`](docs/current-status.md). The companion kernel tree
+is the single source of truth for board data and keeps the required
+integration in `sm8650-oneplus-caihong.dts`, with device policy in
+Caihong-specific files and only small hooks in generic Qualcomm drivers.
+[`patches/linux/`](patches/linux/) contains reproducibility snapshots rather
+than an alternative integration location.
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is
@@ -71,10 +75,10 @@ The existing node is sufficient. Uncomment the pen flag when testing stylus:
 
 ## SC8547 DTS
 
-The frozen experimental board fragment is
-[`dts/sm8650-oneplus-caihong-sc8547.dtsi`](dts/sm8650-oneplus-caihong-sc8547.dtsi).
-For telemetry-only use, omit all `southchip,allow-experimental-*` properties
-and their experimental limits. A minimal passive shape is:
+The frozen experimental board data is kept directly in the companion kernel's
+`sm8650-oneplus-caihong.dts`. For telemetry-only use, omit all
+`southchip,allow-experimental-*` properties and their experimental limits. A
+minimal passive shape is:
 
 ```dts
 &i2c_hub_0 {
@@ -106,9 +110,8 @@ upstream binding. The driver also accepts the downstream-compatible strings
 
 ## Pogo DTS
 
-The current Caihong UART/pin assignment is preserved in
-[`dts/sm8650-oneplus-caihong-pogo.dtsi`](dts/sm8650-oneplus-caihong-pogo.dtsi).
-Its serdev child is equivalent to:
+The current Caihong UART/pin assignment is preserved directly in the companion
+kernel's `sm8650-oneplus-caihong.dts`. Its serdev child is equivalent to:
 
 ```dts
 &uart7 {
@@ -129,6 +132,7 @@ Its serdev child is equivalent to:
 };
 ```
 
-The board fragment selects GENI FIFO mode. Apply the isolated serial-core
-patch in `patches/linux/` before using it; the serdev module cannot change the
-parent UART transfer mode after probe.
+The board node selects GENI FIFO mode. The companion Caihong kernel tree
+contains the required generic, DT-selected serial-core hook; the archived
+patch in `patches/linux/` records the original change. The serdev module cannot
+change the parent UART transfer mode after probe.
