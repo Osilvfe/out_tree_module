@@ -11,6 +11,17 @@ does not mean Caihong integration is removed from the companion kernel tree.
   using `serdev`.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
 
+## Current driver status
+
+| Driver | Status | Hardware state |
+| --- | --- | --- |
+| `nt36532e_ts.ko` | Usable | Caihong NT36532E display and pen path is integrated with the companion kernel DTS. |
+| `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
+| `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
+
+The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
+experimental controls are fail-closed and are not a production charging policy.
+
 The touchscreen driver is written against the DTS currently used by Caihong:
 `spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
 coordinate transform properties, and optional `novatek,pen-support`.

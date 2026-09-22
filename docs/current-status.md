@@ -36,6 +36,21 @@ The complete experiment ledger remains in
 `docs/sc8547-commit-test-matrix.md`. It is evidence, not a recommendation to
 enable automatic charging.
 
+### Post-refactor boot observation
+
+During regression testing of the refactored image, one boot at about 15%
+capacity and 3.73 V battery voltage failed before the continuous session could
+start. The voltage ramp and pump preparation completed, but the primary SC8547
+worker returned `-ERANGE`; the coordinator subsequently observed the primary
+path already disabled and reported `-EIO`. Cleanup, both final-off checks and
+the return to fixed 5 V all succeeded.
+
+Charging started normally after rebooting the same image without a policy
+change. This is therefore retained as an intermittent startup or
+hardware-state observation, not evidence for relaxing a guard. The exact
+physical sample that triggered `-ERANGE` was not captured, so the cause remains
+unclassified.
+
 ## qcom_battmgr boundary
 
 The charger firmware routes every BATTMGR-owner response to every client using
