@@ -40,17 +40,28 @@ That old error path leaves touch IRQ disabled.
 Stage4 uses the existing DRM panel-follower API so firmware is uploaded after
 panel preparation, including display blank/unblank. Work waits for both panel
 and SPI device resume; the firmware is retained in RAM. This addresses a
-source-confirmed ordering gap, while the exact hardware timeout cause and the
-fix still need a device test. `touch_stats` now includes power/start counters
-and errors. No kernel rebuild or WLAN payload change is involved.
+source-confirmed ordering gap. The user has now confirmed that sleep and
+touch recovery work with stage4. This validates the tested wake cycle, without
+establishing the exact old timeout cause or long-term stability. `touch_stats`
+includes power/start counters and errors. No kernel rebuild or WLAN payload
+change is involved.
 
 Stage4 also fixes pen pressure/ranges/transforms and adds `pen_scan`,
 `pen_stats`, and a passive `caihong-pen-status` helper. The user's pen is
 OPN2402, but its vendor scan type, charge and Bluetooth state are unknown.
 The original wireless charger is CPS8601 on I2C hub 3 at 0x41, with a separate
 PMIC-Glink HBOOST dependency. Charging is not implemented by this stage.
-Module compilation, host event/PM/diagnostic tests and final-image checks pass;
-stage4 boot, Wi-Fi, touch/resume and pen still need hardware validation.
+Module compilation, host event/PM/diagnostic tests and final-image checks pass.
+Stage4 boot and touch/resume are confirmed; pen remains untested and a fresh
+Wi-Fi regression result has not been separately reported for stage4.
+
+The first pen helper looked in the removed `/sys/class/i2c-adapter` class and
+reported zero hub-3 adapters. The working image already enables that hub and
+its parent. The updated helper uses `/sys/bus/i2c/devices/i2c-N`, with tests
+covering the current layout and OF-node fallback. It can be run directly on
+stage4 without reflashing. CPS communication is still awaiting device results.
+Bluetooth address-not-available was also reported; the helper only queries
+BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

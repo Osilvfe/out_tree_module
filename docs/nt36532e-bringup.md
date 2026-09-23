@@ -3,8 +3,8 @@
 Status: 2026-09-23. Stage3 desktop touch and a simple browser 10-point test
 passed. Sleep/resume later failed with no `evtest` events and a reported
 `nt36532e_resume` PM error of `-110`. Stage4 contains a panel-sequencing fix
-and pen diagnostics, awaiting device testing. The OPN2402 pen's power,
-Bluetooth connection and input remain unverified.
+and pen diagnostics; the user confirmed sleep/resume now works. The OPN2402
+pen's power, Bluetooth connection and input remain unverified.
 
 ## Stage1 packaging failure
 
@@ -95,6 +95,10 @@ at probe and retained until unbind, removing filesystem access from resume.
 Failed startup remains visible in counters/logs and retries on the next
 panel power cycle. The change does not add automatic unbounded retries.
 
+The user subsequently confirmed normal sleep/resume with this stage4 image.
+Retain it as the current working touch/resume checkpoint. Repeated long-term
+power-cycle coverage and pen operation remain separate validation tasks.
+
 Because startup now runs after panel preparation, module insertion, a bound
 SPI device and input registration alone no longer establish controller startup.
 Check `touch start ... complete`, `enabled=1` and increasing valid frames.
@@ -165,6 +169,22 @@ owns that address. It does not scan arbitrary I2C addresses, change GPIOs,
 power up the charger, clear IRQs, flash firmware, or pair/connect Bluetooth.
 Use `--skip-charger` for input/Bluetooth only. An I2C failure leaves supply,
 sleep state and access unresolved; it does not prove a dead pen or absent IC.
+
+The helper embedded in the original stage4 image has a discovery bug: it looks
+in `/sys/class/i2c-adapter`, which no longer exists in this kernel. The user
+therefore saw `expected one hub-3 adapter ... found 0` before any CPS register
+transaction. The hub and parent are both `okay` in the actual pinned DTB.
+The current script finds numeric adapters under `/sys/bus/i2c/devices` instead
+and lists their OF paths if the target is still missing. Download/run the
+updated `scripts/caihong-pen-status.py` directly; no image change is required.
+The old embedded helper is copied back into `/usr/local/sbin` at boot, so use
+the separately downloaded script for this diagnosis after any reboot.
+
+If `bluetoothctl info` reports that the supplied address is not available,
+check `bluetoothctl list` and `show` first. With a working, powered controller,
+run `sudo bluetoothctl --timeout 15 scan on` and then query the pen address
+again. The helper itself only queries cached info. An undiscovered address
+does not establish whether the pen is charged, advertising or connected.
 
 ## Preserved Wi-Fi baseline
 

@@ -15,7 +15,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 | Driver | Status | Hardware state |
 | --- | --- | --- |
-| `nt36532e_ts.ko` | Desktop touch and 10 points confirmed; resume fix under test | Stage3 works in the desktop and passed a simple browser 10-point test. Resume later failed with `nt36532e_resume: -110`. Stage4 follows panel power, retains firmware in memory and adds pen controls/diagnostics. Pen and wireless pen charging remain unverified. |
+| `nt36532e_ts.ko` | Desktop touch, 10 points and sleep/resume confirmed | Stage3 passed desktop touch and a simple browser 10-point test. Stage4 follows panel power and retains firmware in memory; the user confirmed sleep/resume now works. Pen input, Bluetooth connection and wireless pen charging remain unverified. |
 | `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 

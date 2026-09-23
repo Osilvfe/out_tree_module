@@ -48,7 +48,8 @@ with patch.object(status.fcntl, "ioctl", side_effect=ioctl):
 
     with tempfile.TemporaryDirectory(prefix="pen-status-") as temp:
         root = Path(temp)
-        adapter = root / "sys/class/i2c-adapter/i2c-7"
+        # Match current kernels: no /sys/class/i2c-adapter at all.
+        adapter = root / "sys/bus/i2c/devices/i2c-7"
         adapter.mkdir(parents=True)
         node = root / "firmware/devicetree/i2c@98c000"
         node.mkdir(parents=True)
@@ -66,6 +67,14 @@ with patch.object(status.fcntl, "ioctl", side_effect=ioctl):
             closed.assert_called_once_with(91)
             assert selectors == [0, 1, 2, 3, 4, 7, 8, 0x34, 0x35, 0x38, 0x39, 0x3a, 0x3e, 0x3f]
             assert "chip_id=0x8601" in output.getvalue()
+            # The fallback follows the controller's OF node if necessary.
+            (adapter / "of_node").unlink()
+            (adapter / "device").mkdir()
+            (adapter / "device/of_node").symlink_to(node)
+            selectors.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                status.charger_status()
+            assert selectors[:2] == [0, 1] and len(selectors) == 14
             registers[0] = 0
             selectors.clear()
             with contextlib.redirect_stdout(io.StringIO()):
@@ -76,4 +85,18 @@ with patch.object(status.fcntl, "ioctl", side_effect=ioctl):
             with contextlib.redirect_stdout(io.StringIO()):
                 status.charger_status()
             opened.assert_not_called()  # Respect a bound kernel driver's ownership.
-print("PASS: CPS selectors/endian, short-transfer rejection, exact register set, chip/driver guards")
+            bound.unlink()
+            other = adapter.with_name("i2c-8")
+            other.mkdir()
+            (other / "of_node").symlink_to(node)
+            with contextlib.redirect_stdout(io.StringIO()):
+                status.charger_status()
+            opened.assert_not_called()  # Ambiguous bus selection performs no I2C.
+            (other / "of_node").unlink()
+            (adapter / "device/of_node").unlink()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status.charger_status()
+            opened.assert_not_called()
+            assert "found 0" in output.getvalue() and "i2c-7: no OF node" in output.getvalue()
+print("PASS: modern I2C sysfs/OF fallback, missing/ambiguous adapters, CPS endian/transfers/register/ownership guards")

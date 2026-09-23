@@ -45,14 +45,21 @@ def read_reg(fd, register, length):
 
 def charger_status():
     adapters = []
-    for adapter in Path("/sys/class/i2c-adapter").glob("i2c-*"):
+    inventory = []
+    # The i2c-adapter class was removed; adapters live on the I2C bus.
+    # Restrict names to numeric adapters, not I2C clients such as i2c-ACPI:00.
+    for adapter in sorted(Path("/sys/bus/i2c/devices").glob("i2c-*")):
+        if not re.fullmatch(r"i2c-\d+", adapter.name):
+            continue
         node = adapter / "of_node"
         if not node.exists():
             node = adapter / "device/of_node"
+        inventory.append(f"{adapter.name}: {node.resolve() if node.exists() else 'no OF node'}")
         if node.exists() and node.resolve().name == "i2c@98c000":
             adapters.append(adapter)
     if len(adapters) != 1:
         print(f"CPS8601: expected one hub-3 adapter (i2c@98c000), found {len(adapters)}")
+        print("  I2C adapters: " + ("; ".join(inventory) or "none registered"))
         return
     adapter = adapters[0]
     bus = adapter.name.removeprefix("i2c-")
@@ -91,6 +98,7 @@ def bluetooth_status(address):
         return
     commands = [["bluetoothctl", "list"], ["bluetoothctl", "show"]]
     if address:
+        print("Bluetooth: pen info queries the BlueZ cache; 'not available' can mean it has not been discovered")
         commands.append(["bluetoothctl", "info", address])
     for command in commands:
         print("$ " + " ".join(command), flush=True)
