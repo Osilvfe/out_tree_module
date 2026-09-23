@@ -21,7 +21,9 @@ Stage6a removes that init hook, the module payload, `/pmic-glink/pen-power`
 and the added hub-3 phandle. Its init and DTB are byte-identical to Stage5;
 all archive records except the corrected pogo module and passive helper are
 also identical. `--pen-power-module` now fails before reading/building an
-image. Confirm boot recovery first. The source below remains experimental;
+image. The user confirmed Stage6a boots normally and its keyboard mappings
+work; this narrows the regression to the removed integration without proving
+a specific failure point. The source below remains experimental;
 do not run the historical power-test commands until integration is diagnosed.
 
 ## Observed communication

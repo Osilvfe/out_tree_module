@@ -65,13 +65,13 @@ read: the adapter is found but the transaction receives no acknowledgement.
 The user then reported GPIO10/12/15/85/111 all input/low/pulldown. Stage6 added
 `caihong_pen_power.ko` and its boot-time registration, but the user reported a
 black screen from power-on with no visible kernel log. Stage6 is withdrawn.
-No SSH/IP observation or boot log
-has established whether this is an init hang, display failure or another
-fault. Stage6a omits the CPS module/DT additions and restores the exact Stage5
+No SSH/IP observation or boot log has established whether this was an init
+hang, display failure or another fault. Stage6a omits the CPS module/DT additions and restores the exact Stage5
 init and DTB while retaining the corrected pogo module. Only pogo and the
-passive helper differ from Stage5's archive records. Software checks pass;
-boot recovery requires a device test. CPS power testing remains paused, and
-chip identification, charging and pen input remain unconfirmed.
+passive helper differ from Stage5's archive records. The user confirmed
+Stage6a boots without the black screen; the precise failure inside the removed
+integration is still unknown. CPS power testing remains paused, and chip
+identification, charging and pen input remain unconfirmed.
 See [CPS8601 bring-up](cps8601-bringup.md).
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
@@ -174,10 +174,18 @@ most of the row, but its vendor consumer-page assumptions missed search,
 microphone, touchpad toggle and lock. Captured keyboard usages are respectively
 `0x72`, `0x68`, `0x6b`/`0x6c`, and `0x73`. Stage6 uses those actual usages, keeps
 keyboard Fn held across media reports and corrects volume down/up to F11/F12.
-Host tests and module compilation pass; hardware verification is pending.
+The user confirmed the corrected mappings on the bootable Stage6a image.
+Plain F4 still switches touchpad state inside the keyboard MCU. Stage6b sends
+bounded asynchronous restore commands on both physical key edges, preserving
+the requested hardware state (enabled by default, or explicit sysfs setting).
+Fn+F4 remains a desktop `KEY_TOUCHPAD_TOGGLE` and does not change that hardware
+target. Host tests cover both MCU usages, disabled targets, pending sysfs
+updates, TX failures and removal; module compilation passes. Device validation
+of the restoration and any transient motion interruption is pending.
 See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
 Stage6a preserves the exact tested stage4 touch module and v9 Wi-Fi payload;
-its init and DTB match Stage5 byte for byte.
+its init and DTB match Stage5 byte for byte. Stage6b changes only the pogo
+module relative to the bootable Stage6a image.
 
 ## Restart criteria
 
