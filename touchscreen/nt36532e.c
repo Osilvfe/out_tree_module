@@ -5,6 +5,7 @@
  */
 #include <linux/delay.h>
 #include <linux/firmware.h>
+#include <linux/gpio/consumer.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
@@ -46,6 +47,7 @@ struct nvt_partition { u32 bin, sram, size, crc; };
 
 struct nt36532e {
 	struct spi_device *spi;
+	struct gpio_desc *reset_gpio;
 	struct input_dev *input, *pen;
 	struct touchscreen_properties prop;
 	struct mutex lock;
@@ -55,6 +57,18 @@ struct nt36532e {
 	u8 *tx, *rx;
 	size_t xfer_size;
 };
+
+static void nvt_hw_reset(struct nt36532e *ts)
+{
+	if (!ts->reset_gpio)
+		return;
+
+	/* reset-gpios is active-low: logical 1 asserts reset. */
+	gpiod_set_value_cansleep(ts->reset_gpio, 1);
+	usleep_range(2000, 3000);
+	gpiod_set_value_cansleep(ts->reset_gpio, 0);
+	msleep(20);
+}
 
 static u32 nvt_le32(const u8 *p)
 {
@@ -389,10 +403,11 @@ static int nt36532e_probe(struct spi_device *spi)
 	struct nt36532e *ts;int ret;
 	ts=devm_kzalloc(&spi->dev,sizeof(*ts),GFP_KERNEL);if(!ts)return -ENOMEM;ts->spi=spi;mutex_init(&ts->lock);spi_set_drvdata(spi,ts);
 	ts->xfer_size=NVT_XFER_LEN+2;ts->tx=devm_kmalloc(&spi->dev,ts->xfer_size,GFP_KERNEL);ts->rx=devm_kmalloc(&spi->dev,ts->xfer_size,GFP_KERNEL);if(!ts->tx||!ts->rx)return -ENOMEM;
+	ts->reset_gpio=devm_gpiod_get_optional(&spi->dev,"reset",GPIOD_OUT_LOW);if(IS_ERR(ts->reset_gpio))return PTR_ERR(ts->reset_gpio);
 	if(device_property_read_u32(&spi->dev,"touchscreen-size-x",&ts->max_x))ts->max_x=21200;if(device_property_read_u32(&spi->dev,"touchscreen-size-y",&ts->max_y))ts->max_y=30000;if(device_property_read_u32(&spi->dev,"touchscreen-max-pressure",&ts->max_pressure))ts->max_pressure=4095;
 	ts->pen_support=device_property_read_bool(&spi->dev,"novatek,pen-support");ts->high_res=ts->max_x>4095||ts->max_y>4095;if(device_property_read_string(&spi->dev,"firmware-name",&ts->fw_name))ts->fw_name="novatek/DT-novatek-nt36532.bin";
 	spi->mode=SPI_MODE_0;spi->bits_per_word=8;ret=spi_setup(spi);if(ret)return ret;
-	mutex_lock(&ts->lock);ret=nvt_detect(ts);if(!ret)ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(ret)return ret;
+	nvt_hw_reset(ts);mutex_lock(&ts->lock);ret=nvt_detect(ts);if(!ret)ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(ret)return ret;
 	ret=nvt_input_init(ts);if(ret)return ret;
 	return devm_request_threaded_irq(&spi->dev,spi->irq,NULL,nvt_irq,IRQF_ONESHOT|IRQF_TRIGGER_FALLING,dev_name(&spi->dev),ts);
 }
@@ -405,7 +420,7 @@ static int nt36532e_suspend(struct device *dev)
 static int nt36532e_resume(struct device *dev)
 {
 	struct spi_device *spi=to_spi_device(dev);struct nt36532e *ts=spi_get_drvdata(spi);int ret;
-	mutex_lock(&ts->lock);ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(!ret)enable_irq(spi->irq);return ret;
+	nvt_hw_reset(ts);mutex_lock(&ts->lock);ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(!ret)enable_irq(spi->irq);return ret;
 }
 static DEFINE_SIMPLE_DEV_PM_OPS(nt36532e_pm,nt36532e_suspend,nt36532e_resume);
 static const struct of_device_id nt36532e_of_match[]={{.compatible="novatek,nt36532e"},{}};
