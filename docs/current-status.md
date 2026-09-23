@@ -59,7 +59,12 @@ The first pen helper looked in the removed `/sys/class/i2c-adapter` class and
 reported zero hub-3 adapters. The working image already enables that hub and
 its parent. The updated helper uses `/sys/bus/i2c/devices/i2c-N`, with tests
 covering the current layout and OF-node fallback. It can be run directly on
-stage4 without reflashing. CPS communication is still awaiting device results.
+stage4 without reflashing. CPS chip identification remains unconfirmed.
+After the path correction, the user reported errno 6 (`ENXIO`) from the CPS
+read: the adapter is found but the transaction receives no acknowledgement.
+Stock requires HBOOST, GPIO10 supply enable and GPIO15 wake before the ID
+check; that sequence is not implemented in this image. The latest helper
+includes passive TLMM power-pin state. See [CPS8601 bring-up](cps8601-bringup.md).
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
@@ -153,6 +158,16 @@ module and all board data remains in the Caihong DTS. The patch under
 
 The migrated external driver and board integration still require a fresh
 hardware regression before they should be described as production-ready.
+
+The user subsequently confirmed keyboard use but found Esc ineffective in
+Vim. `evtest` identifies it as `KEY_BACK`; search produced no event and the
+screenshot key reports `KEY_SYSRQ`. Stage5 maps Esc correctly and implements
+search as Fn with a default F1–F12 row in the user-provided physical order.
+The Fn layer restores media/system keycodes; held-key releases retain the code
+chosen at press time. Host tests and module compilation pass; the new keymap
+still needs device validation, especially the inferred fourth-key usage.
+See [pogo keymap](pogo-keymap.md) for the full mapping and reproduction commands.
+Stage5 preserves the tested stage4 touch module and the v9 Wi-Fi payload.
 
 ## Restart criteria
 

@@ -9,6 +9,7 @@ firmware, or pair/connect Bluetooth devices. No optional Python packages.
 
 import argparse
 import ctypes
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -41,6 +42,33 @@ def read_reg(fd, register, length):
             raise OSError(f"incomplete I2C transfer: {count}/2 messages")
         data.append(value[0])
     return int.from_bytes(data, "little")
+
+
+def charger_gpio_status():
+    """Read TLMM's existing debug snapshot without requesting/changing lines."""
+    try:
+        snapshot = Path("/sys/kernel/debug/gpio").read_text()
+    except OSError as error:
+        print(f"CPS8601 GPIO state: debugfs snapshot unavailable: {error}")
+        return
+    roles = {10: "supply switch", 12: "IRQ", 15: "wake/sleep",
+             85: "scan", 111: "off-state"}
+    tlmm = False
+    found = set()
+    for line in snapshot.splitlines():
+        if re.match(r"gpiochip\d+:", line):
+            tlmm = "f100000.pinctrl" in line
+        if not tlmm:
+            continue
+        match = re.match(r"\s*gpio(\d+)\s*:", line)
+        if match and int(match[1]) in roles:
+            pin = int(match[1])
+            found.add(pin)
+            print(f"CPS8601 {roles[pin]}: {line.strip()}")
+    if found != roles.keys():
+        print("CPS8601 GPIO state: TLMM snapshot missing pins " +
+              ", ".join(str(pin) for pin in sorted(roles.keys() - found)))
+    print("CPS8601: GPIO output levels do not measure HBOOST voltage")
 
 
 def charger_status():
@@ -89,6 +117,8 @@ def charger_status():
             os.close(fd)
     except OSError as error:
         print(f"CPS8601: read failed: {error}")
+        if error.errno == errno.ENXIO:
+            print("  Adapter found, but address 0x41 did not acknowledge; check HBOOST, GPIO10 and GPIO15")
         print("  Supply, sleep state and bus access remain unconfirmed; no power controls changed")
 
 
@@ -135,6 +165,7 @@ def main():
             print(f"input: /dev/input/{event.name} = {name}")
     bluetooth_status(args.address)
     if not args.skip_charger:
+        charger_gpio_status()
         charger_status()
 
 

@@ -208,7 +208,9 @@ limited changes:
 - Add `nt36532e_ts.ko`, `novatek/DT-novatek-nt36532.bin` and the pen status
   helper to the embedded
   initramfs. Every existing record except `/init` is preserved byte for byte,
-  including modes, ownership and links.
+  including modes, ownership and links. Stage5 may additionally replace the
+  pogo module via the explicit `--pogo-module` option, which records and checks
+  that single extra replacement; see [pogo keymap](pogo-keymap.md).
 - Append the touch startup hook after the original WLAN load and before the
   root transition. Removing this hook recovers the original `/init` exactly.
   The hook installs touch firmware into the Arch rootfs at
@@ -271,7 +273,8 @@ Vermagic is a compatibility guard, not a substitute for using the matching
 kernel build. Do not rebuild/replace the baseline kernel as part of this test.
 Changing the module build or debug paths may change the resulting image hash.
 To reproduce historical stage2, use repository commit `770cb12` and its
-documented module build directory instead. Stage3 is retained at `fc122e1`.
+documented module build directory instead. Stage3 is retained at `fc122e1`;
+the original tested stage4 source/packager is retained at `6b3a0bb`.
 
 Host packet checks run with:
 

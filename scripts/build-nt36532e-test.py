@@ -24,6 +24,7 @@ BASELINE_SHA256 = "0dcedad3958e689331881d791bbfecafd7055905d628f9b1a776dbb8ad6b1
 FIRMWARE_SHA256 = "fc6f5124d7f571f1090731b77fff0dcaf0abacbc2249b0dfa4891578919b1788"
 TOUCH_NODE = "/soc@0/geniqup@ac0000/spi@a90000/touchscreen@0"
 MODULE = "lib/modules/nt36532e_ts.ko"
+POGO_MODULE = "lib/modules/oneplus_pogo.ko"
 FIRMWARE = "lib/firmware/novatek/DT-novatek-nt36532.bin"
 PEN_STATUS = "usr/local/sbin/caihong-pen-status"
 ANCHOR = b"mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run\n"
@@ -191,15 +192,25 @@ def build(args):
     new_init = init.replace(ANCHOR, hook + b"\n" + ANCHOR, 1)
     require(new_init.replace(hook + b"\n", b"", 1) == init, "original init was modified")
     module = args.module.read_bytes()
+    replacements = {"init": new_init}
+    if args.pogo_module:
+        replacements[POGO_MODULE] = args.pogo_module.read_bytes()
     with tempfile.TemporaryDirectory(prefix="nt36532e-", dir=args.output.parent) as temp:
         work = Path(temp)
         pogo = work / "oneplus_pogo.ko"
-        pogo.write_bytes(original["lib/modules/oneplus_pogo.ko"].data)
+        pogo.write_bytes(original[POGO_MODULE].data)
         vermagic = run("modinfo", "-F", "vermagic", args.module)
         require(vermagic == run("modinfo", "-F", "vermagic", pogo), "module vermagic mismatch")
         require(run("modinfo", "-F", "name", args.module) == "nt36532e_ts", "incorrect module name")
         require(not run("modinfo", "-F", "depends", args.module), "unhandled module dependencies")
-        records = [encode_entry(name, entry.fields, new_init) if name == "init" else entry.raw
+        if args.pogo_module:
+            require(run("modinfo", "-F", "vermagic", args.pogo_module) == vermagic,
+                    "pogo module vermagic mismatch")
+            require(run("modinfo", "-F", "name", args.pogo_module) == "oneplus_pogo",
+                    "incorrect pogo module name")
+            require(not run("modinfo", "-F", "depends", args.pogo_module),
+                    "unhandled pogo module dependencies")
+        records = [encode_entry(name, entry.fields, replacements[name]) if name in replacements else entry.raw
                    for name, entry in original.items() if name != "TRAILER!!!"]
         additions = {"lib/firmware/novatek": (0o40755, b""),
                      FIRMWARE: (0o100644, firmware), MODULE: (0o100644, module),
@@ -217,7 +228,7 @@ def build(args):
         # Compare the entire records, not just contents: modes, ownership,
         # links and device nodes are as important as module/firmware hashes.
         for name, entry in original.items():
-            if name != "init":
+            if name not in replacements:
                 require(expected[name].raw == entry.raw, f"baseline entry changed: {name}")
         init_path = work / "init"
         init_path.write_bytes(new_init)
@@ -246,17 +257,20 @@ def build(args):
             "baseline_sha256": BASELINE_SHA256, "module_vermagic": vermagic,
             "initramfs_offset_in_kernel": archive_offset, "initramfs_reserved_bytes": archive_size,
             "initramfs_gzip_bytes": len(compressed), "original_entries": len(original),
-            "preserved_entries": len(original) - 1, "replaced_entries": ["init"],
+            "preserved_entries": len(original) - len(replacements), "replaced_entries": sorted(replacements),
             "added_entries": sorted(additions),
             "checks": ["kernel identical outside embedded initramfs", "original init retained verbatim around hook",
                        "all other original cpio records byte-identical", "module vermagic matches baseline",
                        "DT only adds listed touchscreen reset/pen properties", "boot metadata and cmdline unchanged",
                        "final image decompressed and all records verified", "boot ID verified"],
-            "hardware_test": "pending: boot, Wi-Fi, touch, pen and suspend/resume",
+            "hardware_test": "pending: boot, Wi-Fi, touch, pen, pogo and suspend/resume",
             "wifi_sha256": {name: sha256(entry.data) for name, entry in original.items()
                             if "/ath12k/" in name and entry.data},
             "touch_sha256": {MODULE: sha256(module), FIRMWARE: sha256(firmware), "init": sha256(new_init)},
         }
+        if args.pogo_module:
+            manifest["pogo_sha256"] = {"baseline": sha256(original[POGO_MODULE].data),
+                                       "replacement": sha256(replacements[POGO_MODULE])}
         output.rename(args.output)
         args.output.with_suffix(".img.json").write_text(json.dumps(manifest, indent=2) + "\n")
         args.output.with_suffix(".img.sha256").write_text(f"{manifest['sha256']}  {args.output.name}\n")
@@ -267,6 +281,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--module", required=True, type=Path)
+    parser.add_argument("--pogo-module", type=Path,
+                        help="optional oneplus_pogo module replacement; all other baseline records stay intact")
     parser.add_argument("--firmware", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()

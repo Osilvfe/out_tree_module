@@ -6,7 +6,7 @@ touch_log()
 	printf '<6>caihong-touch: %s\n' "$*" > /dev/kmsg
 }
 
-touch_log "stage4 based on Wi-Fi v9; preparing NT36532E touch and pen"
+touch_log "Wi-Fi v9 baseline; preparing NT36532E touch and pen with panel sequencing"
 
 if mkdir -p /newroot/usr/local/sbin &&
 	cp /usr/local/sbin/caihong-pen-status /newroot/usr/local/sbin/caihong-pen-status &&

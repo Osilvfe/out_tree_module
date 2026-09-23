@@ -45,23 +45,31 @@
 #define POGO_MAX_PAYLOAD		255
 #define POGO_MAX_FRAME			(5 + POGO_MAX_PAYLOAD + 2 + 1 + 4)
 #define POGO_MAX_TOUCHES		5
+#define POGO_SEARCH_USAGE		0x0393
 
 struct oneplus_pogo_media_map {
 	u16 usage;
 	u16 keycode;
+	u16 fn_keycode;
 };
 
 static const struct oneplus_pogo_media_map oneplus_pogo_media_map[] = {
-	{ 0x006f, KEY_BRIGHTNESSUP },
-	{ 0x0070, KEY_BRIGHTNESSDOWN },
-	{ 0x00b5, KEY_NEXTSONG },
-	{ 0x00b6, KEY_PREVIOUSSONG },
-	{ 0x00cd, KEY_PLAYPAUSE },
-	{ 0x00e2, KEY_MUTE },
-	{ 0x00e9, KEY_VOLUMEUP },
-	{ 0x00ea, KEY_VOLUMEDOWN },
-	{ 0x0224, KEY_BACK },
+	{ 0x0070, KEY_F1, KEY_BRIGHTNESSDOWN },
+	{ 0x006f, KEY_F2, KEY_BRIGHTNESSUP },
+	{ 0x0391, KEY_F3, KEY_MICMUTE },
+	{ 0x0392, KEY_F4, KEY_TOUCHPAD_TOGGLE },
+	/* F5 is the keyboard-page Print Screen usage (0x46), not media. */
+	{ 0x038e, KEY_F6, KEY_SCREENLOCK },
+	{ 0x00b6, KEY_F7, KEY_PREVIOUSSONG },
+	{ 0x00cd, KEY_F8, KEY_PLAYPAUSE },
+	{ 0x00b5, KEY_F9, KEY_NEXTSONG },
+	{ 0x00e2, KEY_F10, KEY_MUTE },
+	{ 0x00e9, KEY_F11, KEY_VOLUMEUP },
+	{ 0x00ea, KEY_F12, KEY_VOLUMEDOWN },
+	/* The physical Esc key reports Android/consumer AC Back on Caihong. */
+	{ 0x0224, KEY_ESC },
 	{ 0x0244, KEY_APPSELECT },
+	{ POGO_SEARCH_USAGE, KEY_FN },
 };
 
 /* USB HID keyboard usages used by the Oplus accessory protocol. */
@@ -125,7 +133,11 @@ struct oneplus_pogo {
 	u16 crc_init;
 
 	u8 old_keys[8];
+	u16 old_keycodes[6];
 	u8 old_media[4];
+	/* Remember the code chosen on key-down even if Fn is released first. */
+	u16 old_media_keycodes[2];
+	bool fn_down;
 	u8 frame[POGO_MAX_FRAME];
 	size_t frame_len;
 	size_t expected_len;
@@ -320,11 +332,19 @@ static bool oneplus_pogo_key_present(const u8 *report, u8 usage)
 	return false;
 }
 
+static u16 oneplus_pogo_keyboard_key(u8 usage, bool fn_down)
+{
+	if (usage == 0x46 && !fn_down)
+		return KEY_F5;
+	return oneplus_pogo_keycode[usage];
+}
+
 static void oneplus_pogo_report_keyboard(struct oneplus_pogo *pogo,
 					 const u8 *payload, size_t len)
 {
 	u8 report[8];
-	int i;
+	u16 keycodes[6] = { 0 };
+	int i, j;
 
 	if (len < sizeof(report))
 		return;
@@ -337,31 +357,50 @@ static void oneplus_pogo_report_keyboard(struct oneplus_pogo *pogo,
 
 	for (i = 2; i < 8; i++) {
 		u8 old = pogo->old_keys[i];
-		u8 current_usage = report[i];
 
 		if (old > 3 && !oneplus_pogo_key_present(report, old) &&
-		    oneplus_pogo_keycode[old])
+		    pogo->old_keycodes[i - 2])
 			input_report_key(pogo->keyboard,
-					 oneplus_pogo_keycode[old], 0);
+					 pogo->old_keycodes[i - 2], 0);
+	}
+	for (i = 2; i < 8; i++) {
+		u8 usage = report[i];
 
-		if (current_usage > 3 &&
-		    !oneplus_pogo_key_present(pogo->old_keys, current_usage) &&
-		    oneplus_pogo_keycode[current_usage])
-			input_report_key(pogo->keyboard,
-					 oneplus_pogo_keycode[current_usage], 1);
+		if (usage <= 3)
+			continue;
+		for (j = 2; j < i; j++)
+			if (report[j] == usage)
+				break;
+		if (j < i)
+			continue;
+		for (j = 2; j < 8; j++)
+			if (pogo->old_keys[j] == usage)
+				break;
+		if (j < 8) {
+			keycodes[i - 2] = pogo->old_keycodes[j - 2];
+			continue;
+		}
+		keycodes[i - 2] = oneplus_pogo_keyboard_key(usage, pogo->fn_down);
+		input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x070000 | usage);
+		if (keycodes[i - 2])
+			input_report_key(pogo->keyboard, keycodes[i - 2], 1);
 	}
 
 	memcpy(pogo->old_keys, report, sizeof(report));
+	memcpy(pogo->old_keycodes, keycodes, sizeof(keycodes));
 	input_sync(pogo->keyboard);
 }
 
-static u16 oneplus_pogo_media_key(u16 usage)
+static u16 oneplus_pogo_media_key(u16 usage, bool fn_down)
 {
-	int i;
+	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_media_map); i++)
-		if (oneplus_pogo_media_map[i].usage == usage)
+		if (oneplus_pogo_media_map[i].usage == usage) {
+			if (fn_down && oneplus_pogo_media_map[i].fn_keycode)
+				return oneplus_pogo_media_map[i].fn_keycode;
 			return oneplus_pogo_media_map[i].keycode;
+		}
 
 	return KEY_RESERVED;
 }
@@ -381,31 +420,46 @@ static void oneplus_pogo_report_media(struct oneplus_pogo *pogo,
 				      const u8 *payload, size_t len)
 {
 	u8 report[4];
-	int i;
+	u16 keycodes[2] = { 0 };
+	int i, j;
 
 	if (len < sizeof(report))
 		return;
 
 	memcpy(report, payload, sizeof(report));
+	pogo->fn_down = oneplus_pogo_media_present(report, POGO_SEARCH_USAGE);
 
 	for (i = 0; i < 2; i++) {
 		u16 old = get_unaligned_le16(pogo->old_media + i * 2);
-		u16 current_usage = get_unaligned_le16(report + i * 2);
-		u16 keycode;
 
-		keycode = oneplus_pogo_media_key(old);
-		if (old && !oneplus_pogo_media_present(report, old) &&
-		    keycode != KEY_RESERVED)
-			input_report_key(pogo->keyboard, keycode, 0);
+		if (old && (i == 0 || old != get_unaligned_le16(pogo->old_media)) &&
+		    !oneplus_pogo_media_present(report, old)) {
+			input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x0c0000 | old);
+			if (pogo->old_media_keycodes[i] != KEY_RESERVED)
+				input_report_key(pogo->keyboard, pogo->old_media_keycodes[i], 0);
+		}
+	}
+	for (i = 0; i < 2; i++) {
+		u16 usage = get_unaligned_le16(report + i * 2);
 
-		keycode = oneplus_pogo_media_key(current_usage);
-		if (current_usage &&
-		    !oneplus_pogo_media_present(pogo->old_media, current_usage) &&
-		    keycode != KEY_RESERVED)
-			input_report_key(pogo->keyboard, keycode, 1);
+		if (!usage || (i && usage == get_unaligned_le16(report)))
+			continue;
+		/* Reports may reorder their two slots while a key remains held. */
+		for (j = 0; j < 2; j++)
+			if (get_unaligned_le16(pogo->old_media + j * 2) == usage)
+				break;
+		if (j < 2) {
+			keycodes[i] = pogo->old_media_keycodes[j];
+			continue;
+		}
+		keycodes[i] = oneplus_pogo_media_key(usage, pogo->fn_down);
+		input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x0c0000 | usage);
+		if (keycodes[i] != KEY_RESERVED)
+			input_report_key(pogo->keyboard, keycodes[i], 1);
 	}
 
 	memcpy(pogo->old_media, report, sizeof(report));
+	memcpy(pogo->old_media_keycodes, keycodes, sizeof(keycodes));
 	input_sync(pogo->keyboard);
 }
 
@@ -748,14 +802,19 @@ static int oneplus_pogo_register_inputs(struct oneplus_pogo *pogo)
 	pogo->keyboard->event = oneplus_pogo_input_event;
 	input_set_drvdata(pogo->keyboard, pogo);
 	input_set_capability(pogo->keyboard, EV_LED, LED_CAPSL);
+	input_set_capability(pogo->keyboard, EV_MSC, MSC_SCAN);
 
 	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_keycode); i++)
 		if (oneplus_pogo_keycode[i])
 			input_set_capability(pogo->keyboard, EV_KEY,
 					     oneplus_pogo_keycode[i]);
-	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_media_map); i++)
+	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_media_map); i++) {
 		input_set_capability(pogo->keyboard, EV_KEY,
 				     oneplus_pogo_media_map[i].keycode);
+		if (oneplus_pogo_media_map[i].fn_keycode)
+			input_set_capability(pogo->keyboard, EV_KEY,
+					     oneplus_pogo_media_map[i].fn_keycode);
+	}
 
 	ret = input_register_device(pogo->keyboard);
 	if (ret)

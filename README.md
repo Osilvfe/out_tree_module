@@ -16,7 +16,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | Driver | Status | Hardware state |
 | --- | --- | --- |
 | `nt36532e_ts.ko` | Desktop touch, 10 points and sleep/resume confirmed | Stage3 passed desktop touch and a simple browser 10-point test. Stage4 follows panel power and retains firmware in memory; the user confirmed sleep/resume now works. Pen input, Bluetooth connection and wireless pen charging remain unverified. |
-| `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
+| `oneplus_pogo.ko` | Keyboard/touchpad work; desktop function row under test | Stage5 maps Android Back to Esc, search to Fn and the user's top-row order to F1–F12; Fn restores media actions. See [`docs/pogo-keymap.md`](docs/pogo-keymap.md). The fourth key's touchpad-toggle identity is provisional. |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
@@ -29,7 +29,7 @@ optional `novatek,pen-support`. The matching 249856-byte no-flash image is
 installed as `novatek/DT-novatek-nt36532.bin` by the Caihong firmware setup.
 Use the pinned-baseline builder described in
 [`docs/nt36532e-bringup.md`](docs/nt36532e-bringup.md) for the current touch test.
-It preserves v9's kernel code, modules, WLAN firmware and deferred WLAN load
+It preserves v9's kernel code, WLAN modules/firmware and deferred WLAN load
 sequence, and verifies the contents of the final boot image. The default
 project ramdisk is not the validated Wi-Fi baseline.
 

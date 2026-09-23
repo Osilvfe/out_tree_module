@@ -100,3 +100,25 @@ with patch.object(status.fcntl, "ioctl", side_effect=ioctl):
             opened.assert_not_called()
             assert "found 0" in output.getvalue() and "i2c-7: no OF node" in output.getvalue()
 print("PASS: modern I2C sysfs/OF fallback, missing/ambiguous adapters, CPS endian/transfers/register/ownership guards")
+
+snapshot = """gpiochip0: GPIOs 0-7, parent: platform/6e80000.pinctrl, 6e80000.pinctrl:
+ gpio10   : out high func0 2mA no pull
+gpiochip1: GPIOs 8-227, parent: platform/f100000.pinctrl, f100000.pinctrl:
+ gpio10   : out low  func0 2mA pull down
+ gpio12   : in  high func0 2mA pull up
+ gpio15   : out low  func0 2mA pull down
+ gpio85   : out low  func0 2mA pull down
+ gpio111  : out low  func0 2mA pull down
+gpiochip2: GPIOs 228-237, parent: platform/other, other:
+ gpio15   : out high func0 2mA no pull
+"""
+with patch.object(Path, "read_text", return_value=snapshot), \
+        patch.object(status.fcntl, "ioctl") as gpio_ioctl, \
+        contextlib.redirect_stdout(io.StringIO()) as output:
+    status.charger_gpio_status()
+    gpio_ioctl.assert_not_called()
+assert "supply switch: gpio10   : out low" in output.getvalue()
+assert "wake/sleep: gpio15   : out low" in output.getvalue()
+assert "out high" not in output.getvalue()  # Exclude other GPIO banks.
+assert "missing pins" not in output.getvalue()
+print("PASS: passive GPIO snapshot selects main TLMM bank without requesting GPIOs")
