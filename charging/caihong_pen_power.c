@@ -10,6 +10,8 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of_platform.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/pinctrl/machine.h>
 #include <linux/pinctrl/pinconf-generic.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
@@ -41,6 +43,16 @@ static struct gpiod_lookup_table pen_gpios = {
 		GPIO_LOOKUP("f100000.pinctrl", 12, "irq", GPIO_ACTIVE_HIGH),
 		{ }
 	},
+};
+
+/* TLMM exposes bias via pinctrl, not gpio_chip.set_config on this kernel. */
+static unsigned long pen_irq_config[] = {
+	PIN_CONF_PACKED(PIN_CONFIG_BIAS_PULL_UP, 1),
+};
+
+static const struct pinctrl_map pen_pinmaps[] = {
+	PIN_MAP_CONFIGS_GROUP(PEN_NAME, "irq-pull-up", "f100000.pinctrl",
+			      "gpio12", pen_irq_config),
 };
 
 struct pen_boost_request {
@@ -364,6 +376,8 @@ static int pen_get_hardware(struct pen_power *pen)
 	struct platform_device *tlmm;
 	struct device_node *bus;
 	struct i2c_adapter *adapter;
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *irq_state;
 	int ret;
 
 	dev_info(dev, "setup=i2c begin\n");
@@ -426,7 +440,14 @@ static int pen_get_hardware(struct pen_power *pen)
 	pen->irq = devm_gpiod_get(dev, "irq", GPIOD_IN);
 	if (IS_ERR(pen->irq))
 		return dev_err_probe(dev, PTR_ERR(pen->irq), "IRQ GPIO\n");
-	ret = gpiod_set_config(pen->irq, pinconf_to_config_packed(PIN_CONFIG_BIAS_PULL_UP, 1));
+	dev_info(dev, "setup=irq-pinctrl begin\n");
+	pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(pinctrl))
+		return dev_err_probe(dev, PTR_ERR(pinctrl), "IRQ pinctrl\n");
+	irq_state = pinctrl_lookup_state(pinctrl, "irq-pull-up");
+	if (IS_ERR(irq_state))
+		return dev_err_probe(dev, PTR_ERR(irq_state), "IRQ bias state\n");
+	ret = pinctrl_select_state(pinctrl, irq_state);
 	if (ret)
 		return dev_err_probe(dev, ret, "IRQ pull-up\n");
 	pen->hardware_ready = true;
@@ -601,8 +622,12 @@ put_node:
 			platform_device_unregister(pen_device);
 		return ret;
 	}
-	if (stage == 2)
+	if (stage == 2) {
+		ret = pinctrl_register_mappings(pen_pinmaps, ARRAY_SIZE(pen_pinmaps));
+		if (ret)
+			goto unregister_device;
 		gpiod_add_lookup_table(&pen_gpios);
+	}
 	pr_info("setup=driver-register begin\n");
 	ret = platform_driver_register(&pen_driver);
 	if (!ret && pen_probe_result) {
@@ -610,10 +635,16 @@ put_node:
 		platform_driver_unregister(&pen_driver);
 	}
 	if (ret) {
-		platform_device_unregister(pen_device);
-		if (stage == 2)
+		if (stage == 2) {
 			gpiod_remove_lookup_table(&pen_gpios);
+			pinctrl_unregister_mappings(pen_pinmaps);
+		}
+		goto unregister_device;
 	}
+	return 0;
+
+unregister_device:
+	platform_device_unregister(pen_device);
 	return ret;
 }
 module_init(pen_init);
@@ -622,11 +653,13 @@ static void __exit pen_exit(void)
 {
 	platform_device_unregister(pen_device);
 	platform_driver_unregister(&pen_driver);
-	if (stage == 2)
+	if (stage == 2) {
 		gpiod_remove_lookup_table(&pen_gpios);
+		pinctrl_unregister_mappings(pen_pinmaps);
+	}
 }
 module_exit(pen_exit);
 
 MODULE_DESCRIPTION("Caihong CPS8601 manual staged transport and chip ID diagnostic");
-MODULE_VERSION("7");
+MODULE_VERSION("7.1");
 MODULE_LICENSE("GPL");

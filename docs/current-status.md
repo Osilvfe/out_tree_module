@@ -73,8 +73,9 @@ hang, display failure or another fault. Stage6a omits the CPS module/DT addition
 init and DTB while retaining the corrected pogo module. Only pogo and the
 passive helper differ from Stage5's archive records. The user confirmed
 Stage6a boots without the black screen; the precise failure inside the removed
-integration is still unknown. CPS chip identification, charging and pen input
-remain unconfirmed; Stage7 below prepares manual diagnostics after boot.
+integration is still unknown. At that checkpoint CPS chip identification,
+charging and pen input remained unconfirmed. Stage7a below now confirms chip
+identification through manual diagnostics after boot.
 See [CPS8601 bring-up](cps8601-bringup.md).
 The user has now resumed pen-test preparation and deferred the minor pogo
 pause. Start from the working Stage6b image and its existing Stage4 touch
@@ -117,9 +118,26 @@ is required for the bounded power/ID experiment. Setup and power phases have
 kernel log markers; synchronous probe failures propagate to `insmod` and
 unwind registration. No module alias, boot hook or DT addition is provided.
 W=1 compilation, checkpatch, power/ACK tests and registration failure tests
-pass locally. They do not validate the actual tablet's device-core registration
-or diagnose the earlier black screen. First collect stage=1 status and logs
-on the working image before proceeding with GPIO/power tests.
+pass locally. The user then authorized direct SSH testing on the tablet.
+Stage 1 registered successfully with `transport_up=1`. Stage 2 failed cleanly
+at IRQ bias configuration with `-524` (`ENOTSUPP`), before any HBOOST request
+or CPS register access: this kernel's Qualcomm GPIO chip lacks `.set_config`.
+
+Stage7a (module version `7.1`) uses a named pinctrl group configuration for
+GPIO12's pull-up. The same working image then passed stage-2 setup and the
+single power/ID request in 2.611 seconds: `phase=done result=0 cleanup=0
+valid=0xff poisoned=0`, chip `0x8601`, firmware `0x0118`, mode `0x2`, IRQ
+snapshot `0x3d`, VIN 5805 mV, IIN raw 125, temperature raw 25 and EPT 0.
+These snapshots do not establish fresh attachment/ASK events or charging.
+No CPS firmware or TX configuration was written. End state was charge inhibit
+high and supply/wake/scan low, with GPIO12 input/high/pull-up. Both HBOOST
+requests were acknowledged, and the module unloaded successfully after saving
+the result. Wi-Fi remained up with carrier and SSH; touch IRQ/frame/contact
+counters advanced without new SPI/checksum/start errors. Pen scan remains 0
+and no pen coordinates are confirmed. No image change or reboot was needed.
+The next step is protected attachment/ASK-address handling; the original boot
+regression still has no proven cause. Reboot before another power experiment
+under the diagnostic's existing one-attempt policy.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

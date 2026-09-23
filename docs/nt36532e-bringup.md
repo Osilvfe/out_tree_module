@@ -9,7 +9,9 @@ connection, automatic attachment and pen input remain unverified. The first
 five-mode sweep acknowledged every command but produced zero IRQs/event reads
 and zero pen reports; it restored scan mode 0. Bluetooth is present and powered
 on, and discovery receives nearby devices but has not identified the pen.
-Next investigate CPS8601 attachment using the manual post-boot diagnostic; see
+The Stage7a manual diagnostic now confirms CPS8601 power/ID access, with Wi-Fi
+connected and touch counters advancing without new errors. Attachment/pen
+wake remains the next step; see
 [the recorded result and next steps](cps8601-bringup.md#resumed-pen-test-preparation).
 
 ## Stage1 packaging failure

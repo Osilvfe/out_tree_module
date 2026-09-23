@@ -5,6 +5,8 @@ a connection in stock when magnetically attached. Linux Bluetooth discovery
 receives nearby devices, but has not identified the pen. Automatic attachment
 and pen input remain unconfirmed. The user has confirmed
 stage4 touchscreen suspend/resume.
+The Stage7a manual test now confirms CPS8601 ID/firmware access and successful
+power cleanup; wireless charging and fresh attachment events are not yet tested.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
 ## Resumed pen test preparation
@@ -28,7 +30,8 @@ Proceed according to the evidence:
 
 | Check | Current evidence | Next step |
 | --- | --- | --- |
-| Pen power | User confirms it has power and charges under another system | Investigate discovery/wake; Linux wireless charging remains unconfirmed. |
+| Pen power | User confirms it has power and charges under another system | Investigate attachment/wake; Linux wireless charging remains unconfirmed. |
+| CPS8601 access | Stage7a returned ID `0x8601`, firmware `0x0118`, VIN 5805 mV and successful cleanup | Implement protected attachment/ASK-address handling; ID alone does not charge or connect the pen. |
 | Linux Bluetooth | Discovery started and received nearby devices, including BLE advertisements; pen's known address absent, anonymous entries unidentified | Investigate missing attachment/wake path. This does not prove the pen never advertises or that Bluetooth is mandatory for coordinates. |
 | NT36532E scan protocol | Modes 1–5 acknowledged, with zero IRQs/event reads in every window; OPN2402 mapping unknown | Repeat the scan test after a wake/connection change. Last sweep restored mode 0. |
 | Raw pen input | No hardware pen report confirmed | After a scan candidate is found, check hover, contact, pressure and leaving proximity in `evtest`. |
@@ -49,7 +52,7 @@ validates discovery reception, not pen identity or connection. The anonymous
 addresses in the output cannot be identified from names/RSSI alone. Nearby
 device names and addresses are deliberately not copied into this repository.
 Do not repeat the unchanged five-mode sweep or cached address query solely
-because of this result. Proceed with Stage7 transport registration below.
+because of this result. The subsequent manual CPS test is recorded below.
 
 For a future discovery test after a wake/attachment change:
 
@@ -220,20 +223,63 @@ confirms reception of other devices; the pen has not been identified.
 Offline tests cover these distinctions and prove the summary path avoids
 device access and writes.
 
-Full stock-like attachment still needs CPS support. Stage7 below prepares an
-observable post-boot identification experiment. The previous Stage6 boot
-regression remains undiagnosed; do not load the withdrawn Stage6 binary.
-First prove provider registration and the power/wake sequence with
-chip ID 0x8601, then add protected wireless operation and address/attachment
-events. Reading the chip ID alone neither charges nor connects the pen.
+Full stock-like attachment still needs CPS support. Stage7a below establishes
+provider registration and the power/wake sequence with chip ID 0x8601.
+Protected wireless operation and address/attachment events are the next step.
+The previous Stage6 boot regression remains undiagnosed; do not load the
+withdrawn Stage6 binary. Reading the chip ID alone neither charges nor connects
+the pen.
 
 ## Stage7 manual post-boot diagnostic
 
-Use the rebuilt Stage7 `caihong_pen_power.ko` (module version `7`) with the
+Use the rebuilt Stage7a `caihong_pen_power.ko` (module version `7.1`) with the
 existing Stage6b image. The module now creates a regular platform child under
 the existing bound `/pmic-glink` device. It no longer needs the withdrawn DT
 child or an added I2C phandle. GPIO lookup is restricted to the board's main
 `f100000.pinctrl` controller and hub 3 is selected by its exact OF path.
+
+### Hardware result and IRQ bias correction
+
+Direct SSH testing on the working Stage6b image confirmed stage-1 registration
+with `transport_up=1`. The original Stage7 stage-2 setup failed at
+`IRQ pull-up` with `-524` (`ENOTSUPP`), before any HBOOST request or I2C register
+transfer. All device registration and GPIO requests had completed; the failed
+probe unwound and the tablet stayed responsive. Source inspection confirms
+`msm_gpio_template` has no `.set_config`, so `gpiod_set_config()` cannot set
+bias on this kernel. This explains that setup failure, not the old black screen.
+
+Stage7a registers a named `irq-pull-up` pinctrl state for TLMM group `gpio12`
+and explicitly selects it after requesting the IRQ input. The map is registered
+only for stage 2, has no automatic/default state, and is removed on failure or
+unload after pinctrl handles are released. No kernel/DT rebuild is required.
+Host tests include mapping-registration failure cleanup. Rebuilt stage-2 setup
+then succeeded, and the one-shot hardware experiment returned:
+
+```text
+elapsed_seconds=2.611
+stage=2 hardware_ready=1 attempted=1 transport_up=1 poisoned=0 rejected=0 phase=done result=0 cleanup=0 valid=0xff
+chip_id=0x8601 firmware=0x0118 mode=0x2 irq=0x3d vin_raw=5805 iin_raw=125 temperature_raw=25 ept=0x0
+charge_disable=1 supply=0 wake=0 scan=0 irq_level=1
+```
+
+Both HBOOST requests received valid success replies. VIN is the chip's ADC
+reading, not an independent voltage measurement. The IRQ snapshot includes
+stock WAKEUP/SSP/IDP/CFGP/ASK bits, but the experiment did not establish a
+cleared baseline, service IRQs or read ASK payloads; it is not proof of fresh
+pen attachment, an address exchange or charging. Preserve mode `0x2` as raw
+evidence rather than assigning an unverified meaning.
+
+After cleanup, debugfs confirmed GPIO111 output/high, GPIO10/15/85 output/low,
+and GPIO12 input/high/pull-up. Wi-Fi stayed up with carrier and SSH. Touch IRQs
+advanced from 4123 to 5584 and contact frames also advanced; SPI errors stayed
+0, checksum errors stayed at the pre-existing 11, and starts/start failures
+stayed 6/0. Pen reports stayed 0 and `pen_scan=0`. The module was unloaded
+successfully, with no module/device left registered. The tablet also has a
+saved result at `/tmp/cps8601-stage7a-result.json`. No new image, reboot, CPS
+firmware write or TX configuration was used. Before a subsequent power
+experiment, reboot under the existing one-attempt policy.
+
+### Reproducing the manual checkpoints
 
 Loading requires explicit `stage=1` or `stage=2`; the default fails before
 device registration. There is no OF module alias and no boot hook. The image
@@ -241,11 +287,11 @@ builder still rejects `--pen-power-module`. The old Stage6 black screen has
 not been attributed to any specific lock, GPIO or firmware operation.
 
 **First hardware checkpoint: stage 1 only.** Copy the newly built module to
-the tablet as `/tmp/caihong_pen_power-stage7.ko`. In a separate terminal keep
+the tablet as `/tmp/caihong_pen_power-stage7a.ko`. In a separate terminal keep
 `dmesg -w` running so the last setup marker is visible if a step stalls. Then:
 
 ```sh
-insmod /tmp/caihong_pen_power-stage7.ko stage=1
+insmod /tmp/caihong_pen_power-stage7a.ko stage=1
 cat /sys/bus/platform/devices/caihong-pen-power/status
 dmesg | tail -n 80
 ```
@@ -267,7 +313,7 @@ Changing stages requires unloading the stage-1 instance:
 
 ```sh
 rmmod caihong_pen_power
-insmod /tmp/caihong_pen_power-stage7.ko stage=2
+insmod /tmp/caihong_pen_power-stage7a.ko stage=2
 cat /sys/bus/platform/devices/caihong-pen-power/status
 ```
 
@@ -295,14 +341,14 @@ the latch. ID success alone does not reproduce attachment or wake the pen.
 Build just this diagnostic from the workspace root:
 
 ```sh
-mkdir -p build/cps8601-stage7/module/charging
+mkdir -p build/cps8601-stage7a/module/charging
 cp external/out_tree_module-sc8547/charging/caihong_pen_power.c \
-    build/cps8601-stage7/module/charging/
-cat > build/cps8601-stage7/module/Makefile <<'EOF'
+    build/cps8601-stage7a/module/charging/
+cat > build/cps8601-stage7a/module/Makefile <<'EOF'
 obj-m += caihong_pen_power.o
 caihong_pen_power-y := charging/caihong_pen_power.o
 EOF
-make -C linux/out M="$PWD/build/cps8601-stage7/module" \
+make -C linux/out M="$PWD/build/cps8601-stage7a/module" \
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- W=1 modules
 ```
 
@@ -310,8 +356,8 @@ The module must match the running kernel; the tested Stage6b build uses
 `7.2.0-00012-gb35f5cb0b661-dirty`. The prepared standalone artifact is:
 
 ```text
-caihong_pen_power-stage7.ko
-sha256: 2d8c005b8788364175168e713475ed0f54d8a41201321916ee455267fadbbcf1
+caihong_pen_power-stage7a.ko
+sha256: 6d9ecbc9622d84b47ab5fdb0e39d9a795f63cedd30e23f923661a2ebe8a9d220
 ```
 
 The existing Stage6b image and Stage4 touch module hashes were checked against
@@ -320,7 +366,8 @@ checkpatch, the existing power/ACK/cleanup fault tests, and a new registration
 test covering explicit stage selection, stage-1 suspend/unload without GPIOs,
 synchronous error propagation and cleanup at each mocked setup failure.
 These tests do not model kernel device-core locking or validate actual GPIO,
-PMIC firmware, or on-device registration. Hardware stage 1 is still pending.
+PMIC firmware, or on-device registration. The manual hardware checkpoints
+above passed; long-term operation, attachment and charging remain unverified.
 
 ## Stage6 withdrawn; Stage6a boot recovery
 

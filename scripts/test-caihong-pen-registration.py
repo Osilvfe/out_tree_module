@@ -31,6 +31,7 @@ shim = r'''
 #define PEN_OWNER 32785
 #define PLATFORM_DEVID_NONE -1
 #define DL_FLAG_AUTOPROBE_CONSUMER 1
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define IS_ERR(p) (!(p))
 #define PTR_ERR(p) (-ENOMEM)
 #define pr_info(...) do {} while (0)
@@ -57,10 +58,11 @@ static struct platform_device parent = { .dev.of_node = &node };
 static struct platform_device child, *pen_device;
 static struct pen_power data;
 static int pen_driver, pen_gpios;
+static int pen_pinmaps[1];
 static void *pen_groups;
 static unsigned int stage;
 static int pen_probe_result;
-static int failure, nodes, parents, devices, registered, lookups, locks;
+static int failure, nodes, parents, devices, registered, lookups, locks, maps;
 static int hw_calls, off_calls, allocs, glinks, wakes, groups;
 static int pen_probe(struct platform_device *);
 static void pen_remove(struct platform_device *);
@@ -87,6 +89,9 @@ static void *device_link_add(struct device *c, struct device *s, int flags)
 { return failure == 9 ? NULL : c; }
 static void gpiod_add_lookup_table(void *p) { assert(!lookups); lookups++; }
 static void gpiod_remove_lookup_table(void *p) { assert(lookups == 1); lookups--; }
+static int pinctrl_register_mappings(const void *p, unsigned int n)
+{ assert(stage == 2 && !maps); if (failure == 16) return -ENOMEM; maps++; return 0; }
+static void pinctrl_unregister_mappings(const void *p) { assert(maps == 1); maps--; }
 static void *devm_kzalloc(struct device *d, size_t s, int f)
 { if (failure == 11) return NULL; allocs++; data = (struct pen_power){0}; return &data; }
 static void mutex_init(int *l) {}
@@ -103,7 +108,7 @@ static void *devm_pmic_glink_client_alloc(struct device *d, int owner,
 { assert(d->parent == &parent.dev); return failure == 12 ? NULL : v; }
 static void pmic_glink_client_register(void *c) { glinks++; }
 static int pen_get_hardware(struct pen_power *p)
-{ hw_calls++; assert(stage == 2 && lookups == 1); if (failure == 13) return -EIO;
+{ hw_calls++; assert(stage == 2 && lookups == 1 && maps == 1); if (failure == 13) return -EIO;
   p->hardware_ready = true; return 0; }
 static void pen_off(struct pen_power *p) { assert(p->hardware_ready); off_calls++; }
 static int device_init_wakeup(struct device *d, bool on)
@@ -127,7 +132,7 @@ tests = r'''
 static void reset(void)
 {
     assert(!nodes && !parents && !devices && !registered && !lookups && !locks);
-    assert(!allocs && !glinks && !wakes && !groups);
+    assert(!allocs && !glinks && !wakes && !groups && !maps);
     pen_device = NULL; pen_probe_result = -ENODEV; hw_calls = off_calls = 0;
 }
 int main(void)
@@ -146,8 +151,8 @@ int main(void)
         assert(off_calls == (stage == 2 ? 3 : 0));
     }
     for (stage = 1; stage <= 2; stage++) {
-        for (failure = 1; failure <= 15; failure++) {
-            if (stage == 1 && failure == 13) continue;
+        for (failure = 1; failure <= 16; failure++) {
+            if (stage == 1 && (failure == 13 || failure == 16)) continue;
             reset();
             assert(pen_init() < 0);
             assert(!groups && !registered);
