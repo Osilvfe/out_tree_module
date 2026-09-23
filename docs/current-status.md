@@ -31,8 +31,26 @@ has not been connected or tested.
 Stage3 fixes a source-confirmed missing multitouch slot release, selects the
 coordinate layout from firmware information, and adds read-only event counters
 and the latest packet. It retains the same v9 Wi-Fi payload and init sequence.
-Module compilation, host packet tests and final-image checks pass; desktop
-clicks, pen and suspend/resume still need hardware validation.
+The user confirmed normal desktop touch with stage3, then 10 simultaneous
+points in a simple browser test. This is the working touch checkpoint, not
+long-term validation. Later, touch stopped after sleep with no `evtest` output;
+the user reported a PM error from `nt36532e_resume` returning `-110` (timeout).
+That old error path leaves touch IRQ disabled.
+
+Stage4 uses the existing DRM panel-follower API so firmware is uploaded after
+panel preparation, including display blank/unblank. Work waits for both panel
+and SPI device resume; the firmware is retained in RAM. This addresses a
+source-confirmed ordering gap, while the exact hardware timeout cause and the
+fix still need a device test. `touch_stats` now includes power/start counters
+and errors. No kernel rebuild or WLAN payload change is involved.
+
+Stage4 also fixes pen pressure/ranges/transforms and adds `pen_scan`,
+`pen_stats`, and a passive `caihong-pen-status` helper. The user's pen is
+OPN2402, but its vendor scan type, charge and Bluetooth state are unknown.
+The original wireless charger is CPS8601 on I2C hub 3 at 0x41, with a separate
+PMIC-Glink HBOOST dependency. Charging is not implemented by this stage.
+Module compilation, host event/PM/diagnostic tests and final-image checks pass;
+stage4 boot, Wi-Fi, touch/resume and pen still need hardware validation.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

@@ -15,7 +15,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 | Driver | Status | Hardware state |
 | --- | --- | --- |
-| `nt36532e_ts.ko` | Input events confirmed; desktop clicks under test | Stage2 detects the IC, loads firmware, receives interrupts and reports touch events, but desktop taps do not work. Stage3 fixes missing contact release and adds event diagnostics. Pen remains untested. |
+| `nt36532e_ts.ko` | Desktop touch and 10 points confirmed; resume fix under test | Stage3 works in the desktop and passed a simple browser 10-point test. Resume later failed with `nt36532e_resume: -110`. Stage4 follows panel power, retains firmware in memory and adds pen controls/diagnostics. Pen and wireless pen charging remain unverified. |
 | `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
@@ -66,8 +66,8 @@ sc8547_cp.ko
 
 ## Touchscreen DTS
 
-The current test node includes the reset GPIO and enables pen support; both
-touch and pen still need hardware validation:
+The current test node includes the reset GPIO and pen properties. Stage3 touch
+is confirmed; stage4 resume and pen changes still need hardware validation:
 
 ```dts
 &spi4 {
@@ -81,10 +81,14 @@ touch and pen still need hardware validation:
         spi-max-frequency = <12000000>;
         panel = <&panel>;
         novatek,pen-support;
+        novatek,pen-max-pressure = <16383>;
+        novatek,pen-max-tilt = <60>;
         firmware-name = "novatek/DT-novatek-nt36532.bin";
         touchscreen-size-x = <21200>;
         touchscreen-size-y = <30000>;
         touchscreen-max-pressure = <1000>;
+        touchscreen-x-mm = <177>;
+        touchscreen-y-mm = <250>;
         touchscreen-swapped-x-y;
         touchscreen-inverted-x;
         pinctrl-0 = <&ts_default>;

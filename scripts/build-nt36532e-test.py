@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Add the NT36532E bring-up payload to the pinned, working Caihong Wi-Fi v9.
 
-Only the embedded initramfs and two touchscreen DT properties may change.
+Only the embedded initramfs and listed touchscreen DT properties may change.
 This deliberately does not rebuild the kernel or consume a mutable ramdisk
 directory. Requires Python 3, dtc, fdtget, fdtput, modinfo and mkbootimg.
 """
@@ -25,6 +25,7 @@ FIRMWARE_SHA256 = "fc6f5124d7f571f1090731b77fff0dcaf0abacbc2249b0dfa4891578919b1
 TOUCH_NODE = "/soc@0/geniqup@ac0000/spi@a90000/touchscreen@0"
 MODULE = "lib/modules/nt36532e_ts.ko"
 FIRMWARE = "lib/firmware/novatek/DT-novatek-nt36532.bin"
+PEN_STATUS = "usr/local/sbin/caihong-pen-status"
 ANCHOR = b"mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run\n"
 
 
@@ -123,15 +124,20 @@ def patch_dtb(original, work):
     require(irq[1:] == ["a2", "2"], "unexpected touch IRQ GPIO/trigger")
     run("fdtput", "-t", "x", dest, TOUCH_NODE, "reset-gpios", irq[0], "a1", "1")
     run("fdtput", dest, TOUCH_NODE, "novatek,pen-support")
+    pen_properties = {"novatek,pen-max-pressure": 16383, "novatek,pen-max-tilt": 60,
+                      "touchscreen-x-mm": 177, "touchscreen-y-mm": 250}
+    for name, value in pen_properties.items():
+        run("fdtput", "-t", "x", dest, TOUCH_NODE, name, f"{value:x}")
     before = run("dtc", "-q", "-s", "-I", "dtb", "-O", "dts", source)
     after = run("dtc", "-q", "-s", "-I", "dtb", "-O", "dts", dest)
     added = [f"\t\t\t\t\treset-gpios = <0x{irq[0]} 0xa1 0x01>;\n",
              "\t\t\t\t\tnovatek,pen-support;\n"]
+    added += [f"\t\t\t\t\t{name} = <0x{value:x}>;\n" for name, value in pen_properties.items()]
     restored = after
     for line in added:
         require(restored.count(line) == 1, f"unexpected DT property: {line.strip()}")
         restored = restored.replace(line, "", 1)
-    require(restored == before, "DT changes extend beyond the two touch properties")
+    require(restored == before, "DT changes extend beyond the listed touch/pen properties")
     return dest
 
 
@@ -196,7 +202,8 @@ def build(args):
         records = [encode_entry(name, entry.fields, new_init) if name == "init" else entry.raw
                    for name, entry in original.items() if name != "TRAILER!!!"]
         additions = {"lib/firmware/novatek": (0o40755, b""),
-                     FIRMWARE: (0o100644, firmware), MODULE: (0o100644, module)}
+                     FIRMWARE: (0o100644, firmware), MODULE: (0o100644, module),
+                     PEN_STATUS: (0o100755, Path(__file__).with_name("caihong-pen-status.py").read_bytes())}
         inode = max(entry.fields[0] for entry in original.values()) + 1
         for name, (mode, data) in additions.items():
             require(name not in original, f"touch payload already exists: {name}")
@@ -243,7 +250,7 @@ def build(args):
             "added_entries": sorted(additions),
             "checks": ["kernel identical outside embedded initramfs", "original init retained verbatim around hook",
                        "all other original cpio records byte-identical", "module vermagic matches baseline",
-                       "DT only adds touchscreen reset-gpios and pen-support", "boot metadata and cmdline unchanged",
+                       "DT only adds listed touchscreen reset/pen properties", "boot metadata and cmdline unchanged",
                        "final image decompressed and all records verified", "boot ID verified"],
             "hardware_test": "pending: boot, Wi-Fi, touch, pen and suspend/resume",
             "wifi_sha256": {name: sha256(entry.data) for name, entry in original.items()
