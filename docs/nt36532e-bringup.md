@@ -5,7 +5,11 @@ passed. Sleep/resume later failed with no `evtest` events and a reported
 `nt36532e_resume` PM error of `-110`. Stage4 contains a panel-sequencing fix
 and pen diagnostics; the user confirmed sleep/resume now works. The user now
 confirms OPN2402 has power and charges under another system; Linux Bluetooth
-connection, automatic attachment and pen input remain unverified.
+connection, automatic attachment and pen input remain unverified. The first
+five-mode sweep acknowledged every command but produced zero IRQs/event reads
+and zero pen reports; it restored scan mode 0. Bluetooth is present and powered
+on. Next check pen discovery on the existing image; see
+[the recorded result and next steps](cps8601-bringup.md#resumed-pen-test-preparation).
 
 ## Stage1 packaging failure
 
@@ -184,10 +188,10 @@ updated `scripts/caihong-pen-status.py` directly; no image change is required.
 The old embedded helper is copied back into `/usr/local/sbin` at boot, so use
 the separately downloaded script for this diagnosis after any reboot.
 
-If `bluetoothctl info` reports that the supplied address is not available,
-check `bluetoothctl list` and `show` first. With a working, powered controller,
-run `sudo bluetoothctl --timeout 15 scan on` and then query the pen address
-again. The helper itself only queries cached info. An undiscovered address
+The supplied `bluetoothctl show` now confirms a present, powered controller.
+Run `sudo bluetoothctl --timeout 25 scan on` and then query the pen address
+with `bluetoothctl info`. `Discoverable: no` does not prevent scanning. The
+helper itself only queries cached info. An undiscovered address
 does not establish whether the pen is charged, advertising or connected.
 
 ## Preserved Wi-Fi baseline

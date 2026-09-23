@@ -12,7 +12,7 @@ The user has deferred the minor all-key touchpad pause and asked to resume
 OPN2402 testing. The working image remains
 `mainline-boot-v2-stage6b-pogo-f4-wifi-v9.img`; it already contains the tested
 Stage4 touch module, pen input device and diagnostics. No new image is needed
-to collect the first status snapshot:
+for the current discovery step. For later input/controller snapshots, use:
 
 ```sh
 sudo caihong-pen-status --skip-charger
@@ -27,23 +27,37 @@ Proceed according to the evidence:
 
 | Check | Current evidence | Next step |
 | --- | --- | --- |
-| Pen power | User confirms it has power and charges under another system | Proceed with the powered-pen scan test; this does not establish Linux wireless charging. |
-| Linux Bluetooth | A cached address query previously returned unavailable; controller status is unconfirmed | Inspect helper output. If a controller exists and is powered, do a bounded discovery scan; a missing cached address alone says nothing about pen power. |
-| NT36532E scan protocol | Driver supports types 1–5; OPN2402 mapping is unknown | Obtain the stock-selected type if available, or test the five documented modes using the bounded helper below. Default/unconfigured is `-1`, not a retail model ID. |
-| Raw pen input | No hardware pen report confirmed | With a powered pen, test hover, contact, pressure and leaving proximity in `evtest`; compare `pen_stats` before and after. |
+| Pen power | User confirms it has power and charges under another system | Investigate discovery/wake; Linux wireless charging remains unconfirmed. |
+| Linux Bluetooth | Controller present, powered, pairable; central/peripheral roles supported. No discovery result yet. | Run bounded discovery and query the pen device. A missing cached address alone says nothing about pen power. |
+| NT36532E scan protocol | Modes 1–5 acknowledged, with zero IRQs/event reads in every window; OPN2402 mapping unknown | Check pen discovery/connection first; repeat the scan test after a wake/connection change. Last sweep restored mode 0. |
+| Raw pen input | No hardware pen report confirmed | After a scan candidate is found, check hover, contact, pressure and leaving proximity in `evtest`. |
 
-For a present, powered Bluetooth controller, discovery can be tested with:
+The supplied `bluetoothctl show` confirms `Powered: yes`, `Pairable: yes`,
+`Discovering: no` and `Discoverable: no`. Being non-discoverable does not
+prevent this controller from scanning or initiating a connection. Discovery
+can be tested on the current image with:
 
 ```sh
-sudo bluetoothctl --timeout 15 scan on
+sudo bluetoothctl --timeout 25 scan on
 ```
 
-Supply the pen address locally when querying `bluetoothctl info`; do not add
-it to public logs or source. Discovery/connection and touch-controller scan
-configuration are separate checkpoints. Stock Android informs the touchscreen
+Keep the display awake; take the pen off the magnetic rail, move it and tap
+with its tip during the scan. Record whether other nearby devices appear,
+as controller power alone does not validate radio discovery. Then query
+`bluetoothctl info <pen-address>`, using the pen address locally rather than
+adding it to public logs or source. If the pen appears under another address,
+retain its name, address type and advertised services for identification.
+If discovered, inspect connection/service state and attempt a normal BlueZ
+connection, pairing if required. If absent, do not infer a dead pen or a
+specific touch protocol; attachment-driven wake remains unresolved.
+
+Discovery/connection and touch-controller scan configuration are separate
+checkpoints. Stock Android informs the touchscreen
 of a pen type through `pencil_connected`; there is no equivalent automatic
 BlueZ-to-NT36532E bridge in this driver. Bluetooth connection alone therefore
-does not configure Linux pen scanning or establish valid coordinates.
+does not configure Linux pen scanning or establish valid coordinates. The
+latest sweep restored **mode 0 (disabled)**. After a successful connection or
+wake change, run the existing scan helper again before testing pen input.
 
 If stock kernel logs are accessible while reconnecting the powered pen,
 `nvt_notify_pencil_type` logs `value = ..., set pencil type to ...`. The latter
@@ -107,6 +121,12 @@ the final touchscreen step without claiming to implement attachment,
 Bluetooth pairing or pen-side wake/authentication. Whether this pen needs
 additional connection/wake activity remains a hardware question.
 
+The inspected Novatek `nvt_pen_control()` dispatches vibrator control and
+feedback, not an identified connection/wake handshake. The CPS8601
+`TX_INT_WAKEUP` handler signals a charger wake waitqueue; it does not establish
+that the pen has been woken. No additional pen-side wake command is confirmed
+by these paths.
+
 ## Powered-pen scan test
 
 On the existing Stage6b image, take the charged pen off the magnetic rail,
@@ -148,18 +168,22 @@ touch/pen counters and sampled raw coordinates for that next diagnosis.
 Host tests cover candidate selection, false positives, timeout, cleanup,
 interruption, sleeping/restarted controllers and counter resets.
 
-The user reports that all printed counter deltas are zero in the first
-five-mode sweep. These are increments during each observation window, not
-the absolute lifetime counters. Since `nvt_report_pen()` increments `packets`
-before checksum/format/coordinate handling, a zero packet delta means no new
-event reached that handler during the window. It does not establish whether
-there were no IRQs, reads failed, boot events were filtered, or another path
-prevented pen dispatch. The current command bytes, ACK polling, 120-byte
-event payload and pen data offset 66 match the inspected stock NT36532 path.
-No specific decoder change is justified by the zero deltas alone.
+The user supplied the summary of `pen-scan-20260923-223638.json` on
+2026-09-23. All five modes show `ack=observed`, with zero increments in
+`irq`, `reads`, `touch_frames`, `spi_errors`, `boot_events`, `pen_packets`,
+`pen_reports` and `pen_checksum_errors`. Each has
+`evidence=no_new_event_reads`; the sweep ended with `candidate=None` and
+`restored_mode=0`, with no error or restore error printed. These are increments
+during each observation window, not absolute lifetime counters.
+
+This establishes that no new touch IRQ/event read occurred in those windows;
+there was no new data for the pen decoder to process. It does not distinguish
+pen wake/connection from controller scanning. The current command bytes, ACK
+polling, 120-byte event payload and pen data offset 66 match the inspected
+stock NT36532 path. No specific decoder change is justified by this result.
 
 The original JSON already contains touch IRQ/read counters for every sample.
-Use the updated helper to summarize it without another hardware test:
+It can be summarized without another hardware test:
 
 ```sh
 python3 scripts/caihong-pen-scan.py --summarize /path/to/pen-scan-TIMESTAMP.json
@@ -178,8 +202,9 @@ dispatch, packets without valid coordinates, and valid-coordinate reports.
 in the saved snapshot; it does not prove that the pen was awake or connected.
 If an error aborted the run, the summary prints that error and the cleanup
 result. No-IRQ/no-read results make pen wake/connection and controller scanning
-the next checks; they do not identify which side failed. The Bluetooth
-controller's current state can be collected separately with `bluetoothctl show`.
+the next checks; they do not identify which side failed. The supplied
+`bluetoothctl show` establishes controller power; pen discovery is the next
+hardware observation needed.
 Offline tests cover these distinctions and prove the summary path avoids
 device access and writes.
 

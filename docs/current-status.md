@@ -49,12 +49,13 @@ change is involved.
 Stage4 also fixes pen pressure/ranges/transforms and adds `pen_scan`,
 `pen_stats`, and a passive `caihong-pen-status` helper. The user's pen is
 OPN2402. The user now confirms the pen has power and charges under another
-system; its vendor scan type and Linux Bluetooth state remain unknown.
+system; its vendor scan type remains unknown. The Linux Bluetooth controller
+is present and powered on, but pen discovery/connection remain unconfirmed.
 The original wireless charger is CPS8601 on I2C hub 3 at 0x41, with a separate
 PMIC-Glink HBOOST dependency. Charging is not implemented by this stage.
 Module compilation, host event/PM/diagnostic tests and final-image checks pass.
-Stage4 boot and touch/resume are confirmed; pen remains untested and a fresh
-Wi-Fi regression result has not been separately reported for stage4.
+Stage4 boot and touch/resume are confirmed; pen input remains unconfirmed.
+A fresh Wi-Fi regression result has not been separately reported for stage4.
 
 The first pen helper looked in the removed `/sys/class/i2c-adapter` class and
 reported zero hub-3 adapters. The working image already enables that hub and
@@ -83,14 +84,24 @@ separate `pencil_connected` → type selection → scan command path. The Androi
 component linking these to pairing/UI is not present in the inspected kernel
 sources. `scripts/caihong-pen-scan.py --sweep` now tests the five documented
 NT36532E modes on the existing image and keeps a candidate only after fresh
-moving coordinates and tip pressure are observed. The user reports all printed
-counter deltas are zero for the scan sweep. No pen input has been confirmed;
-the saved touch IRQ/read counters and error/cleanup status have not yet been
-provided. `--summarize` reads that existing JSON without rerunning modes or
-accessing devices. Host tests pass. The withdrawn CPS boot integration is not
-reinstated.
-Bluetooth address-not-available was also reported; the helper only queries
-BlueZ's cache and does not discover devices, so pen power cannot be inferred.
+moving coordinates and tip pressure are observed. The summary of
+`pen-scan-20260923-223638.json` now confirms `ack=observed` in modes 1–5,
+with zero increments in IRQs, reads, touch frames, SPI errors, boot events,
+pen packets, reports and checksum errors in every observation window.
+Each mode reports `no_new_event_reads`; `candidate=None` and
+`restored_mode=0`. This narrows the next investigation to pen wake/connection
+and controller scanning, before coordinate decoding. ACK alone does not
+establish that the controller detected a pen.
+
+The supplied `bluetoothctl show` confirms a present, powered, pairable
+controller supporting central and peripheral roles; it was not discovering
+at the time. Its `Discoverable: no` state does not prevent discovery as a
+central. The earlier pen address-not-available result was a BlueZ cache query,
+not a discovery test. Next run bounded Bluetooth discovery and inspect the
+pen's device info. If a connection/wake change succeeds, rerun the existing
+scan helper: the last sweep restored **0 (pen scan disabled)** and this driver
+does not automatically select a scan type from BlueZ state. Host helper tests
+pass; the withdrawn CPS boot integration is not reinstated.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 
