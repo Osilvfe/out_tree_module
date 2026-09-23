@@ -22,10 +22,11 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | `caihong_pen_power.ko` | Boot integration withdrawn | Stage6 produced a reported black screen; the failure point is not yet known. Stage6a omits this module and its DT additions, with the exact Stage5 init/DTB and corrected keyboard mapping. The user confirmed Stage6a boots again. Power/charging tests are paused. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
-The current priority is preparing OPN2402 pen tests on the working Stage6b
-image: establish pen power, inspect Bluetooth/controller and pen scan state,
-then validate raw pen input. The previous CPS8601 boot integration remains
-withdrawn. See [pen test preparation](docs/cps8601-bringup.md#resumed-pen-test-preparation).
+The user confirms OPN2402 has power and charges under another system. The
+current priority is testing its scan protocol and raw pen input on the working
+Stage6b image using `scripts/caihong-pen-scan.py --sweep`. Linux pen input and
+automatic attachment/connection remain unverified. The previous CPS8601 boot
+integration remains withdrawn. See [pen test preparation](docs/cps8601-bringup.md#resumed-pen-test-preparation).
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
 experimental controls are fail-closed and are not a production charging policy.

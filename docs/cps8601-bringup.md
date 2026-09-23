@@ -1,7 +1,9 @@
 # Caihong CPS8601 pen charger
 
-The OPN2402 pen has not yet been confirmed powered, discovered over Bluetooth
-or reporting input. The user has confirmed stage4 touchscreen suspend/resume.
+The user confirms OPN2402 has power, can charge under another system and shows
+a connection in stock when magnetically attached. Linux Bluetooth discovery,
+automatic attachment and pen input remain unconfirmed. The user has confirmed
+stage4 touchscreen suspend/resume.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
 ## Resumed pen test preparation
@@ -18,16 +20,16 @@ sudo caihong-pen-status --skip-charger
 
 This reads `touch_stats`, `pen_stats`, `pen_scan`, the Novatek event device
 names and Bluetooth controller status. The known unpowered CPS NACK does not
-need to be reproduced. Pen charge and access to a stock/compatible charging
-device are still unknown at this checkpoint.
+need to be reproduced. The user's confirmation of a powered pen permits an
+input-only scan experiment before restoring the CPS8601 attachment path.
 
 Proceed according to the evidence:
 
 | Check | Current evidence | Next step |
 | --- | --- | --- |
-| Pen power | OPN2402 charge is unknown | If a stock/compatible device is available, confirm it charges and the pen writes there. Otherwise resume CPS power/ID integration first. |
+| Pen power | User confirms it has power and charges under another system | Proceed with the powered-pen scan test; this does not establish Linux wireless charging. |
 | Linux Bluetooth | A cached address query previously returned unavailable; controller status is unconfirmed | Inspect helper output. If a controller exists and is powered, do a bounded discovery scan; a missing cached address alone says nothing about pen power. |
-| NT36532E scan protocol | Driver supports types 1–5; OPN2402 mapping is unknown | Obtain the vendor-selected type when possible, then use the existing acknowledged `pen_scan` interface. Default/unconfigured is `-1`, not a retail model ID. |
+| NT36532E scan protocol | Driver supports types 1–5; OPN2402 mapping is unknown | Obtain the stock-selected type if available, or test the five documented modes using the bounded helper below. Default/unconfigured is `-1`, not a retail model ID. |
 | Raw pen input | No hardware pen report confirmed | With a powered pen, test hover, contact, pressure and leaving proximity in `evtest`; compare `pen_stats` before and after. |
 
 For a present, powered Bluetooth controller, discovery can be tested with:
@@ -67,14 +69,92 @@ when leaving range. The `packets` counter includes no-pen/ID packets, so its
 increase alone is not proof of pen detection: inspect `reports`, `format`,
 `in_range`, coordinates and error counters together.
 
-If no known powered pen is available, further empty pen tests cannot separate
-power from scan configuration. Resume the CPS8601 work as a post-boot manual
-identification experiment with observable registration/probe logs, keeping the
-working boot path intact. The previous Stage6 boot regression remains
-undiagnosed; the withdrawn module is not ready to load unchanged. First prove
-provider registration and an acknowledged power/wake sequence with chip ID
-0x8601, then implement charging separately. An ID read alone does not charge
-the pen.
+## Stock attachment and connection path
+
+The inspected kernel sources establish these endpoints:
+
+1. `cps_wls_tx_irq_handler()` handles `TX_INT_RX_ATTACH`, marks the pen near,
+   adjusts HBOOST and starts attachment/charge monitoring. `TX_INT_SSP` can
+   set `pen_present` before the BLE address has been validated.
+2. `TX_INT_ASK_PKT` calls `cps_wls_get_ask_packet()`. Wireless packets with
+   header `0x48` carry address-check bytes (`0xc1`) and two encoded address
+   halves (`0xb6`/`0xb7`). After address validation the normal attachment path
+   sends a uevent containing `pencil_status=1` and `pencil_addr=...`. Removal
+   sends status 0. This is wireless-charger communication, not an HCI report
+   that a Bluetooth connection has completed.
+3. A userspace write to the touchscreen's `pencil_connected` proc entry passes
+   a nonzero type to `notify_pencil_type()` and enables `MODE_PEN_SCAN`.
+   `nvt_enable_pen_mode()` chooses the matching NT36532 extended scan command.
+   The coordinates/pressure arrive over touchscreen SPI.
+
+The Android userspace implementation between the charger uevent, Bluetooth
+pairing and the visible connection popup is not included in the inspected
+kernel tree. The popup alone therefore does not identify which of these
+steps is complete. Similarly, CPS `tx_status=Connected` only reflects
+`pen_present`; it does not query Bluetooth.
+
+`notify_pen_state()` separately tracks magnetic attachment for touchscreen
+power policy. While the screen is awake, it selects scanning according to
+`is_pen_connected`; in supported screen-off gesture states it also checks
+that the pen is not attached. The CPS8601 source inspected here does not call
+this symbol, so do not infer a direct CPS-to-touch notifier from the older
+P9418/RA9530 charger implementations.
+
+On the current Linux image the CPS module is absent and no automatic service
+translates charger/BlueZ state into `pen_scan`. Attaching a powered pen alone
+therefore does not reproduce the stock path. The manual scan test exercises
+the final touchscreen step without claiming to implement attachment,
+Bluetooth pairing or pen-side wake/authentication. Whether this pen needs
+additional connection/wake activity remains a hardware question.
+
+## Powered-pen scan test
+
+On the existing Stage6b image, take the charged pen off the magnetic rail,
+keep the screen awake, and run:
+
+```sh
+sudo python3 scripts/caihong-pen-scan.py --sweep
+```
+
+Keep drawing short lines and tapping with the pen tip while each mode is
+displayed. The test tries modes 1–5 for up to 8 seconds each, with a half-second
+settle period per change. It stops at the first candidate with at least five
+new valid-coordinate reports, three fresh sampled reports, two distinct
+positions and observed tip pressure/contact. Empty/ID packets, unchanged
+cached coordinates and hover alone do not qualify. These are candidate
+criteria for this experiment, not a permanent retail-model mapping.
+
+A candidate scan mode remains selected so `sudo evtest` can immediately test
+**Novatek NT36532E Pen**. The existing driver also retains an acknowledged
+selection across display/suspend cycles. Confirm raw hover, tip pressure,
+release and leaving proximity before claiming a working pen or selecting a
+default type in the driver. `--type N` tests just a stock-known type instead
+of sweeping; `--seconds` accepts 3–15 seconds per mode.
+
+The helper changes only the existing `pen_scan` attribute. It sends no CPS,
+GPIO, HBOOST, firmware-flash or Bluetooth commands. Mode writes use the
+driver's existing ACK polling. A command/read failure, restart, mode change,
+SPI error or counter reset stops the sweep. If no candidate is found, or the
+test fails/is interrupted, it attempts to restore the previous known mode.
+If the initial mode was `-1`, the fallback is **0 (pen scan disabled)**;
+the unknown firmware default cannot be reconstructed. Cleanup failure is
+reported explicitly. The log uses exclusive creation and concurrent helper
+runs are rejected with a lock.
+
+Provide the printed result and the generated `pen-scan-*.json`. No candidate
+does not mean the charged pen is dead: pen-side wake/connection, the protocol
+selection or the touch event path may still be missing. The log includes
+touch/pen counters and sampled raw coordinates for that next diagnosis.
+Host tests cover candidate selection, false positives, timeout, cleanup,
+interruption, sleeping/restarted controllers and counter resets; actual
+hardware scan results are pending.
+
+Full stock-like attachment still needs CPS support. Resume that as an
+observable post-boot identification experiment: the previous Stage6 boot
+regression remains undiagnosed and the withdrawn module is not ready to load
+unchanged. First prove provider registration and the power/wake sequence with
+chip ID 0x8601, then add protected wireless operation and address/attachment
+events. Reading the chip ID alone neither charges nor connects the pen.
 
 ## Stage6 withdrawn; Stage6a boot recovery
 

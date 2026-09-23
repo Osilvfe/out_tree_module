@@ -48,7 +48,8 @@ change is involved.
 
 Stage4 also fixes pen pressure/ranges/transforms and adds `pen_scan`,
 `pen_stats`, and a passive `caihong-pen-status` helper. The user's pen is
-OPN2402, but its vendor scan type, charge and Bluetooth state are unknown.
+OPN2402. The user now confirms the pen has power and charges under another
+system; its vendor scan type and Linux Bluetooth state remain unknown.
 The original wireless charger is CPS8601 on I2C hub 3 at 0x41, with a separate
 PMIC-Glink HBOOST dependency. Charging is not implemented by this stage.
 Module compilation, host event/PM/diagnostic tests and final-image checks pass.
@@ -75,12 +76,15 @@ identification, charging and pen input remain unconfirmed.
 See [CPS8601 bring-up](cps8601-bringup.md).
 The user has now resumed pen-test preparation and deferred the minor pogo
 pause. Start from the working Stage6b image and its existing Stage4 touch
-module. Pen charge is still unknown; first collect input/Bluetooth status
-with `sudo caihong-pen-status --skip-charger` and establish whether a known
-working stock/compatible device can power the pen. The withdrawn CPS boot
-integration is not reinstated by this change in task priority. If the pen
-cannot be powered elsewhere, the next implementation task is an isolated,
-post-boot CPS identification path before charging or pen-input conclusions.
+module. The user confirms the pen has power, can charge under another system,
+and stock shows a connection when it is attached magnetically. Source review
+confirms CPS8601 attachment/ASK-address/uevent handling and the touchscreen's
+separate `pencil_connected` → type selection → scan command path. The Android
+component linking these to pairing/UI is not present in the inspected kernel
+sources. `scripts/caihong-pen-scan.py --sweep` now tests the five documented
+NT36532E modes on the existing image and keeps a candidate only after fresh
+moving coordinates and tip pressure are observed. Host tests pass; no device
+result is available yet. The withdrawn CPS boot integration is not reinstated.
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,

@@ -3,8 +3,9 @@
 Status: 2026-09-23. Stage3 desktop touch and a simple browser 10-point test
 passed. Sleep/resume later failed with no `evtest` events and a reported
 `nt36532e_resume` PM error of `-110`. Stage4 contains a panel-sequencing fix
-and pen diagnostics; the user confirmed sleep/resume now works. The OPN2402
-pen's power, Bluetooth connection and input remain unverified.
+and pen diagnostics; the user confirmed sleep/resume now works. The user now
+confirms OPN2402 has power and charges under another system; Linux Bluetooth
+connection, automatic attachment and pen input remain unverified.
 
 ## Stage1 packaging failure
 
@@ -128,7 +129,10 @@ Writes use the vendor's acknowledged extended command and bounded polling.
 An ACK timeout is reported as an error and leaves the scan state unknown.
 There is no established mapping from retail model **OPN2402** to these types;
 do not infer it from the Bluetooth address. No type is selected automatically.
-Once a type is established, write it using, for example, `printf '%s\n'
+The powered-pen helper `scripts/caihong-pen-scan.py --sweep` can now try those
+five documented modes with bounded observation and explicit cleanup; see
+[the powered-pen test](cps8601-bringup.md#powered-pen-scan-test). No retail model
+mapping is assumed. Once a type is established, write it using, for example, `printf '%s\n'
 "$TYPE" | sudo tee /sys/bus/spi/devices/spi0.0/pen_scan`. `pen_stats` shows
 packet/report/error counters, raw values, scan state and command errors.
 
