@@ -14,7 +14,7 @@ The standalone SPI driver implements the released Novatek no-flash path:
 - pen X/Y, pressure, tilt, distance and two side buttons; pen format byte is 66.
 - no-flash firmware is downloaded again on resume.
 
-The exact `b_16.0.0_pad_pro` vendor source confirms that IRQ handling reads the point packet first, validates the normal point checksum, then validates the pen block independently when pen support is enabled. The current Caihong DTS can therefore be used without inventing a reset GPIO or regulator. Enable `novatek,pen-support;` for stylus input.
+The exact `b_16.0.0_pad_pro` vendor source confirms that IRQ handling reads the point packet first, validates the normal point checksum, then validates the pen block independently when pen support is enabled. Caihong's board data uses GPIO162 for IRQ and GPIO161 as an active-low reset; the standalone driver toggles that reset before the initial and resume firmware downloads. Enable `novatek,pen-support;` for stylus input. The firmware image is the `firmware-data-0` payload from the Android Caihong DTSI and is installed as `novatek/DT-novatek-nt36532.bin`.
 
 ## Pogo keyboard/touchpad
 

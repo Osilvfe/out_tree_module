@@ -23,8 +23,10 @@ The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
 experimental controls are fail-closed and are not a production charging policy.
 
 The touchscreen driver is written against the DTS currently used by Caihong:
-`spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
-coordinate transform properties, and optional `novatek,pen-support`.
+`spi4`, GPIO162 falling-edge interrupt, GPIO161 active-low reset,
+`firmware-name`, standard touchscreen coordinate transform properties, and
+optional `novatek,pen-support`. The matching 249856-byte no-flash image is
+installed as `novatek/DT-novatek-nt36532.bin` by the Caihong firmware setup.
 
 The latest project checkpoint and hardware caveats are summarized in
 [`docs/current-status.md`](docs/current-status.md). The companion kernel tree
@@ -69,6 +71,7 @@ The existing node is sufficient. Uncomment the pen flag when testing stylus:
         compatible = "novatek,nt36532e";
         reg = <0>;
         interrupts-extended = <&tlmm 162 IRQ_TYPE_EDGE_FALLING>;
+        reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
         spi-max-frequency = <12000000>;
         panel = <&panel>;
         novatek,pen-support;
