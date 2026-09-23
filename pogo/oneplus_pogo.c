@@ -45,7 +45,7 @@
 #define POGO_MAX_PAYLOAD		255
 #define POGO_MAX_FRAME			(5 + POGO_MAX_PAYLOAD + 2 + 1 + 4)
 #define POGO_MAX_TOUCHES		5
-#define POGO_SEARCH_USAGE		0x0393
+#define POGO_SEARCH_USAGE		0x72
 
 struct oneplus_pogo_media_map {
 	u16 usage;
@@ -56,19 +56,25 @@ struct oneplus_pogo_media_map {
 static const struct oneplus_pogo_media_map oneplus_pogo_media_map[] = {
 	{ 0x0070, KEY_F1, KEY_BRIGHTNESSDOWN },
 	{ 0x006f, KEY_F2, KEY_BRIGHTNESSUP },
-	{ 0x0391, KEY_F3, KEY_MICMUTE },
-	{ 0x0392, KEY_F4, KEY_TOUCHPAD_TOGGLE },
-	/* F5 is the keyboard-page Print Screen usage (0x46), not media. */
-	{ 0x038e, KEY_F6, KEY_SCREENLOCK },
+	/* F3 through F6 and search arrive on the keyboard page. */
 	{ 0x00b6, KEY_F7, KEY_PREVIOUSSONG },
 	{ 0x00cd, KEY_F8, KEY_PLAYPAUSE },
 	{ 0x00b5, KEY_F9, KEY_NEXTSONG },
 	{ 0x00e2, KEY_F10, KEY_MUTE },
-	{ 0x00e9, KEY_F11, KEY_VOLUMEUP },
-	{ 0x00ea, KEY_F12, KEY_VOLUMEDOWN },
+	{ 0x00ea, KEY_F11, KEY_VOLUMEDOWN },
+	{ 0x00e9, KEY_F12, KEY_VOLUMEUP },
 	/* The physical Esc key reports Android/consumer AC Back on Caihong. */
 	{ 0x0224, KEY_ESC },
 	{ 0x0244, KEY_APPSELECT },
+};
+
+/* Captured on Caihong: the touchpad key alternates between 0x6b and 0x6c. */
+static const struct oneplus_pogo_media_map oneplus_pogo_keyboard_map[] = {
+	{ 0x68, KEY_F3, KEY_MICMUTE },
+	{ 0x6b, KEY_F4, KEY_TOUCHPAD_TOGGLE },
+	{ 0x6c, KEY_F4, KEY_TOUCHPAD_TOGGLE },
+	{ 0x46, KEY_F5, KEY_SYSRQ },
+	{ 0x73, KEY_F6, KEY_SCREENLOCK },
 	{ POGO_SEARCH_USAGE, KEY_FN },
 };
 
@@ -334,8 +340,14 @@ static bool oneplus_pogo_key_present(const u8 *report, u8 usage)
 
 static u16 oneplus_pogo_keyboard_key(u8 usage, bool fn_down)
 {
-	if (usage == 0x46 && !fn_down)
-		return KEY_F5;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_keyboard_map); i++)
+		if (oneplus_pogo_keyboard_map[i].usage == usage) {
+			if (fn_down && oneplus_pogo_keyboard_map[i].fn_keycode)
+				return oneplus_pogo_keyboard_map[i].fn_keycode;
+			return oneplus_pogo_keyboard_map[i].keycode;
+		}
 	return oneplus_pogo_keycode[usage];
 }
 
@@ -350,6 +362,8 @@ static void oneplus_pogo_report_keyboard(struct oneplus_pogo *pogo,
 		return;
 
 	memcpy(report, payload, sizeof(report));
+	/* Compute Fn before translating any slot, including a simultaneous key. */
+	pogo->fn_down = oneplus_pogo_key_present(report, POGO_SEARCH_USAGE);
 
 	for (i = 0; i < 8; i++)
 		input_report_key(pogo->keyboard, oneplus_pogo_keycode[224 + i],
@@ -427,7 +441,6 @@ static void oneplus_pogo_report_media(struct oneplus_pogo *pogo,
 		return;
 
 	memcpy(report, payload, sizeof(report));
-	pogo->fn_down = oneplus_pogo_media_present(report, POGO_SEARCH_USAGE);
 
 	for (i = 0; i < 2; i++) {
 		u16 old = get_unaligned_le16(pogo->old_media + i * 2);
@@ -814,6 +827,13 @@ static int oneplus_pogo_register_inputs(struct oneplus_pogo *pogo)
 		if (oneplus_pogo_media_map[i].fn_keycode)
 			input_set_capability(pogo->keyboard, EV_KEY,
 					     oneplus_pogo_media_map[i].fn_keycode);
+	}
+	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_keyboard_map); i++) {
+		input_set_capability(pogo->keyboard, EV_KEY,
+				     oneplus_pogo_keyboard_map[i].keycode);
+		if (oneplus_pogo_keyboard_map[i].fn_keycode)
+			input_set_capability(pogo->keyboard, EV_KEY,
+					     oneplus_pogo_keyboard_map[i].fn_keycode);
 	}
 
 	ret = input_register_device(pogo->keyboard);

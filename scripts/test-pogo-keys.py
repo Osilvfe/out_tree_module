@@ -77,13 +77,14 @@ int main(void)
 {
     struct oneplus_pogo p = {0};
     /* Physical order supplied by the user; screenshot uses keyboard page. */
-    const u16 row[] = {0x70, 0x6f, 0x391, 0x392, 0, 0x38e,
-                       0xb6, 0xcd, 0xb5, 0xe2, 0xe9, 0xea};
+    const u16 row[] = {0x70, 0x6f, 0, 0, 0, 0,
+                       0xb6, 0xcd, 0xb5, 0xe2, 0xea, 0xe9};
     const u16 fkeys[] = {KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
                          KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12};
     for (unsigned int i = 0; i < ARRAY_SIZE(row); i++) {
+        const u8 ordinary[] = {0, 0, 0x68, 0x6b, 0x46, 0x73};
         if (row[i]) report(&p, row[i], 0);
-        else keyboard(&p, 0, 0x46, 0);
+        else keyboard(&p, 0, ordinary[i], 0);
         assert(keys[fkeys[i]]);
         report(&p, 0, 0);
         keyboard(&p, 0, 0, 0);
@@ -94,22 +95,24 @@ int main(void)
     report(&p, 0, 0);
     assert(!keys[KEY_ESC]);
 
-    report(&p, POGO_SEARCH_USAGE, 0);
+    keyboard(&p, 0, POGO_SEARCH_USAGE, 0);
     assert(keys[KEY_FN] && p.fn_down);
-    report(&p, 0, 0);
+    keyboard(&p, 0, 0, 0);
     assert(!keys[KEY_FN] && !p.fn_down);
 
-    report(&p, POGO_SEARCH_USAGE, 0);
-    keyboard(&p, 0, 0x46, 0);
+    keyboard(&p, 0, POGO_SEARCH_USAGE, 0);
+    keyboard(&p, 0, 0x46, POGO_SEARCH_USAGE);
     assert(keys[KEY_SYSRQ] && !keys[KEY_F5]);
-    report(&p, 0, 0); /* Fn released while screenshot is still down. */
+    keyboard(&p, 0, 0x46, 0); /* Fn released while screenshot is still down. */
     keyboard(&p, 0, 0, 0x46); /* Move held key to another keyboard slot. */
     assert(keys[KEY_SYSRQ] && !keys[KEY_F5]);
     keyboard(&p, 0, 0, 0);
     assert(!keys[KEY_SYSRQ]);
     keyboard(&p, 1, 0x46, 4); /* Ctrl + F5 + A. */
     assert(keys[KEY_LEFTCTRL] && keys[KEY_F5] && keys[KEY_A]);
-    report(&p, POGO_SEARCH_USAGE, 0); /* Late Fn cannot change held F5. */
+    u8 late[] = {1, 0, 4, 0x46, POGO_SEARCH_USAGE, 0, 0, 0};
+    oneplus_pogo_report_keyboard(&p, late, sizeof(late));
+    assert(p.fn_down);
     keyboard(&p, 1, 4, 0x46);
     assert(keys[KEY_F5] && !keys[KEY_SYSRQ]);
     keyboard(&p, 0, 0, 0);
@@ -121,28 +124,58 @@ int main(void)
     for (unsigned int i = 0; i < ARRAY_SIZE(oneplus_pogo_media_map); i++) {
         const struct oneplus_pogo_media_map *m = &oneplus_pogo_media_map[i];
         if (!m->fn_keycode) continue;
-        /* Fn and row key arrive in either order in the same report. */
-        for (int order = 0; order < 2; order++) {
-            report(&p, order ? m->usage : POGO_SEARCH_USAGE,
-                   order ? POGO_SEARCH_USAGE : m->usage);
-            assert(keys[KEY_FN] && keys[m->fn_keycode]);
-            int count = events;
-            report(&p, POGO_SEARCH_USAGE, m->usage);
-            assert(events == count); /* Slot reorder / duplicate frame. */
-            report(&p, m->usage, 0); /* Release Fn first. */
-            assert(!keys[KEY_FN] && keys[m->fn_keycode] && !keys[m->keycode]);
-            report(&p, 0, 0);
-            assert(!keys[m->fn_keycode]);
-        }
-        /* Pressing Fn after an existing F key must not retype that key. */
+        keyboard(&p, 0, POGO_SEARCH_USAGE, 0);
         report(&p, m->usage, 0);
-        assert(keys[m->keycode]);
-        report(&p, m->usage, POGO_SEARCH_USAGE);
-        assert(keys[m->keycode] && !keys[m->fn_keycode]);
-        report(&p, POGO_SEARCH_USAGE, 0);
-        assert(!keys[m->keycode]);
+        assert(keys[KEY_FN] && p.fn_down && keys[m->fn_keycode]);
+        int count = events;
+        report(&p, 0, m->usage); /* Media snapshots must not reset keyboard Fn. */
+        assert(events == count && p.fn_down);
+        keyboard(&p, 0, 0, 0); /* Release Fn before media key. */
+        report(&p, m->usage, 0);
+        assert(!keys[KEY_FN] && keys[m->fn_keycode] && !keys[m->keycode]);
         report(&p, 0, 0);
+        assert(!keys[m->fn_keycode]);
+        /* A late keyboard Fn must not retype a held media key. */
+        report(&p, m->usage, 0);
+        keyboard(&p, 0, POGO_SEARCH_USAGE, 0);
+        report(&p, 0, m->usage);
+        assert(keys[m->keycode] && !keys[m->fn_keycode]);
+        report(&p, 0, 0);
+        assert(!keys[m->keycode] && p.fn_down);
+        keyboard(&p, 0, 0, 0);
     }
+    /* Real captured keyboard usages, including both touchpad states. */
+    const u8 special[] = {0x68, 0x6b, 0x6c, 0x46, 0x73};
+    const u16 base[] = {KEY_F3, KEY_F4, KEY_F4, KEY_F5, KEY_F6};
+    const u16 alternate[] = {KEY_MICMUTE, KEY_TOUCHPAD_TOGGLE,
+                             KEY_TOUCHPAD_TOGGLE, KEY_SYSRQ, KEY_SCREENLOCK};
+    for (unsigned int i = 0; i < ARRAY_SIZE(special); i++) {
+        keyboard(&p, 0, special[i], 0);
+        assert(last_scan == (0x070000u | special[i]) && keys[base[i]]);
+        keyboard(&p, 0, 0, 0);
+        for (int order = 0; order < 2; order++) {
+            keyboard(&p, 0, order ? special[i] : POGO_SEARCH_USAGE,
+                     order ? POGO_SEARCH_USAGE : special[i]);
+            assert(keys[KEY_FN] && keys[alternate[i]] && !keys[base[i]]);
+            int count = events;
+            keyboard(&p, 0, special[i], POGO_SEARCH_USAGE);
+            assert(events == count);
+            keyboard(&p, 0, special[i], 0);
+            assert(!p.fn_down && keys[alternate[i]]);
+            keyboard(&p, 0, 0, 0);
+            assert(!keys[alternate[i]]);
+        }
+    }
+    keyboard(&p, 0, 0x6b, 0);
+    keyboard(&p, 0, 0x6c, 0); /* Changing MCU state releases/represses F4. */
+    assert(keys[KEY_F4]);
+    keyboard(&p, 0, 0, 0);
+    keyboard(&p, 0, POGO_SEARCH_USAGE, 0);
+    assert(last_scan == 0x70072 && keys[KEY_FN]);
+    u8 short_keyboard[] = {0, 0, 0};
+    oneplus_pogo_report_keyboard(&p, short_keyboard, sizeof(short_keyboard));
+    assert(p.fn_down && keys[KEY_FN]);
+    keyboard(&p, 0, 0, 0);
     report(&p, 0x224, 0x224); /* Malformed duplicate usage emits one press. */
     assert(keys[KEY_ESC]);
     report(&p, 0, 0);
@@ -157,7 +190,7 @@ int main(void)
     report(&p, 0, 0);
     for (int i = 0; i <= KEY_MAX; i++) assert(!keys[i]);
     assert(scans > 0);
-    puts("PASS: F1-F12 order, Esc/Delete, Fn layers, screenshot/modifiers, release/slot ordering, invalid reports");
+    puts("PASS: F1-F12 order, Esc/Delete, captured keyboard Fn across media reports, both touchpad states, screenshot/modifiers, release/slot ordering, invalid reports");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="pogo-keys-") as temp:
