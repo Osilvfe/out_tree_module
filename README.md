@@ -9,7 +9,8 @@ does not mean Caihong integration is removed from the companion kernel tree.
 - `nt36532e_ts.ko`: Novatek NT36532E no-flash SPI touchscreen + pen.
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
-- `caihong_pen_power.ko`: Manual, bounded CPS8601 power/wake/ID diagnostic.
+- `caihong_pen_power.ko`: Experimental CPS8601 diagnostic; image integration
+  withdrawn after a Stage6 black-screen report.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
 
 ## Current driver status
@@ -17,8 +18,8 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | Driver | Status | Hardware state |
 | --- | --- | --- |
 | `nt36532e_ts.ko` | Desktop touch, 10 points and sleep/resume confirmed | Stage3 passed desktop touch and a simple browser 10-point test. Stage4 follows panel power and retains firmware in memory; the user confirmed sleep/resume now works. Pen input, Bluetooth connection and wireless pen charging remain unverified. |
-| `oneplus_pogo.ko` | Keyboard/touchpad work; corrected function row under test | Stage6 uses captured keyboard usages for search/Fn, microphone, both touchpad states and lock. Volume down is F11; volume up is F12. Fn restores media actions. See [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
-| `caihong_pen_power.ko` | Manual power/ID diagnostic; hardware validation pending | Stage5 found GPIO10/12/15/85/111 all input/pulldown and I2C NACK. Stage6 adds an explicit one-shot HBOOST/GPIO wake/ID test, always inhibiting charging and cutting supply afterwards. It does not implement wireless charging. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md). |
+| `oneplus_pogo.ko` | Keyboard/touchpad work; corrected function row under test | Stage6a retains the captured keyboard usages for search/Fn, microphone, both touchpad states and lock. Volume down is F11; volume up is F12. Fn restores media actions. See [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
+| `caihong_pen_power.ko` | Boot integration withdrawn | Stage6 produced a reported black screen; the failure point is not yet known. Stage6a omits this module and its DT additions, with the exact Stage5 init/DTB and corrected keyboard mapping. Power/charging tests are paused. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its

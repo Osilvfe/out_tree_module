@@ -197,6 +197,8 @@ def verify_image(blob, baseline, archive_offset, archive_size, expected, dtb):
 
 def build(args):
     require(not args.output.exists(), f"refusing to overwrite {args.output}")
+    require(not args.pen_power_module,
+            "CPS8601 image integration withdrawn after Stage6 black-screen report; omit --pen-power-module")
     baseline = args.baseline.read_bytes()
     require(sha256(baseline) == BASELINE_SHA256, "baseline SHA256 does not match working Wi-Fi v9")
     firmware = args.firmware.read_bytes()
@@ -324,7 +326,7 @@ def main():
     parser.add_argument("--pogo-module", type=Path,
                         help="optional oneplus_pogo module replacement; all other baseline records stay intact")
     parser.add_argument("--pen-power-module", type=Path,
-                        help="optional manual CPS8601 power/ID diagnostic with dedicated PMIC-Glink DT child")
+                        help="temporarily disabled after the Stage6 boot regression")
     parser.add_argument("--firmware", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()

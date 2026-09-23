@@ -4,6 +4,26 @@ The OPN2402 pen has not yet been confirmed powered, discovered over Bluetooth
 or reporting input. The user has confirmed stage4 touchscreen suspend/resume.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
+## Stage6 withdrawn; Stage6a boot recovery
+
+The user reported a black screen from power-on after flashing Stage6, with
+no visible kernel log at all. This does not locate the failure at module
+insertion; the DT change or an earlier boot/display failure remain possible.
+Wi-Fi uses a random MAC and the current IP was unknown, so SSH availability and Wi-Fi failure
+have **not** been established. The old image synchronously inserted
+`caihong_pen_power.ko` before `switch_root`. Even without triggering
+`probe_once`, module registration creates devices/links and changes GPIO
+configuration. The host ACK/sequence tests did not exercise actual device
+registration or the tablet's boot path. No log currently proves a specific
+lockup or display failure.
+
+Stage6a removes that init hook, the module payload, `/pmic-glink/pen-power`
+and the added hub-3 phandle. Its init and DTB are byte-identical to Stage5;
+all archive records except the corrected pogo module and passive helper are
+also identical. `--pen-power-module` now fails before reading/building an
+image. Confirm boot recovery first. The source below remains experimental;
+do not run the historical power-test commands until integration is diagnosed.
+
 ## Observed communication
 
 The original helper used the removed `/sys/class/i2c-adapter` class. After
@@ -40,8 +60,8 @@ automatic firmware-flashing or charging-enablement steps just to read an ID.
 
 Stage5 lacked this sequencing. The user's GPIO snapshot shows all five pins
 as input/low/pulldown, including GPIO10/15/111. This establishes the missing
-GPIO control; it does not measure HBOOST voltage. Stage6 implements a manual
-bounded identification experiment. Hardware results are still pending.
+GPIO control; it does not measure HBOOST voltage. The withdrawn Stage6 attempted a manual
+bounded identification experiment; it has no successful hardware result.
 
 ## HBOOST protocol and integration
 
@@ -72,7 +92,7 @@ Paths relative to the stock tree `external/oneplus-sm8650-pad-pro`:
 Mainline references are `drivers/i2c/busses/i2c-qcom-geni.c`,
 `drivers/pinctrl/qcom/pinctrl-msm.c` and `drivers/soc/qcom/pmic_glink.c`.
 
-## Stage6 manual power/ID diagnostic
+## Withdrawn Stage6 design (historical; do not run)
 
 The module creates the dedicated `/pmic-glink/pen-power` DT child under the
 actual, bound PMIC-Glink platform device. A managed supplier link orders probe,
@@ -82,7 +102,7 @@ script adds only this child and a unique hub-3 phandle, in addition to the
 existing touch properties. Kernel code and SC8547 are unchanged.
 
 At registration it requests GPIO111 high first, GPIO10/15/85 low, GPIO12 input
-with pull-up. It sends **no HBOOST request at boot**. Root can explicitly run:
+with pull-up. It sends **no HBOOST request at boot**. The historical test command was:
 
 ```sh
 sudo caihong-pen-status --probe-power

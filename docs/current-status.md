@@ -62,11 +62,16 @@ covering the current layout and OF-node fallback. It can be run directly on
 stage4 without reflashing. CPS chip identification remains unconfirmed.
 After the path correction, the user reported errno 6 (`ENXIO`) from the CPS
 read: the adapter is found but the transaction receives no acknowledgement.
-The user then reported GPIO10/12/15/85/111 all input/low/pulldown. Stage6 adds
-`caihong_pen_power.ko`, a manual bounded HBOOST/GPIO power/wake/ID test with
-charging inhibited and supply cut afterwards. The helper defaults to cached
-status; `--probe-power` explicitly requests one attempt. Software checks pass,
-but a chip ID, working charging and pen input remain unconfirmed.
+The user then reported GPIO10/12/15/85/111 all input/low/pulldown. Stage6 added
+`caihong_pen_power.ko` and its boot-time registration, but the user reported a
+black screen from power-on with no visible kernel log. Stage6 is withdrawn.
+No SSH/IP observation or boot log
+has established whether this is an init hang, display failure or another
+fault. Stage6a omits the CPS module/DT additions and restores the exact Stage5
+init and DTB while retaining the corrected pogo module. Only pogo and the
+passive helper differ from Stage5's archive records. Software checks pass;
+boot recovery requires a device test. CPS power testing remains paused, and
+chip identification, charging and pen input remain unconfirmed.
 See [CPS8601 bring-up](cps8601-bringup.md).
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
@@ -171,7 +176,8 @@ microphone, touchpad toggle and lock. Captured keyboard usages are respectively
 keyboard Fn held across media reports and corrects volume down/up to F11/F12.
 Host tests and module compilation pass; hardware verification is pending.
 See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
-Stage6 preserves the exact tested stage4 touch module and v9 Wi-Fi payload.
+Stage6a preserves the exact tested stage4 touch module and v9 Wi-Fi payload;
+its init and DTB match Stage5 byte for byte.
 
 ## Restart criteria
 

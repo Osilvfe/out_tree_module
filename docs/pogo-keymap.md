@@ -1,11 +1,19 @@
 # Caihong pogo keyboard: desktop function row
 
-Stage6 test image (hardware validation pending):
+Stage6a boot-recovery image (hardware validation pending):
 
 ```text
-mainline-boot-v2-stage6-pogo-pen-power-wifi-v9.img
-sha256: 06c3aadddd45ddacd9c7c4060697dc10ac53c9f367c2394711ef593d74b6e6bd
+mainline-boot-v2-stage6a-pogo-only-wifi-v9.img
+sha256: fb626f979c611de79f2c9149eebaf761c6f2de93e186432f3992edf4dec5c137
 ```
+
+Stage6 was withdrawn after the user reported a black screen from power-on
+with no visible kernel log. Stage6a
+removes the CPS8601 module and its DT additions, and restores the **exact
+Stage5 init and DTB bytes**. It keeps the corrected Stage6 pogo module. Only
+the pogo module and passive status helper differ from Stage5's CPIO records.
+Boot recovery still needs confirmation on the tablet; the specific Stage6
+failure has not been established from logs.
 
 The user confirmed `KEY_BACK` for Esc and `KEY_SYSRQ` for screenshot.
 Stage5's vendor consumer-page assumptions did not match this keyboard:
@@ -63,20 +71,15 @@ example, does not add microphone support.
 
 ## Build the test image
 
-Keep the already-tested stage4 touch module. Compile the pogo and pen
-diagnostic modules:
+Keep the already-tested stage4 touch module. Compile only the pogo module:
 
 ```sh
-mkdir -p build/nt36532e-stage6/module/{pogo,charging}
+mkdir -p build/nt36532e-stage6/module/pogo
 cp external/out_tree_module-sc8547/pogo/oneplus_pogo.c \
     build/nt36532e-stage6/module/pogo/
-cp external/out_tree_module-sc8547/charging/caihong_pen_power.c \
-    build/nt36532e-stage6/module/charging/
 cat > build/nt36532e-stage6/module/Makefile <<'EOF'
 obj-m += oneplus_pogo.o
 oneplus_pogo-y := pogo/oneplus_pogo.o
-obj-m += caihong_pen_power.o
-caihong_pen_power-y := charging/caihong_pen_power.o
 EOF
 make -C linux/out M="$PWD/build/nt36532e-stage6/module" \
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
@@ -85,18 +88,15 @@ python3 external/out_tree_module-sc8547/scripts/build-nt36532e-test.py \
     --baseline mainline-boot-v2-wifi-deferred-hmt1-v9-official-bdf.img \
     --module build/nt36532e-stage4/module/nt36532e_ts.ko \
     --pogo-module build/nt36532e-stage6/module/oneplus_pogo.ko \
-    --pen-power-module build/nt36532e-stage6/module/caihong_pen_power.ko \
     --firmware firmware-assets/novatek/DT-novatek-nt36532.bin \
-    --output mainline-boot-v2-stage6-pogo-pen-power-wifi-v9.img
+    --output mainline-boot-v2-stage6a-pogo-only-wifi-v9.img
 ```
 
 The optional `--pogo-module` allows replacement of exactly
 `lib/modules/oneplus_pogo.ko`, in addition to the existing init hook/touch
 payload. The builder checks the module's name, vermagic and dependencies,
 records the old/new module hashes, and verifies all remaining original archive
-records byte for byte. Stage6 uses the exact stage4 touch module and preserves
+records byte for byte. Stage6a uses the exact stage4 touch module and preserves
 the v9 kernel outside initramfs, WLAN modules/firmware and WLAN init commands.
-The optional `--pen-power-module` adds a dedicated PMIC-Glink DT child and a
-hub-3 phandle, plus a manual power/ID diagnostic module. Its init hook holds
-charging inhibited and supply off; a test requires an explicit command.
-See [CPS8601 investigation and test](cps8601-bringup.md).
+`--pen-power-module` is currently rejected following the Stage6 boot regression.
+The CPS8601 boot hook has been removed. See [CPS8601 investigation](cps8601-bringup.md).
