@@ -15,7 +15,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 | Driver | Status | Hardware state |
 | --- | --- | --- |
-| `nt36532e_ts.ko` | Usable | Caihong NT36532E display and pen path is integrated with the companion kernel DTS. |
+| `nt36532e_ts.ko` | Awaiting hardware validation | SPI touch/pen driver and Caihong DTS are integrated. Stage1 omitted module loading; stage2 fixes packaging on the working Wi-Fi v9 baseline. Touch, pen and resume are not yet confirmed. |
 | `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
@@ -27,6 +27,11 @@ The touchscreen driver is written against the DTS currently used by Caihong:
 `firmware-name`, standard touchscreen coordinate transform properties, and
 optional `novatek,pen-support`. The matching 249856-byte no-flash image is
 installed as `novatek/DT-novatek-nt36532.bin` by the Caihong firmware setup.
+Use the pinned-baseline builder described in
+[`docs/nt36532e-bringup.md`](docs/nt36532e-bringup.md) for the current touch test.
+It preserves v9's kernel code, modules, WLAN firmware and deferred WLAN load
+sequence, and verifies the contents of the final boot image. The default
+project ramdisk is not the validated Wi-Fi baseline.
 
 The latest project checkpoint and hardware caveats are summarized in
 [`docs/current-status.md`](docs/current-status.md). The companion kernel tree
@@ -61,7 +66,8 @@ sc8547_cp.ko
 
 ## Touchscreen DTS
 
-The existing node is sufficient. Uncomment the pen flag when testing stylus:
+The current test node includes the reset GPIO and enables pen support; both
+touch and pen still need hardware validation:
 
 ```dts
 &spi4 {

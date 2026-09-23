@@ -1,6 +1,6 @@
 # Caihong out-of-tree driver status
 
-Status date: 2026-09-21.
+Status date: 2026-09-23.
 
 This repository carries Caihong drivers that are not yet upstream and archives
 their bring-up evidence. The companion kernel tree remains the integration
@@ -8,6 +8,24 @@ tree; device-specific code is kept in dedicated Caihong files wherever the
 generic Qualcomm drivers require a small hook. The SC8547 charging work is
 paused at the bounded Stage 7D13 checkpoint and is not a production charging
 implementation.
+
+## NT36532E touchscreen and Wi-Fi baseline
+
+The user confirmed Wi-Fi connection and normal use with
+`mainline-boot-v2-wifi-deferred-hmt1-v9-official-bdf.img`. Resume is somewhat
+slow; longer-term behavior remains to be observed.
+
+The first NT36532E image was not a valid driver test: its actual `/init` did
+not insert `nt36532e_ts.ko`. It also used a different WLAN init sequence and
+different AMSS, M3 and BDF files from the working v9 image. Stage1 is withdrawn.
+
+Stage2 is built directly from the pinned v9 image. It adds touch loading,
+firmware, reset and pen DT properties while preserving the v9 kernel outside
+its initramfs, all existing module/firmware records and the original WLAN
+commands. Image contents and module vermagic have been checked; hardware
+boot, touch/pen, Wi-Fi regression and suspend/resume tests remain pending.
+See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
+checksums and the logs needed to distinguish module insertion from probe.
 
 ## SC8547
 
