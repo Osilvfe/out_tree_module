@@ -39,6 +39,8 @@
 #define NVT_G_DLM_CSUM_ADDR 0x1fb504
 #define NVT_EVENT_HOST_CMD 0x50
 #define NVT_EVENT_RESET_COMPLETE 0x60
+#define NVT_EVENT_FWINFO 0x78
+#define NVT_EVENTBUF_PROT_HIGH_RESO 0xf1
 #define NVT_RESET_STATE_INIT 0xa0
 #define NVT_RESET_STATE_MAX 0xaf
 #define NVT_CMD_SLEEP 0x11
@@ -54,6 +56,12 @@ struct nt36532e {
 	const char *fw_name;
 	u32 max_x, max_y, max_pressure;
 	bool pen_support, high_res, cascade;
+	bool irq_enabled;
+	u8 fw_version, event_protocol;
+	u8 last_event[NVT_POINT_DATA_LEN + 1];
+	u64 irq_count, event_reads, touch_frames, touch_contacts;
+	u64 spi_errors, checksum_errors, out_of_range, boot_events;
+	int last_error;
 	u8 *tx, *rx;
 	size_t xfer_size;
 };
@@ -342,6 +350,70 @@ static bool nvt_pen_checksum(const u8 *d)
 	want=~sum+1;return want==d[NVT_PEN_DATA_OFFSET+NVT_PEN_DATA_LEN-1];
 }
 
+/* The vendor driver selects the packet layout from FWINFO byte 13, not
+ * from the coordinate range in DT. Reading an event after download also
+ * acknowledges a boot notification that may already have asserted IRQ.
+ */
+static int nvt_read_event(struct nt36532e *ts)
+{
+	int ret;
+
+	memset(ts->last_event, 0, sizeof(ts->last_event));
+	ret = nvt_set_page(ts, NVT_EVENT_BUF_ADDR);
+	if (!ret)
+		ret = nvt_spi_read(ts, ts->last_event, sizeof(ts->last_event));
+	ts->last_error = ret;
+	if (ret) {
+		ts->spi_errors++;
+		if (ts->spi_errors <= 3)
+			dev_warn(&ts->spi->dev, "event read failed: %d\n", ret);
+		return ret;
+	}
+
+	ts->event_reads++;
+	if (ts->event_reads <= 3)
+		dev_info(&ts->spi->dev, "event %llu: %8ph ... checksum=%02x\n",
+			 ts->event_reads, ts->last_event + 1,
+			 ts->last_event[NVT_POINT_CSUM_INDEX]);
+	return 0;
+}
+
+static int nvt_prepare_events(struct nt36532e *ts)
+{
+	u8 info[39];
+	int ret, attempt;
+
+	ret = nvt_read_event(ts);
+	if (ret)
+		return ret;
+
+	for (attempt = 0; attempt < 4; attempt++) {
+		ret = nvt_set_page(ts, NVT_EVENT_BUF_ADDR | NVT_EVENT_FWINFO);
+		if (ret)
+			return ret;
+		memset(info, 0, sizeof(info));
+		info[0] = NVT_EVENT_FWINFO;
+		ret = nvt_spi_read(ts, info, sizeof(info));
+		if (ret)
+			return ret;
+		if (info[1] + info[2] == 0xff)
+			break;
+		msleep(10);
+	}
+	if (attempt == 4)
+		return dev_err_probe(&ts->spi->dev, -EIO,
+				     "invalid firmware info: %02x %02x\n",
+				     info[1], info[2]);
+
+	ts->fw_version = info[1];
+	ts->event_protocol = info[13];
+	ts->high_res = info[13] == NVT_EVENTBUF_PROT_HIGH_RESO;
+	dev_info(&ts->spi->dev, "FW %02x protocol=%02x (%s coordinates) PID=%02x%02x\n",
+		 ts->fw_version, ts->event_protocol,
+		 ts->high_res ? "16-bit" : "12-bit", info[36], info[35]);
+	return 0;
+}
+
 static void nvt_pen_release(struct nt36532e *ts)
 {
 	if(!ts->pen)return;
@@ -364,25 +436,135 @@ static void nvt_report_pen(struct nt36532e *ts,const u8 *d)
 	input_report_key(ts->pen,BTN_STYLUS,d[77]&BIT(0));input_report_key(ts->pen,BTN_STYLUS2,d[77]&BIT(1));input_sync(ts->pen);
 }
 
-static irqreturn_t nvt_irq(int irq,void *data)
+static void nvt_report_touch(struct nt36532e *ts, const u8 *d)
 {
-	struct nt36532e *ts=data;u8 d[NVT_POINT_DATA_LEN+1]={0};unsigned long active=0;int i,ret;
-	mutex_lock(&ts->lock);ret=nvt_set_page(ts,NVT_EVENT_BUF_ADDR);if(ret)goto out;
-	d[0]=0;ret=nvt_spi_read(ts,d,sizeof(d));if(ret||!nvt_point_checksum(d))goto out;
-	for(i=0;i<NVT_MAX_TOUCHES;i++){
-		int pos=1+6*i,id=(d[pos]>>3)-1;u8 state=d[pos]&0x07;u32 x,y,pressure;
-		if(id<0||id>=NVT_MAX_TOUCHES||(state!=0x01&&state!=0x02))continue;
-		if(ts->high_res){x=((u32)d[pos+1]<<8)|d[pos+2];y=((u32)d[pos+3]<<8)|d[pos+4];pressure=d[pos+5]?:1;}
-		else{x=((u32)d[pos+1]<<4)|(d[pos+3]>>4);y=((u32)d[pos+2]<<4)|(d[pos+3]&0x0f);pressure=d[pos+5];if(i<2)pressure+=(u32)d[i+63]<<8;pressure=clamp_val(pressure,1,1000);}
-		if(x>ts->max_x||y>ts->max_y)continue;
-		active|=BIT(id);input_mt_slot(ts->input,id);input_mt_report_slot_state(ts->input,MT_TOOL_FINGER,true);
-		touchscreen_report_pos(ts->input,&ts->prop,x,y,true);input_report_abs(ts->input,ABS_MT_PRESSURE,pressure);
+	int i;
+
+	ts->touch_frames++;
+	for (i = 0; i < NVT_MAX_TOUCHES; i++) {
+		int pos = 1 + 6 * i;
+		int id = (d[pos] >> 3) - 1;
+		u8 state = d[pos] & 0x07;
+		u32 x, y, pressure;
+
+		if (id < 0 || id >= NVT_MAX_TOUCHES ||
+		    (state != 0x01 && state != 0x02))
+			continue;
+		if (ts->high_res) {
+			x = ((u32)d[pos + 1] << 8) | d[pos + 2];
+			y = ((u32)d[pos + 3] << 8) | d[pos + 4];
+			pressure = d[pos + 5] ?: 1;
+		} else {
+			x = ((u32)d[pos + 1] << 4) | (d[pos + 3] >> 4);
+			y = ((u32)d[pos + 2] << 4) | (d[pos + 3] & 0x0f);
+			pressure = d[pos + 5];
+			if (i < 2)
+				pressure += (u32)d[i + 63] << 8;
+			pressure = clamp_val(pressure, 1, 1000);
+		}
+		if (x >= ts->max_x || y >= ts->max_y) {
+			ts->out_of_range++;
+			continue;
+		}
+		ts->touch_contacts++;
+		input_mt_slot(ts->input, id);
+		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
+		touchscreen_report_pos(ts->input, &ts->prop, x, y, true);
+		input_report_abs(ts->input, ABS_MT_PRESSURE, pressure);
 	}
-	input_mt_sync_frame(ts->input);input_report_key(ts->input,BTN_TOUCH,!!active);input_sync(ts->input);
-	if(ts->pen_support)nvt_report_pen(ts,d);
-out:
-	mutex_unlock(&ts->lock);return IRQ_HANDLED;
+	/* DROP_UNUSED retires lifted contacts before pointer/BTN_TOUCH emulation. */
+	input_mt_sync_frame(ts->input);
+	input_sync(ts->input);
 }
+
+static void nvt_process_event(struct nt36532e *ts)
+{
+	const u8 *d = ts->last_event;
+
+	if (nvt_read_event(ts))
+		return;
+	if (d[1] == 0x77 && d[2] == 0x77 && d[3] == 0x77 &&
+	    d[4] == 0x77 && d[5] == 0x77 && d[6] == 0x77) {
+		ts->boot_events++;
+		return;
+	}
+	if (nvt_point_checksum(d)) {
+		nvt_report_touch(ts, d);
+	} else {
+		ts->checksum_errors++;
+		if (ts->checksum_errors <= 3)
+			dev_warn(&ts->spi->dev, "touch checksum mismatch: %8ph ... %02x\n",
+				 d + 1, d[NVT_POINT_CSUM_INDEX]);
+	}
+	/* The touch and pen packets have independent checksums in the vendor path. */
+	if (ts->pen_support)
+		nvt_report_pen(ts, d);
+}
+
+static irqreturn_t nvt_irq(int irq, void *data)
+{
+	struct nt36532e *ts = data;
+
+	mutex_lock(&ts->lock);
+	ts->irq_count++;
+	nvt_process_event(ts);
+	mutex_unlock(&ts->lock);
+	return IRQ_HANDLED;
+}
+
+static void nvt_start_events(struct nt36532e *ts)
+{
+	/* Caller holds the mutex. Arm first, then read once: this acknowledges an
+	 * already-low IRQ without losing a falling edge between drain and enable.
+	 * Any concurrent IRQ thread waits until this initial read is complete.
+	 */
+	enable_irq(ts->spi->irq);
+	ts->irq_enabled = true;
+	nvt_process_event(ts);
+}
+
+static ssize_t touch_stats_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct nt36532e *ts = dev_get_drvdata(dev);
+	ssize_t len;
+
+	mutex_lock(&ts->lock);
+	len = sysfs_emit(buf,
+		"irq=%llu reads=%llu frames=%llu contacts=%llu spi_errors=%llu "
+		"checksum_errors=%llu out_of_range=%llu boot_events=%llu "
+		"last_error=%d enabled=%u fw=%02x protocol=%02x high_res=%u\n",
+		ts->irq_count, ts->event_reads, ts->touch_frames, ts->touch_contacts,
+		ts->spi_errors, ts->checksum_errors, ts->out_of_range, ts->boot_events,
+		ts->last_error, ts->irq_enabled, ts->fw_version, ts->event_protocol,
+		ts->high_res);
+	mutex_unlock(&ts->lock);
+	return len;
+}
+static DEVICE_ATTR_RO(touch_stats);
+
+static ssize_t last_event_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct nt36532e *ts = dev_get_drvdata(dev);
+	ssize_t len = 0;
+	int i;
+
+	mutex_lock(&ts->lock);
+	for (i = 0; i < sizeof(ts->last_event); i++)
+		len += sysfs_emit_at(buf, len, "%02x%c", ts->last_event[i],
+				    i == sizeof(ts->last_event) - 1 ? '\n' : ' ');
+	mutex_unlock(&ts->lock);
+	return len;
+}
+static DEVICE_ATTR_RO(last_event);
+
+static struct attribute *nvt_attrs[] = {
+	&dev_attr_touch_stats.attr,
+	&dev_attr_last_event.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nvt);
 
 static int nvt_input_init(struct nt36532e *ts)
 {
@@ -390,7 +572,7 @@ static int nvt_input_init(struct nt36532e *ts)
 	ts->input=devm_input_allocate_device(dev);if(!ts->input)return -ENOMEM;
 	ts->input->name="Novatek NT36532E Touchscreen";ts->input->id.bustype=BUS_SPI;
 	input_set_abs_params(ts->input,ABS_MT_POSITION_X,0,ts->max_x,0,0);input_set_abs_params(ts->input,ABS_MT_POSITION_Y,0,ts->max_y,0,0);input_set_abs_params(ts->input,ABS_MT_PRESSURE,0,1000,0,0);input_set_capability(ts->input,EV_KEY,BTN_TOUCH);__set_bit(INPUT_PROP_DIRECT,ts->input->propbit);
-	touchscreen_parse_properties(ts->input,true,&ts->prop);ret=input_mt_init_slots(ts->input,NVT_MAX_TOUCHES,INPUT_MT_DIRECT);if(ret)return ret;ret=input_register_device(ts->input);if(ret||!ts->pen_support)return ret;
+	touchscreen_parse_properties(ts->input,true,&ts->prop);ret=input_mt_init_slots(ts->input,NVT_MAX_TOUCHES,INPUT_MT_DIRECT|INPUT_MT_DROP_UNUSED);if(ret)return ret;ret=input_register_device(ts->input);if(ret||!ts->pen_support)return ret;
 	ts->pen=devm_input_allocate_device(dev);if(!ts->pen)return -ENOMEM;
 	ts->pen->name="Novatek NT36532E Pen";ts->pen->id.bustype=BUS_SPI;
 	input_set_abs_params(ts->pen,ABS_X,0,ts->max_x,0,0);input_set_abs_params(ts->pen,ABS_Y,0,ts->max_y,0,0);input_set_abs_params(ts->pen,ABS_PRESSURE,0,ts->max_pressure,0,0);input_set_abs_params(ts->pen,ABS_TILT_X,-127,127,0,0);input_set_abs_params(ts->pen,ABS_TILT_Y,-127,127,0,0);input_set_abs_params(ts->pen,ABS_DISTANCE,0,65535,0,0);
@@ -400,32 +582,100 @@ static int nvt_input_init(struct nt36532e *ts)
 
 static int nt36532e_probe(struct spi_device *spi)
 {
-	struct nt36532e *ts;int ret;
-	ts=devm_kzalloc(&spi->dev,sizeof(*ts),GFP_KERNEL);if(!ts)return -ENOMEM;ts->spi=spi;mutex_init(&ts->lock);spi_set_drvdata(spi,ts);
-	ts->xfer_size=NVT_XFER_LEN+2;ts->tx=devm_kmalloc(&spi->dev,ts->xfer_size,GFP_KERNEL);ts->rx=devm_kmalloc(&spi->dev,ts->xfer_size,GFP_KERNEL);if(!ts->tx||!ts->rx)return -ENOMEM;
-	ts->reset_gpio=devm_gpiod_get_optional(&spi->dev,"reset",GPIOD_OUT_LOW);if(IS_ERR(ts->reset_gpio))return PTR_ERR(ts->reset_gpio);
-	if(device_property_read_u32(&spi->dev,"touchscreen-size-x",&ts->max_x))ts->max_x=21200;if(device_property_read_u32(&spi->dev,"touchscreen-size-y",&ts->max_y))ts->max_y=30000;if(device_property_read_u32(&spi->dev,"touchscreen-max-pressure",&ts->max_pressure))ts->max_pressure=4095;
-	ts->pen_support=device_property_read_bool(&spi->dev,"novatek,pen-support");ts->high_res=ts->max_x>4095||ts->max_y>4095;if(device_property_read_string(&spi->dev,"firmware-name",&ts->fw_name))ts->fw_name="novatek/DT-novatek-nt36532.bin";
-	spi->mode=SPI_MODE_0;spi->bits_per_word=8;ret=spi_setup(spi);if(ret)return ret;
-	nvt_hw_reset(ts);mutex_lock(&ts->lock);ret=nvt_detect(ts);if(!ret)ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(ret)return ret;
-	ret=nvt_input_init(ts);if(ret)return ret;
-	return devm_request_threaded_irq(&spi->dev,spi->irq,NULL,nvt_irq,IRQF_ONESHOT|IRQF_TRIGGER_FALLING,dev_name(&spi->dev),ts);
+	struct nt36532e *ts;
+	int ret;
+
+	ts = devm_kzalloc(&spi->dev, sizeof(*ts), GFP_KERNEL);
+	if (!ts)
+		return -ENOMEM;
+	ts->spi = spi;
+	mutex_init(&ts->lock);
+	spi_set_drvdata(spi, ts);
+	ts->xfer_size = NVT_XFER_LEN + 2;
+	ts->tx = devm_kmalloc(&spi->dev, ts->xfer_size, GFP_KERNEL);
+	ts->rx = devm_kmalloc(&spi->dev, ts->xfer_size, GFP_KERNEL);
+	if (!ts->tx || !ts->rx)
+		return -ENOMEM;
+	ts->reset_gpio = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(ts->reset_gpio))
+		return dev_err_probe(&spi->dev, PTR_ERR(ts->reset_gpio), "reset GPIO\n");
+	if (device_property_read_u32(&spi->dev, "touchscreen-size-x", &ts->max_x))
+		ts->max_x = 21200;
+	if (device_property_read_u32(&spi->dev, "touchscreen-size-y", &ts->max_y))
+		ts->max_y = 30000;
+	if (device_property_read_u32(&spi->dev, "touchscreen-max-pressure", &ts->max_pressure))
+		ts->max_pressure = 4095;
+	ts->pen_support = device_property_read_bool(&spi->dev, "novatek,pen-support");
+	if (device_property_read_string(&spi->dev, "firmware-name", &ts->fw_name))
+		ts->fw_name = "novatek/DT-novatek-nt36532.bin";
+	spi->mode = SPI_MODE_0;
+	spi->bits_per_word = 8;
+	ret = spi_setup(spi);
+	if (ret)
+		return ret;
+	nvt_hw_reset(ts);
+	mutex_lock(&ts->lock);
+	ret = nvt_detect(ts);
+	if (!ret)
+		ret = nvt_download_fw(ts);
+	if (!ret)
+		ret = nvt_prepare_events(ts);
+	mutex_unlock(&ts->lock);
+	if (ret)
+		return ret;
+	ret = nvt_input_init(ts);
+	if (ret)
+		return ret;
+	ret = devm_request_threaded_irq(&spi->dev, spi->irq, NULL, nvt_irq,
+			IRQF_ONESHOT | IRQF_TRIGGER_FALLING | IRQF_NO_AUTOEN,
+			dev_name(&spi->dev), ts);
+	if (ret)
+		return dev_err_probe(&spi->dev, ret, "request touch IRQ\n");
+	mutex_lock(&ts->lock);
+	nvt_start_events(ts);
+	mutex_unlock(&ts->lock);
+	dev_info(&spi->dev, "event stream armed: IRQ %d, falling edge, startup event read\n",
+		 spi->irq);
+	return 0;
 }
 
 static int nt36532e_suspend(struct device *dev)
 {
-	struct spi_device *spi=to_spi_device(dev);struct nt36532e *ts=spi_get_drvdata(spi);u8 cmd[2]={NVT_EVENT_HOST_CMD,NVT_CMD_SLEEP};
-	disable_irq(spi->irq);mutex_lock(&ts->lock);if(!nvt_set_page(ts,NVT_EVENT_BUF_ADDR))nvt_spi_write(ts,cmd,sizeof(cmd));nvt_pen_release(ts);mutex_unlock(&ts->lock);return 0;
+	struct spi_device *spi = to_spi_device(dev);
+	struct nt36532e *ts = spi_get_drvdata(spi);
+	u8 cmd[2] = { NVT_EVENT_HOST_CMD, NVT_CMD_SLEEP };
+
+	if (ts->irq_enabled)
+		disable_irq(spi->irq);
+	mutex_lock(&ts->lock);
+	ts->irq_enabled = false;
+	if (!nvt_set_page(ts, NVT_EVENT_BUF_ADDR))
+		nvt_spi_write(ts, cmd, sizeof(cmd));
+	input_mt_sync_frame(ts->input);
+	input_sync(ts->input);
+	nvt_pen_release(ts);
+	mutex_unlock(&ts->lock);
+	return 0;
 }
 static int nt36532e_resume(struct device *dev)
 {
-	struct spi_device *spi=to_spi_device(dev);struct nt36532e *ts=spi_get_drvdata(spi);int ret;
-	nvt_hw_reset(ts);mutex_lock(&ts->lock);ret=nvt_download_fw(ts);mutex_unlock(&ts->lock);if(!ret)enable_irq(spi->irq);return ret;
+	struct nt36532e *ts = dev_get_drvdata(dev);
+	int ret;
+
+	nvt_hw_reset(ts);
+	mutex_lock(&ts->lock);
+	ret = nvt_download_fw(ts);
+	if (!ret)
+		ret = nvt_prepare_events(ts);
+	if (!ret)
+		nvt_start_events(ts);
+	mutex_unlock(&ts->lock);
+	return ret;
 }
 static DEFINE_SIMPLE_DEV_PM_OPS(nt36532e_pm,nt36532e_suspend,nt36532e_resume);
 static const struct of_device_id nt36532e_of_match[]={{.compatible="novatek,nt36532e"},{}};
 MODULE_DEVICE_TABLE(of,nt36532e_of_match);
-static struct spi_driver nt36532e_driver={.driver={.name="nt36532e",.of_match_table=nt36532e_of_match,.pm=pm_sleep_ptr(&nt36532e_pm)},.probe=nt36532e_probe};
+static struct spi_driver nt36532e_driver={.driver={.name="nt36532e",.of_match_table=nt36532e_of_match,.pm=pm_sleep_ptr(&nt36532e_pm),.dev_groups=nvt_groups},.probe=nt36532e_probe};
 module_spi_driver(nt36532e_driver);
 MODULE_DESCRIPTION("Novatek NT36532E no-flash SPI touchscreen and pen");
 MODULE_LICENSE("GPL");

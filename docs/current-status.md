@@ -22,8 +22,17 @@ different AMSS, M3 and BDF files from the working v9 image. Stage1 is withdrawn.
 Stage2 is built directly from the pinned v9 image. It adds touch loading,
 firmware, reset and pen DT properties while preserving the v9 kernel outside
 its initramfs, all existing module/firmware records and the original WLAN
-commands. Image contents and module vermagic have been checked; hardware
-boot, touch/pen, Wi-Fi regression and suspend/resume tests remain pending.
+commands. Stage2 hardware logs now confirm cascade detection, firmware loading
+(16 partitions), input-device registration and binding to `spi0.0`. The user
+also confirmed increasing IRQ counts and coordinate/pressure/BTN_TOUCH events
+in `evtest`, while taps in the graphical desktop still have no effect. Pen
+has not been connected or tested.
+
+Stage3 fixes a source-confirmed missing multitouch slot release, selects the
+coordinate layout from firmware information, and adds read-only event counters
+and the latest packet. It retains the same v9 Wi-Fi payload and init sequence.
+Module compilation, host packet tests and final-image checks pass; desktop
+clicks, pen and suspend/resume still need hardware validation.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

@@ -1,7 +1,8 @@
 # Caihong NT36532E bring-up
 
-Status: 2026-09-23. Stage2 is packaged and checked, awaiting device testing.
-No successful touchscreen or pen hardware test has been recorded yet.
+Status: 2026-09-23. Stage2 touch interrupts and input events are confirmed, but
+desktop taps have no effect. Stage3 is packaged and checked, awaiting device
+testing. Pen has not been connected or tested.
 
 ## Stage1 packaging failure
 
@@ -21,7 +22,43 @@ mainline-boot-v2-nt36532e-stage1.img
 sha256: 2bd4ff1cca3892414f265704e1a96e0f657865555b37f70f3ab74da5fe8b324a
 ```
 
-## Stage2 image
+## Stage3 event handling
+
+The stage2 screenshot confirms NT36532E cascade detection, all 16 firmware
+partitions loaded, both input devices registered, and `spi0.0` bound. The
+user confirmed that the `spi0.0` interrupt count increases when touching and
+that `evtest` reports codes 53/54 (MT coordinates), 58 (MT pressure), 330
+(BTN_TOUCH), and 0/1/24 (single-touch coordinates/pressure). The reported
+failure is in the graphical desktop, not merely lack of actions in a console.
+This establishes the IRQ/SPI/input path; it does not establish correct
+multitouch release or desktop handling.
+
+The previous code called `input_mt_sync_frame()` without
+`INPUT_MT_DROP_UNUSED` and never explicitly released a slot. Consequently,
+lifted contacts remained active in the input core. Stage3 enables slot
+release and lets the input core derive BTN_TOUCH consistently from the active
+slots, including on suspend. This is a confirmed code defect; whether it
+fully explains the desktop symptom remains to be checked on the device.
+
+Stage3 also follows the vendor `nvt_get_fw_info_noflash()` layout selection:
+FWINFO byte 13 equal to `0xf1` selects 16-bit coordinates, otherwise the
+legacy 12-bit layout is used. It reads boot events around firmware-info
+setup and IRQ enable, including after resume, and handles touch/pen checksum
+results independently. Pen interaction is still unverified.
+
+Read-only `touch_stats` and `last_event` attributes under the SPI device expose
+IRQ/read/valid-frame/contact/error counts and the latest 121-byte event. Reads
+of these attributes do not perform SPI transactions or consume new events.
+Only the first three events and first three failures are printed in dmesg.
+
+```text
+mainline-boot-v2-nt36532e-stage3-events-wifi-v9.img
+sha256: 8a1694c88ce131cd9848322ce7b134ab779fbdda00c6c05b7ae00a2c7b87f073
+```
+
+## Preserved Wi-Fi baseline
+
+The previous stage2 image is retained for comparison:
 
 ```text
 mainline-boot-v2-nt36532e-stage2-wifi-v9.img
@@ -72,21 +109,21 @@ From the Caihong project directory, with this repository checked out as
 matching prepared kernel build:
 
 ```sh
-mkdir -p build/nt36532e-stage2/module/touchscreen
+mkdir -p build/nt36532e-stage3/module/touchscreen
 cp external/out_tree_module-sc8547/touchscreen/nt36532e.c \
-    build/nt36532e-stage2/module/touchscreen/
-cat > build/nt36532e-stage2/module/Makefile <<'EOF'
+    build/nt36532e-stage3/module/touchscreen/
+cat > build/nt36532e-stage3/module/Makefile <<'EOF'
 obj-m += nt36532e_ts.o
 nt36532e_ts-y := touchscreen/nt36532e.o
 EOF
-make -C linux/out M="$PWD/build/nt36532e-stage2/module" \
+make -C linux/out M="$PWD/build/nt36532e-stage3/module" \
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
 
 python3 external/out_tree_module-sc8547/scripts/build-nt36532e-test.py \
     --baseline mainline-boot-v2-wifi-deferred-hmt1-v9-official-bdf.img \
-    --module build/nt36532e-stage2/module/nt36532e_ts.ko \
+    --module build/nt36532e-stage3/module/nt36532e_ts.ko \
     --firmware firmware-assets/novatek/DT-novatek-nt36532.bin \
-    --output mainline-boot-v2-nt36532e-stage2-wifi-v9.img
+    --output mainline-boot-v2-nt36532e-stage3-events-wifi-v9.img
 ```
 
 The builder refuses to overwrite an existing image. Requirements: Python 3,
@@ -101,6 +138,20 @@ signatures disabled. The checked module vermagic is:
 Vermagic is a compatibility guard, not a substitute for using the matching
 kernel build. Do not rebuild/replace the baseline kernel as part of this test.
 Changing the module build or debug paths may change the resulting image hash.
+To reproduce historical stage2, use repository commit `770cb12` and its
+documented module build directory instead.
+
+Host packet checks run with:
+
+```sh
+python3 external/out_tree_module-sc8547/scripts/test-nt36532e-events.py
+```
+
+They compile the actual driver decoder/FWINFO functions with SPI/input sinks
+and fixed wire packets, checking both coordinate formats, corrupt checksums,
+pen dispatch, empty release frames, boot notifications, bounds and SPI errors.
+They passed with undefined-behavior/bounds sanitizers. They do not emulate the
+Linux input core or establish hardware IRQ/desktop behavior.
 
 The firmware was extracted from the stock Caihong `firmware-data-0` property
 in `caihong-oplus-tp-23926_firmware.dtsi`. It is 249856 bytes with SHA256
@@ -108,12 +159,13 @@ in `caihong-oplus-tp-23926_firmware.dtsi`. It is 249856 bytes with SHA256
 
 ## Device checks
 
-After booting stage2, first confirm Wi-Fi still connects. Then collect:
+After booting stage3, first confirm Wi-Fi still connects. Then collect:
 
 ```sh
 sudo dmesg | grep -Ei 'caihong-touch|nt36532|novatek|ath12k'
 lsmod | grep -E 'nt36532|ath12k'
 cat /proc/bus/input/devices
+cat /sys/bus/spi/devices/spi0.0/touch_stats
 ```
 
 `caihong-touch: nt36532e_ts module inserted` means only driver registration
@@ -122,6 +174,21 @@ shows that probe completed. If there is no bound device, retain the associated
 SPI/firmware error logs; do not infer success from `lsmod` alone. The hook
 records both console output and kernel messages, including insertion errors.
 
-If input devices exist but touch is still ineffective, inspect their event
-streams with `evtest` and retain `/proc/interrupts` before and after touching
-the panel. Touch orientation, pen, and suspend/resume need separate tests.
+Touch and lift a finger, then read `touch_stats` again. `frames` counts valid
+touch packets, while `contacts` counts accepted contacts across those frames;
+it is not the number of fingers currently down. `reads` includes startup
+reads, so it may exceed `irq`. Error counters separate SPI failures, bad
+checksums and coordinates outside the configured range. `last_event` retains
+the last read packet for diagnosing persistent errors.
+
+In `evtest`, select **Novatek NT36532E Touchscreen**. Finger down should create
+an `ABS_MT_TRACKING_ID` (code 57), and finger up should emit tracking ID `-1`
+and BTN_TOUCH (code 330) `0`. Stop evtest before testing desktop interaction.
+If those events are correct but the desktop still does not react, run
+`sudo libinput debug-events --device /dev/input/eventN` with the touchscreen's
+actual event number. Look for `TOUCH_DOWN`, `TOUCH_MOTION`, `TOUCH_UP` and
+`TOUCH_FRAME`; also inspect `udevadm info -q property -n /dev/input/eventN`
+for `ID_INPUT_TOUCHSCREEN=1` and seat tags. Avoid a permanent calibration or
+udev override until the event stream and classification are known.
+
+Touch orientation, pen, and suspend/resume need separate hardware tests.

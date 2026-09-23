@@ -6,7 +6,7 @@ touch_log()
 	printf '<6>caihong-touch: %s\n' "$*" > /dev/kmsg
 }
 
-touch_log "stage2 based on Wi-Fi v9; preparing NT36532E"
+touch_log "stage3 based on Wi-Fi v9; preparing NT36532E event stream"
 
 # Arch uses /lib -> usr/lib. Write through the real rootfs path rather than
 # following a possibly absolute /newroot/lib symlink from the initramfs.

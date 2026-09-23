@@ -15,7 +15,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 | Driver | Status | Hardware state |
 | --- | --- | --- |
-| `nt36532e_ts.ko` | Awaiting hardware validation | SPI touch/pen driver and Caihong DTS are integrated. Stage1 omitted module loading; stage2 fixes packaging on the working Wi-Fi v9 baseline. Touch, pen and resume are not yet confirmed. |
+| `nt36532e_ts.ko` | Input events confirmed; desktop clicks under test | Stage2 detects the IC, loads firmware, receives interrupts and reports touch events, but desktop taps do not work. Stage3 fixes missing contact release and adds event diagnostics. Pen remains untested. |
 | `oneplus_pogo.ko` | Usable for bring-up | Pogo keyboard and touchpad protocol, UART transport and input reporting are working; the companion kernel still supplies the DT-selected GENI FIFO mode. |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
