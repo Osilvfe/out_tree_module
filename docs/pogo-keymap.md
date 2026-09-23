@@ -1,6 +1,6 @@
 # Caihong pogo keyboard: desktop function row
 
-Stage6b F4 touchpad-state correction (brief pauses reported; diagnosis ongoing):
+Stage6b F4 touchpad-state correction (brief pauses recorded; diagnosis deferred):
 
 ```text
 mainline-boot-v2-stage6b-pogo-f4-wifi-v9.img
@@ -108,6 +108,11 @@ record the pogo `status` after releasing the key and allowing the worker to
 finish; persistent disable and a brief MCU interruption are different results.
 
 ## Brief pauses while typing
+
+**Known issue, investigation deferred at the user's request.** The user
+considers the pause minor and is resuming pen work. No raw timing capture has
+been supplied. The diagnostic below is retained for later; it is not a
+prerequisite for testing the pen.
 
 The user reports that every key briefly pauses touchpad motion, even after
 turning off **Disable while typing** and then testing with the keyboard

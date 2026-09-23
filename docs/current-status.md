@@ -73,6 +73,14 @@ Stage6a boots without the black screen; the precise failure inside the removed
 integration is still unknown. CPS power testing remains paused, and chip
 identification, charging and pen input remain unconfirmed.
 See [CPS8601 bring-up](cps8601-bringup.md).
+The user has now resumed pen-test preparation and deferred the minor pogo
+pause. Start from the working Stage6b image and its existing Stage4 touch
+module. Pen charge is still unknown; first collect input/Bluetooth status
+with `sudo caihong-pen-status --skip-charger` and establish whether a known
+working stock/compatible device can power the pen. The withdrawn CPS boot
+integration is not reinstated by this change in task priority. If the pen
+cannot be powered elsewhere, the next implementation task is an isolated,
+post-boot CPS identification path before charging or pen-input conclusions.
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
@@ -189,6 +197,11 @@ counters still need a hardware capture; MCU suppression and receive-path
 problems remain hypotheses. The standalone `scripts/caihong-pogo-capture.py`
 collects these on the existing image. Pause-free behavior and the full
 restoration matrix are not confirmed.
+The user considers this brief all-key pause a minor issue and explicitly
+deferred further investigation in favor of pen testing. Keep it as an open
+known issue; no timing capture result has been supplied and the cause is
+unconfirmed. The collector is retained for a future investigation, not a
+required step before pen work.
 See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
 Stage6a preserves the exact tested stage4 touch module and v9 Wi-Fi payload;
 its init and DTB match Stage5 byte for byte. Stage6b changes only the pogo

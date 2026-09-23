@@ -4,6 +4,78 @@ The OPN2402 pen has not yet been confirmed powered, discovered over Bluetooth
 or reporting input. The user has confirmed stage4 touchscreen suspend/resume.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
+## Resumed pen test preparation
+
+The user has deferred the minor all-key touchpad pause and asked to resume
+OPN2402 testing. The working image remains
+`mainline-boot-v2-stage6b-pogo-f4-wifi-v9.img`; it already contains the tested
+Stage4 touch module, pen input device and diagnostics. No new image is needed
+to collect the first status snapshot:
+
+```sh
+sudo caihong-pen-status --skip-charger
+```
+
+This reads `touch_stats`, `pen_stats`, `pen_scan`, the Novatek event device
+names and Bluetooth controller status. The known unpowered CPS NACK does not
+need to be reproduced. Pen charge and access to a stock/compatible charging
+device are still unknown at this checkpoint.
+
+Proceed according to the evidence:
+
+| Check | Current evidence | Next step |
+| --- | --- | --- |
+| Pen power | OPN2402 charge is unknown | If a stock/compatible device is available, confirm it charges and the pen writes there. Otherwise resume CPS power/ID integration first. |
+| Linux Bluetooth | A cached address query previously returned unavailable; controller status is unconfirmed | Inspect helper output. If a controller exists and is powered, do a bounded discovery scan; a missing cached address alone says nothing about pen power. |
+| NT36532E scan protocol | Driver supports types 1–5; OPN2402 mapping is unknown | Obtain the vendor-selected type when possible, then use the existing acknowledged `pen_scan` interface. Default/unconfigured is `-1`, not a retail model ID. |
+| Raw pen input | No hardware pen report confirmed | With a powered pen, test hover, contact, pressure and leaving proximity in `evtest`; compare `pen_stats` before and after. |
+
+For a present, powered Bluetooth controller, discovery can be tested with:
+
+```sh
+sudo bluetoothctl --timeout 15 scan on
+```
+
+Supply the pen address locally when querying `bluetoothctl info`; do not add
+it to public logs or source. Discovery/connection and touch-controller scan
+configuration are separate checkpoints. Stock Android informs the touchscreen
+of a pen type through `pencil_connected`; there is no equivalent automatic
+BlueZ-to-NT36532E bridge in this driver. Bluetooth connection alone therefore
+does not configure Linux pen scanning or establish valid coordinates.
+
+If stock kernel logs are accessible while reconnecting the powered pen,
+`nvt_notify_pencil_type` logs `value = ..., set pencil type to ...`. The latter
+is the controller type after any DT mapping. Reading `pencil_connected`
+returns only a connection boolean and **cannot recover the numeric type**.
+The checked Caihong touch DTS has no `touchpanel,pen-id-map`, but that does not
+identify OPN2402's type or prove that an installed stock image uses identical
+board data. The generic source default of Havon is not a model identification.
+
+Once power and scan setup are established, keep the display awake and run:
+
+```sh
+cat /sys/bus/spi/devices/spi0.0/pen_stats
+sudo evtest
+```
+
+Select **Novatek NT36532E Pen**, then test hovering, drawing with varied
+pressure, lifting the tip and moving out of range. End with Ctrl+C and read
+`pen_stats` again. Expected reports include `ABS_X/Y`, `ABS_PRESSURE`,
+`BTN_TOOL_PEN` and `BTN_TOUCH`; tilt and buttons need separate hardware checks.
+Check that pressure/contact return to zero on lift and tool proximity clears
+when leaving range. The `packets` counter includes no-pen/ID packets, so its
+increase alone is not proof of pen detection: inspect `reports`, `format`,
+`in_range`, coordinates and error counters together.
+
+If no known powered pen is available, further empty pen tests cannot separate
+power from scan configuration. Resume the CPS8601 work as a post-boot manual
+identification experiment with observable registration/probe logs, keeping the
+working boot path intact. The previous Stage6 boot regression remains
+undiagnosed; the withdrawn module is not ready to load unchanged. First prove
+provider registration and an acknowledged power/wake sequence with chip ID
+0x8601, then implement charging separately. An ID read alone does not charge
+the pen.
+
 ## Stage6 withdrawn; Stage6a boot recovery
 
 The user reported a black screen from power-on after flashing Stage6, with
