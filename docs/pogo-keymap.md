@@ -1,6 +1,6 @@
 # Caihong pogo keyboard: desktop function row
 
-Stage6b F4 touchpad-state fix (hardware validation pending):
+Stage6b F4 touchpad-state correction (brief pauses reported; diagnosis ongoing):
 
 ```text
 mainline-boot-v2-stage6b-pogo-f4-wifi-v9.img
@@ -86,8 +86,9 @@ media slot. Host tests exercise these cases, both touchpad states, captured
 usages, Ctrl combinations, the 12-position row, ordinary Esc/Delete, repeated/duplicate reports, unknown
 usages and truncated reports. Tests also inject MCU toggles at both edges,
 preserve enabled/disabled targets, interleave sysfs requests with queued work,
-exercise bounded TX failures and block requeueing during removal. Stage6b
-hardware restoration remains unverified.
+exercise bounded TX failures and block requeueing during removal. The user
+reports a brief pause with Stage6b and clarified that all keys cause a pause.
+Pause-free F4 behavior and the full restoration test matrix remain unverified.
 
 ```sh
 python3 external/out_tree_module-sc8547/scripts/test-pogo-keys.py
@@ -105,6 +106,32 @@ Fn+F4 twice in the desktop. Also test plain F4 while the desktop has disabled
 the touchpad, Alt+F4, normal typing and touchpad clicks. If motion stops,
 record the pogo `status` after releasing the key and allowing the worker to
 finish; persistent disable and a brief MCU interruption are different results.
+
+## Brief pauses while typing
+
+The user reports that every key briefly pauses touchpad motion. The driver's
+restore worker is queued only by changes in the two physical F4 usages;
+ordinary letter presses do not queue it. Desktop disable-while-typing is a
+candidate for the broader pause, but has not yet been confirmed on the tablet.
+Upstream libinput enables this feature by default and ignores function keys,
+Esc and standalone modifiers in its typing filter, so it cannot by itself
+explain a pause on every key, including F4. See
+[`tp_key_ignore_for_dwt` and `tp_keyboard_event`](https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-mt-touchpad.c).
+
+On KDE Plasma, open System Settings → Mouse & Touchpad (Input Devices on
+older versions) → Touchpad and turn off **Disable while typing**, then apply.
+Keep moving a finger and test a letter such as A, F1 and F4 separately on the
+same Stage6b image. If letters stop causing pauses but F4 still pauses, the
+F4-specific firmware correction still needs investigation. This setting
+allows touchpad motion during typing, so incidental palm motion may move the
+pointer.
+
+If pauses remain with that setting off, run `sudo evtest` and select
+**OnePlus Pogo Touchpad** (without `--grab`). Compare raw motion events while
+moving a finger and pressing those same keys: continuous raw events with a
+paused pointer point toward desktop filtering; a gap in raw events requires
+investigating the MCU/driver path. Do not rebuild or change Wi-Fi/touchscreen
+modules to test this desktop setting.
 
 ## Build the test image
 

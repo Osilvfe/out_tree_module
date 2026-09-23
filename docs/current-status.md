@@ -180,8 +180,12 @@ bounded asynchronous restore commands on both physical key edges, preserving
 the requested hardware state (enabled by default, or explicit sysfs setting).
 Fn+F4 remains a desktop `KEY_TOUCHPAD_TOGGLE` and does not change that hardware
 target. Host tests cover both MCU usages, disabled targets, pending sysfs
-updates, TX failures and removal; module compilation passes. Device validation
-of the restoration and any transient motion interruption is pending.
+updates, TX failures and removal; module compilation passes. The user reports
+a brief pause with Stage6b and clarifies that all keys cause a pause. Desktop
+disable-while-typing needs an on-device comparison with that setting off;
+upstream libinput excludes F-keys, so an additional F4 firmware interruption
+remains possible. Pause-free behavior and the full restoration matrix are
+not confirmed.
 See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
 Stage6a preserves the exact tested stage4 touch module and v9 Wi-Fi payload;
 its init and DTB match Stage5 byte for byte. Stage6b changes only the pogo
