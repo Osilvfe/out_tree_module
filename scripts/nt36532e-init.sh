@@ -48,3 +48,13 @@ done
 if [ "$touch_bound" -eq 0 ]; then
 	touch_log "no SPI device bound yet; check nt36532e probe/deferred-probe logs"
 fi
+
+# Registration holds CPS8601 off. Only the explicit probe_once sysfs command
+# performs a bounded power/ID test; there is no charging or firmware update.
+if [ -f /lib/modules/caihong_pen_power.ko ]; then
+	if insmod /lib/modules/caihong_pen_power.ko; then
+		touch_log "pen power diagnostic inserted; manual probe only"
+	else
+		touch_log "ERROR: pen power diagnostic insertion failed"
+	fi
+fi

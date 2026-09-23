@@ -122,3 +122,27 @@ assert "wake/sleep: gpio15   : out low" in output.getvalue()
 assert "out high" not in output.getvalue()  # Exclude other GPIO banks.
 assert "missing pins" not in output.getvalue()
 print("PASS: passive GPIO snapshot selects main TLMM bank without requesting GPIOs")
+
+with tempfile.TemporaryDirectory(prefix="pen-provider-") as temp:
+    root = Path(temp)
+    provider = root / 'sys/bus/platform/devices/caihong-pen-power'
+    provider.mkdir(parents=True)
+    (provider / 'status').write_text('attempted=0 phase=idle\n')
+    (provider / 'probe_once').write_text('')
+    with patch.object(status, 'Path', side_effect=lambda p: root / p.lstrip('/')), \
+            patch.object(status.os, 'open') as opened:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            status.charger_status()
+        assert 'phase=idle' in output.getvalue()
+        assert not (provider / 'probe_once').read_text()
+        with contextlib.redirect_stdout(io.StringIO()):
+            status.charger_status(probe_power=True)
+        assert (provider / 'probe_once').read_text() == '1\n'
+        (provider / 'status').unlink()
+        (provider / 'probe_once').write_text('')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            status.charger_status(probe_power=True)
+        assert 'not bound' in output.getvalue()
+        assert not (provider / 'probe_once').read_text()
+        opened.assert_not_called()
+print('PASS: cached provider skips raw I2C; power test writes only on explicit request to a bound provider')

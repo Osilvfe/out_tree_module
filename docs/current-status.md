@@ -62,9 +62,12 @@ covering the current layout and OF-node fallback. It can be run directly on
 stage4 without reflashing. CPS chip identification remains unconfirmed.
 After the path correction, the user reported errno 6 (`ENXIO`) from the CPS
 read: the adapter is found but the transaction receives no acknowledgement.
-Stock requires HBOOST, GPIO10 supply enable and GPIO15 wake before the ID
-check; that sequence is not implemented in this image. The latest helper
-includes passive TLMM power-pin state. See [CPS8601 bring-up](cps8601-bringup.md).
+The user then reported GPIO10/12/15/85/111 all input/low/pulldown. Stage6 adds
+`caihong_pen_power.ko`, a manual bounded HBOOST/GPIO power/wake/ID test with
+charging inhibited and supply cut afterwards. The helper defaults to cached
+status; `--probe-power` explicitly requests one attempt. Software checks pass,
+but a chip ID, working charging and pen input remain unconfirmed.
+See [CPS8601 bring-up](cps8601-bringup.md).
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
@@ -161,13 +164,14 @@ hardware regression before they should be described as production-ready.
 
 The user subsequently confirmed keyboard use but found Esc ineffective in
 Vim. `evtest` identifies it as `KEY_BACK`; search produced no event and the
-screenshot key reports `KEY_SYSRQ`. Stage5 maps Esc correctly and implements
-search as Fn with a default F1–F12 row in the user-provided physical order.
-The Fn layer restores media/system keycodes; held-key releases retain the code
-chosen at press time. Host tests and module compilation pass; the new keymap
-still needs device validation, especially the inferred fourth-key usage.
-See [pogo keymap](pogo-keymap.md) for the full mapping and reproduction commands.
-Stage5 preserves the tested stage4 touch module and the v9 Wi-Fi payload.
+screenshot key reports `KEY_SYSRQ`. Stage5 exposed raw scancodes and mapped
+most of the row, but its vendor consumer-page assumptions missed search,
+microphone, touchpad toggle and lock. Captured keyboard usages are respectively
+`0x72`, `0x68`, `0x6b`/`0x6c`, and `0x73`. Stage6 uses those actual usages, keeps
+keyboard Fn held across media reports and corrects volume down/up to F11/F12.
+Host tests and module compilation pass; hardware verification is pending.
+See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
+Stage6 preserves the exact tested stage4 touch module and v9 Wi-Fi payload.
 
 ## Restart criteria
 

@@ -15,6 +15,9 @@ sc8547_dual-y := charging/sc8547_dual.o
 obj-m += sc8547_policy_diag.o
 sc8547_policy_diag-y := charging/sc8547_policy_diag.o
 
+obj-m += caihong_pen_power.o
+caihong_pen_power-y := charging/caihong_pen_power.o
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 .PHONY: all clean

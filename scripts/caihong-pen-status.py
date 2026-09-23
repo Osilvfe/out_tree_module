@@ -3,8 +3,10 @@
 """Read touch/pen, Bluetooth and CPS8601 status on Caihong.
 
 Uses only the known I2C hub-3 address 0x41 and documented status registers.
-Does not scan the bus, change GPIOs, enable charging, clear IRQs, flash
-firmware, or pair/connect Bluetooth devices. No optional Python packages.
+Reads cached kernel diagnostic results when present. --probe-power explicitly
+requests one bounded power/wake/ID test with charging inhibited. Does not scan
+the bus, enable charging, clear IRQs, flash firmware, or pair Bluetooth.
+No optional Python packages.
 """
 
 import argparse
@@ -71,7 +73,25 @@ def charger_gpio_status():
     print("CPS8601: GPIO output levels do not measure HBOOST voltage")
 
 
-def charger_status():
+def charger_status(probe_power=False):
+    provider = Path("/sys/bus/platform/devices/caihong-pen-power")
+    if (provider / "status").exists():
+        if probe_power:
+            print("CPS8601: running bounded power/ID test with charging inhibited", flush=True)
+            try:
+                (provider / "probe_once").write_text("1\n")
+            except OSError as error:
+                print(f"CPS8601: power/ID test returned: {error}")
+        try:
+            print("CPS8601 cached power/ID diagnostic:\n" + (provider / "status").read_text().strip())
+        except OSError as error:
+            print(f"CPS8601: cached status unavailable: {error}")
+        print("  valid bits 0..7: chip_id, firmware, mode, irq, VIN, IIN, temperature, EPT")
+        print("  Values are latched during the test; supply is then off. No pen charging implemented.")
+        return
+    if probe_power:
+        print("CPS8601: power diagnostic provider is not bound; check dmesg for caihong-pen-power")
+        return
     adapters = []
     inventory = []
     # The i2c-adapter class was removed; adapters live on the I2C bus.
@@ -143,7 +163,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--address", help="optional pen Bluetooth address; queries cached info only")
     parser.add_argument("--skip-charger", action="store_true", help="skip the I2C register reads")
+    parser.add_argument("--probe-power", action="store_true",
+                        help="explicitly run the kernel's single power/wake/ID test, then cut supply")
     args = parser.parse_args()
+    if args.probe_power and args.skip_charger:
+        parser.error("--probe-power cannot be combined with --skip-charger")
     if args.address and not re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", args.address):
         parser.error("--address must be a six-byte Bluetooth address")
     for device in Path("/sys/bus/spi/devices").glob("spi*.*"):
@@ -166,7 +190,7 @@ def main():
     bluetooth_status(args.address)
     if not args.skip_charger:
         charger_gpio_status()
-        charger_status()
+        charger_status(args.probe_power)
 
 
 if __name__ == "__main__":

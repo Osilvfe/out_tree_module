@@ -38,11 +38,10 @@ wake, waits, and checks chip ID. It next sets protection thresholds and IRQ
 handling before normal charging. A mainline diagnostic should not copy the
 automatic firmware-flashing or charging-enablement steps just to read an ID.
 
-The current image lacks this HBOOST/GPIO sequencing. NACK is consistent with
-an unpowered or sleeping chip; the actual pin and supply states are still
-unconfirmed. The first power experiment should hold charging disallowed,
-perform a bounded power/wake/ID/status check, and restore the disabled state.
-No such active power experiment is implemented or run by the passive helper.
+Stage5 lacked this sequencing. The user's GPIO snapshot shows all five pins
+as input/low/pulldown, including GPIO10/15/111. This establishes the missing
+GPIO control; it does not measure HBOOST voltage. Stage6 implements a manual
+bounded identification experiment. Hardware results are still pending.
 
 ## HBOOST protocol and integration
 
@@ -72,3 +71,63 @@ Paths relative to the stock tree `external/oneplus-sm8650-pad-pro`:
 
 Mainline references are `drivers/i2c/busses/i2c-qcom-geni.c`,
 `drivers/pinctrl/qcom/pinctrl-msm.c` and `drivers/soc/qcom/pmic_glink.c`.
+
+## Stage6 manual power/ID diagnostic
+
+The module creates the dedicated `/pmic-glink/pen-power` DT child under the
+actual, bound PMIC-Glink platform device. A managed supplier link orders probe,
+suspend and removal against that provider. It also links to the GENI I2C
+controller and reserves hub-3 address 0x41 using a dummy client. The packaging
+script adds only this child and a unique hub-3 phandle, in addition to the
+existing touch properties. Kernel code and SC8547 are unchanged.
+
+At registration it requests GPIO111 high first, GPIO10/15/85 low, GPIO12 input
+with pull-up. It sends **no HBOOST request at boot**. Root can explicitly run:
+
+```sh
+sudo caihong-pen-status --probe-power
+```
+
+The command sets 5800 mV through owner 32785 and waits for a validated ACK,
+raises GPIO10, waits 10 ms, raises GPIO15, waits 2500 ms, then reads chip ID.
+Only ID 0x8601 allows reads of firmware, mode, IRQ flags, VIN/IIN/temperature
+and EPT. Register selectors are big-endian and values are little-endian,
+matching stock's per-byte access. There are no CPS configuration, TX, IRQ-clear
+or firmware writes. GPIO111 stays high for the entire test.
+
+On completion or failure it lowers wake, scan and supply and requests the
+minimum 2000 mV setting if the transport is still unambiguous. That setting is
+not a regulator-off claim. The physical supply switch is disabled first.
+A timeout, send failure or transport loss during the test latches `poisoned`:
+no further request can consume a delayed response as its own ACK. Callbacks
+never sleep; a transport-down event aborts waits. A mutex, wakeup source and
+PM callbacks prevent a test from overlapping suspend/removal. One attempt is
+accepted per module load, retained across driver unbind/rebind. Reboot before
+another hardware experiment, especially after `poisoned=1`; module reload is
+not a recovery procedure for an ambiguous firmware response.
+
+The helper normally reads cached results without powering the chip or doing
+raw I2C while the provider owns it. To read the result again:
+
+```sh
+sudo caihong-pen-status
+cat /sys/bus/platform/devices/caihong-pen-power/status
+```
+
+`attempted=0 phase=idle result=-61` means no test has run. After a successful
+identification expect `phase=done result=0 cleanup=0 valid=0xff chip_id=0x8601`,
+with `charge_disable=1 supply=0 wake=0 scan=0`. `valid` bits 0 through 7
+correspond to chip ID, firmware, mode, IRQ, VIN, IIN, temperature and EPT;
+only set bits have meaningful latched values. `phase` identifies the failing
+step. A read-phase result of `-6` still means NACK, now after acknowledged
+HBOOST and GPIO wake sequencing. A `-110` with `phase=hboost` means ACK timeout,
+so CPS power/wake was not enabled. Neither output pin readback nor an HBOOST
+ACK proves physical rail voltage. Identification alone does not prove pen
+charging, Bluetooth discovery or touch pen reports.
+
+Software verification includes W=1 module builds, checkpatch and host tests
+of the production ACK/power/I2C code with fake hardware: success, rejected
+ACKs, malformed/unaligned replies, timeout and late reply, transport loss,
+short transfer/NACK, mismatched ID, cleanup timeout and the invariant that
+charging is always inhibited. These tests do not validate PMIC firmware or
+physical GPIO behavior. See [image build instructions](pogo-keymap.md).

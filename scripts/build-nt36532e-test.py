@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Add the NT36532E bring-up payload to the pinned, working Caihong Wi-Fi v9.
 
-Only the embedded initramfs and listed touchscreen DT properties may change.
+Only the embedded initramfs and listed touch/pen DT properties may change.
 This deliberately does not rebuild the kernel or consume a mutable ramdisk
 directory. Requires Python 3, dtc, fdtget, fdtput, modinfo and mkbootimg.
 """
@@ -25,6 +25,9 @@ FIRMWARE_SHA256 = "fc6f5124d7f571f1090731b77fff0dcaf0abacbc2249b0dfa4891578919b1
 TOUCH_NODE = "/soc@0/geniqup@ac0000/spi@a90000/touchscreen@0"
 MODULE = "lib/modules/nt36532e_ts.ko"
 POGO_MODULE = "lib/modules/oneplus_pogo.ko"
+PEN_POWER_MODULE = "lib/modules/caihong_pen_power.ko"
+PEN_POWER_NODE = "/pmic-glink/pen-power"
+PEN_I2C_NODE = "/soc@0/geniqup@9c0000/i2c@98c000"
 FIRMWARE = "lib/firmware/novatek/DT-novatek-nt36532.bin"
 PEN_STATUS = "usr/local/sbin/caihong-pen-status"
 ANCHOR = b"mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run\n"
@@ -115,7 +118,7 @@ def boot_id(kernel, dtb):
     return digest.digest() + b"\0" * 12
 
 
-def patch_dtb(original, work):
+def patch_dtb(original, work, pen_power=False):
     source, dest = work / "v9.dtb", work / "touch.dtb"
     source.write_bytes(original)
     dest.write_bytes(original)
@@ -139,6 +142,32 @@ def patch_dtb(original, work):
         require(restored.count(line) == 1, f"unexpected DT property: {line.strip()}")
         restored = restored.replace(line, "", 1)
     require(restored == before, "DT changes extend beyond the listed touch/pen properties")
+    if pen_power:
+        require("qcom,pmic-glink" in run("fdtget", dest, "/pmic-glink", "compatible").split(),
+                "missing PMIC-Glink parent")
+        require("oneplus,caihong" in run("fdtget", dest, "/", "compatible").split(),
+                "pen power diagnostic requires Caihong")
+        require("pen-power" not in run("fdtget", "-l", dest, "/pmic-glink").split(),
+                "pen power DT child already exists")
+        require("phandle" not in run("fdtget", "-p", dest, PEN_I2C_NODE).split(),
+                "unexpected existing hub-3 phandle")
+        require(run("fdtget", dest, PEN_I2C_NODE, "status") == "okay", "hub-3 disabled")
+        phandles = [int(value, 16) for value in re.findall(r"phandle = <0x([0-9a-f]+)>;", after)]
+        handle = max(phandles) + 1
+        require(handle < 0xffffffff, "no available phandle")
+        run("fdtput", "-t", "x", dest, PEN_I2C_NODE, "phandle", f"{handle:x}")
+        run("fdtput", "-c", dest, PEN_POWER_NODE)
+        run("fdtput", "-t", "s", dest, PEN_POWER_NODE, "compatible", "oneplus,caihong-pen-power")
+        run("fdtput", "-t", "x", dest, PEN_POWER_NODE, "i2c-bus", f"{handle:x}")
+        for role, pin in {"charge-disable": 111, "supply": 10, "wake": 15,
+                          "scan": 85, "irq": 12}.items():
+            run("fdtput", "-t", "x", dest, PEN_POWER_NODE, f"{role}-gpios", irq[0], f"{pin:x}", "0")
+        reverted = work / "reverted.dtb"
+        reverted.write_bytes(dest.read_bytes())
+        run("fdtput", "-r", reverted, PEN_POWER_NODE)
+        run("fdtput", "-d", reverted, PEN_I2C_NODE, "phandle")
+        require(run("dtc", "-q", "-s", "-I", "dtb", "-O", "dts", reverted) == after,
+                "pen power DT changes extend beyond child and hub-3 phandle")
     return dest
 
 
@@ -210,11 +239,20 @@ def build(args):
                     "incorrect pogo module name")
             require(not run("modinfo", "-F", "depends", args.pogo_module),
                     "unhandled pogo module dependencies")
+        if args.pen_power_module:
+            require(run("modinfo", "-F", "vermagic", args.pen_power_module) == vermagic,
+                    "pen power module vermagic mismatch")
+            require(run("modinfo", "-F", "name", args.pen_power_module) == "caihong_pen_power",
+                    "incorrect pen power module name")
+            require(not run("modinfo", "-F", "depends", args.pen_power_module),
+                    "unhandled pen power module dependencies")
         records = [encode_entry(name, entry.fields, replacements[name]) if name in replacements else entry.raw
                    for name, entry in original.items() if name != "TRAILER!!!"]
         additions = {"lib/firmware/novatek": (0o40755, b""),
                      FIRMWARE: (0o100644, firmware), MODULE: (0o100644, module),
                      PEN_STATUS: (0o100755, Path(__file__).with_name("caihong-pen-status.py").read_bytes())}
+        if args.pen_power_module:
+            additions[PEN_POWER_MODULE] = (0o100644, args.pen_power_module.read_bytes())
         inode = max(entry.fields[0] for entry in original.values()) + 1
         for name, (mode, data) in additions.items():
             require(name not in original, f"touch payload already exists: {name}")
@@ -240,7 +278,7 @@ def build(args):
                           kernel[archive_offset + archive_size:])
         image = work / "Image"
         image.write_bytes(patched_kernel)
-        patched_dtb = patch_dtb(dtb, work)
+        patched_dtb = patch_dtb(dtb, work, bool(args.pen_power_module))
         output = work / "boot.img"
         cmdline = (header[64:576].split(b"\0")[0] + header[608:1632].split(b"\0")[0]).decode()
         # Metadata is fixed by the pinned v9 hash; verify the generated header
@@ -261,7 +299,7 @@ def build(args):
             "added_entries": sorted(additions),
             "checks": ["kernel identical outside embedded initramfs", "original init retained verbatim around hook",
                        "all other original cpio records byte-identical", "module vermagic matches baseline",
-                       "DT only adds listed touchscreen reset/pen properties", "boot metadata and cmdline unchanged",
+                       "DT only adds listed touch properties and optional pen power child/hub-3 phandle", "boot metadata and cmdline unchanged",
                        "final image decompressed and all records verified", "boot ID verified"],
             "hardware_test": "pending: boot, Wi-Fi, touch, pen, pogo and suspend/resume",
             "wifi_sha256": {name: sha256(entry.data) for name, entry in original.items()
@@ -271,6 +309,8 @@ def build(args):
         if args.pogo_module:
             manifest["pogo_sha256"] = {"baseline": sha256(original[POGO_MODULE].data),
                                        "replacement": sha256(replacements[POGO_MODULE])}
+        if args.pen_power_module:
+            manifest["pen_power_sha256"] = sha256(additions[PEN_POWER_MODULE][1])
         output.rename(args.output)
         args.output.with_suffix(".img.json").write_text(json.dumps(manifest, indent=2) + "\n")
         args.output.with_suffix(".img.sha256").write_text(f"{manifest['sha256']}  {args.output.name}\n")
@@ -283,6 +323,8 @@ def main():
     parser.add_argument("--module", required=True, type=Path)
     parser.add_argument("--pogo-module", type=Path,
                         help="optional oneplus_pogo module replacement; all other baseline records stay intact")
+    parser.add_argument("--pen-power-module", type=Path,
+                        help="optional manual CPS8601 power/ID diagnostic with dedicated PMIC-Glink DT child")
     parser.add_argument("--firmware", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
