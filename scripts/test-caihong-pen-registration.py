@@ -38,6 +38,7 @@ shim = r'''
 #define pr_err(...) do {} while (0)
 #define dev_info(...) do {} while (0)
 #define dev_err(...) do {} while (0)
+#define INIT_DELAYED_WORK(w, fn) do { (void)(w); (void)(fn); } while (0)
 struct device_node { int unused; };
 struct device {
     struct device *parent;
@@ -48,7 +49,7 @@ struct device {
 struct platform_device { struct device dev; };
 struct pen_power {
     struct device *dev;
-    int result, cleanup, lock, ack_lock, ack, lost;
+    int result, cleanup, lock, power_lock, ack_lock, ack, lost, event, cutoff_work;
     void *glink;
     const char *phase;
     bool hardware_ready, suspended;
@@ -68,6 +69,7 @@ static int pen_probe(struct platform_device *);
 static void pen_remove(struct platform_device *);
 static void pen_reply(void) {}
 static void pen_transport(void) {}
+static void pen_cutoff(void) {}
 static bool of_machine_is_compatible(const char *s) { return failure != 1; }
 static struct device_node *of_find_node_by_path(const char *s)
 { if (failure == 2) return NULL; nodes++; return &node; }

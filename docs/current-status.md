@@ -135,9 +135,51 @@ requests were acknowledged, and the module unloaded successfully after saving
 the result. Wi-Fi remained up with carrier and SSH; touch IRQ/frame/contact
 counters advanced without new SPI/checksum/start errors. Pen scan remains 0
 and no pen coordinates are confirmed. No image change or reboot was needed.
-The next step is protected attachment/ASK-address handling; the original boot
+Stage8 below extends this to attachment/ASK-address handling; the original boot
 regression still has no proven cause. Reboot before another power experiment
 under the diagnostic's existing one-attempt policy.
+
+Stage8 adds root-triggered, bounded attachment diagnostics with stock protection
+write/readback checks, fresh IRQ/ASK processing and checksum-validated identity
+decoding. A separate workqueue cutoff and the observation loop limit the active
+window to 15 seconds. No boot-image or Wi-Fi/touch payload change is involved.
+The pen remained magnetically attached during the tests. GPIO-only operation
+passed setup but timed out without fresh IRQ/ASK events. On a separate boot,
+Stage8a's explicit vendor ENTER_TX_MODE command produced readback `0x2`, raw
+mode `0x2` and one new interrupt with undefined flags `0x800`; I2C then stopped
+acknowledging, ending the test with `-ENXIO` after 3.096 seconds including wake.
+Both tests cleaned up with inhibit high, supply/wake/scan low, minimum HBOOST
+acknowledged and no transport poison. The pen's known Bluetooth address stayed
+unavailable. Wi-Fi/SSH remained usable. Touch counters advanced during Stage8;
+Stage8a introduced no new errors but had no finger activity to validate input.
+Reboot resets `pen_scan` to the unknown firmware default (`-1`); the earlier
+sweep's mode 0 does not persist across boot.
+
+Stage8b adds preservation of the initial ASK mailbox and a separately requested
+vendor final 50 ms off/on supply cycle, gated by exact stock power-on protection
+defaults and post-cycle readbacks. No timeout or failed command automatically
+retries with this path. W=1 build, checkpatch and 37 attachment fault cases pass,
+alongside existing power/ACK and registration tests. See
+[`cps8601-attachment.md`](cps8601-attachment.md) for the experiment boundaries
+and hardware results. On hardware, default protection values were
+800/4000/9000/2200, so Stage8b correctly blocked the cycle before allowing
+charging (`enabled=0 cycled=0 result=-95 cleanup=0`). Six startup IRQs occurred,
+and the initial mailbox contained a combined address packet decoding exactly
+to the user's known pen address. No checksum frame was captured, so this is
+partial identity evidence, not a completed validated exchange. The next
+receiver change should capture startup packets before the 2.5-second wait and
+flag clearing lose them. Pen input and wireless charging remain unconfirmed.
+
+After this startup-address evidence, the user removed the pen and drew during
+a remote 10-second-per-mode sweep. All five commands were acknowledged; only
+mode 4 had new event traffic (11 IRQs/reads/touch frames), with zero pen
+coordinate reports in every mode. No candidate was found and mode 0 was
+restored. The user then paused physical tests. The diagnostic module is
+unloaded and its supply was disabled; Wi-Fi/SSH remains working, and touch
+IRQ/frame counts advanced to 1092 without new SPI/checksum/start errors.
+Resume by implementing early startup reception and capturing both checksum
+and address frames with the pen attached, before another coordinate sweep.
+
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

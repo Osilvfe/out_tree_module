@@ -54,7 +54,7 @@ struct pen_power {
     struct gpio_desc *disable, *supply, *wake, *scan, *irq;
     int ack_lock;
     struct completion ack, lost;
-    bool up, pending, poisoned, active, hardware_ready;
+    bool up, pending, poisoned, active, hardware_ready, attach_requested;
     int ack_error;
     u32 rejected, valid;
     u16 values[8];
@@ -71,6 +71,7 @@ static bool completion_done(struct completion *c) { return c->done; }
 static struct pen_power *current;
 static int sends, reads, scenario, delays;
 static bool supply_was_on;
+static int pen_attach(struct pen_power *p) { assert(false); return -EINVAL; }
 static void pen_reply(const void *, size_t, void *);
 static void pen_transport(void *, int);
 static int pmic_glink_send(void *client, void *data, size_t len)

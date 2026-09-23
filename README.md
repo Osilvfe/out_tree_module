@@ -19,7 +19,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | --- | --- | --- |
 | `nt36532e_ts.ko` | Desktop touch, 10 points and sleep/resume confirmed | Stage3 passed desktop touch and a simple browser 10-point test. Stage4 follows panel power and retains firmware in memory; the user confirmed sleep/resume now works. Pen input, Bluetooth connection and wireless pen charging remain unverified. |
 | `oneplus_pogo.ko` | Keymap works; brief touchpad pauses recorded, investigation deferred | Search/Fn and F1–F12 mappings work. Stage6b sends commands to restore the hardware target after F4 and keeps Fn+F4 as the desktop toggle. All-key pauses persist with disable-while-typing off and with the keyboard grabbed by evtest. The user considers the impact minor and has paused this investigation to resume pen testing; see [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
-| `caihong_pen_power.ko` | Manual power/ID test passed; wireless charging unimplemented | Stage7a fixes IRQ bias setup through pinctrl. Hardware returned ID `0x8601`, firmware `0x0118`, VIN 5805 mV, and successful power-off cleanup. Wi-Fi stayed connected and touch counters advanced without new errors. Boot integration remains withdrawn; the previous Stage6 black-screen cause is unknown. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md#stage7-manual-post-boot-diagnostic). |
+| `caihong_pen_power.ko` | Startup ASK address matches the pen; full handshake/charging unconfirmed | Stage8b preserved an initial address packet matching the user's OPN2402, but missed the checksum frame. Late observation had no fresh ASK; explicit TX caused undefined flags `0x800` then I2C NACK. A supply-cycle request was blocked before charging permission because power-on protection defaults differ. Cleanup passed; boot integration remains withdrawn. See [`docs/cps8601-attachment.md`](docs/cps8601-attachment.md). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
 The user confirms OPN2402 has power and charges under another system. On the
@@ -29,9 +29,18 @@ observation window; it ended with no candidate and restored scan mode 0.
 Bluetooth discovery succeeds and receives nearby devices, but the pen's known
 address is absent; anonymous devices cannot be identified from the supplied
 log. Pen connection and raw input remain unverified. The manual CPS8601
-power/ID test now passes; next implement protected attachment/ASK-address
-handling. The previous CPS8601 boot integration remains withdrawn. See
+power/ID test now passes. Protected attachment/ASK-address handling is now
+implemented for manual tests. The saved startup mailbox now matches the pen's
+address, narrowing the next investigation to receiving both handshake frames
+early enough. The previous CPS8601 boot integration
+remains withdrawn. See
 [pen test preparation](docs/cps8601-bringup.md#resumed-pen-test-preparation).
+
+A subsequent remote scan after the startup-address capture still produced no
+pen coordinates in modes 1–5; mode 4 received touch traffic only. Physical
+testing is paused at the user's request. The diagnostic module is unloaded,
+pen scan is 0, and Wi-Fi and touch remain working. Next capture both startup
+handshake frames before repeating pen-input tests.
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
 experimental controls are fail-closed and are not a production charging policy.
