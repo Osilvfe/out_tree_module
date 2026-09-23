@@ -50,7 +50,8 @@ Stage4 also fixes pen pressure/ranges/transforms and adds `pen_scan`,
 `pen_stats`, and a passive `caihong-pen-status` helper. The user's pen is
 OPN2402. The user now confirms the pen has power and charges under another
 system; its vendor scan type remains unknown. The Linux Bluetooth controller
-is present and powered on, but pen discovery/connection remain unconfirmed.
+is present and powered on. Discovery receives nearby devices but has not
+identified the pen; pen connection remains unconfirmed.
 The original wireless charger is CPS8601 on I2C hub 3 at 0x41, with a separate
 PMIC-Glink HBOOST dependency. Charging is not implemented by this stage.
 Module compilation, host event/PM/diagnostic tests and final-image checks pass.
@@ -72,8 +73,8 @@ hang, display failure or another fault. Stage6a omits the CPS module/DT addition
 init and DTB while retaining the corrected pogo module. Only pogo and the
 passive helper differ from Stage5's archive records. The user confirmed
 Stage6a boots without the black screen; the precise failure inside the removed
-integration is still unknown. CPS power testing remains paused, and chip
-identification, charging and pen input remain unconfirmed.
+integration is still unknown. CPS chip identification, charging and pen input
+remain unconfirmed; Stage7 below prepares manual diagnostics after boot.
 See [CPS8601 bring-up](cps8601-bringup.md).
 The user has now resumed pen-test preparation and deferred the minor pogo
 pause. Start from the working Stage6b image and its existing Stage4 touch
@@ -96,12 +97,29 @@ establish that the controller detected a pen.
 The supplied `bluetoothctl show` confirms a present, powered, pairable
 controller supporting central and peripheral roles; it was not discovering
 at the time. Its `Discoverable: no` state does not prevent discovery as a
-central. The earlier pen address-not-available result was a BlueZ cache query,
-not a discovery test. Next run bounded Bluetooth discovery and inspect the
-pen's device info. If a connection/wake change succeeds, rerun the existing
+central. A subsequent 25-second discovery returned `Discovery started`,
+`Discovering: yes`, and multiple nearby devices including BLE advertisements.
+The pen's known address was absent and `info` returned unavailable. Anonymous
+addresses in the scan remain unidentified, so this does not prove the pen
+never advertises or establish a mandatory Bluetooth connection for pen input.
+The next investigation is the missing CPS8601 attachment path. If a
+connection/wake change succeeds, rerun the existing
 scan helper: the last sweep restored **0 (pen scan disabled)** and this driver
 does not automatically select a scan type from BlueZ state. Host helper tests
 pass; the withdrawn CPS boot integration is not reinstated.
+
+Stage7 refactors `caihong_pen_power.ko` for manual loading on the existing
+Stage6b device tree. Explicit `stage=1` registers only a real PMIC-Glink child
+and client; it sends no messages and requests no GPIOs or I2C resources.
+`stage=2` additionally reserves hub-3/address 0x41 and acquires the five known
+GPIOs with charging inhibited and supply off. A separate `probe_once` write
+is required for the bounded power/ID experiment. Setup and power phases have
+kernel log markers; synchronous probe failures propagate to `insmod` and
+unwind registration. No module alias, boot hook or DT addition is provided.
+W=1 compilation, checkpatch, power/ACK tests and registration failure tests
+pass locally. They do not validate the actual tablet's device-core registration
+or diagnose the earlier black screen. First collect stage=1 status and logs
+on the working image before proceeding with GPIO/power tests.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

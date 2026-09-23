@@ -8,7 +8,8 @@ confirms OPN2402 has power and charges under another system; Linux Bluetooth
 connection, automatic attachment and pen input remain unverified. The first
 five-mode sweep acknowledged every command but produced zero IRQs/event reads
 and zero pen reports; it restored scan mode 0. Bluetooth is present and powered
-on. Next check pen discovery on the existing image; see
+on, and discovery receives nearby devices but has not identified the pen.
+Next investigate CPS8601 attachment using the manual post-boot diagnostic; see
 [the recorded result and next steps](cps8601-bringup.md#resumed-pen-test-preparation).
 
 ## Stage1 packaging failure
@@ -189,10 +190,12 @@ The old embedded helper is copied back into `/usr/local/sbin` at boot, so use
 the separately downloaded script for this diagnosis after any reboot.
 
 The supplied `bluetoothctl show` now confirms a present, powered controller.
-Run `sudo bluetoothctl --timeout 25 scan on` and then query the pen address
-with `bluetoothctl info`. `Discoverable: no` does not prevent scanning. The
-helper itself only queries cached info. An undiscovered address
-does not establish whether the pen is charged, advertising or connected.
+The subsequent 25-second scan started successfully and received nearby devices,
+including BLE advertisements, but the pen's known address did not appear.
+`bluetoothctl info` still returned unavailable. Anonymous scan entries remain
+unidentified. `Discoverable: no` does not prevent scanning. The helper itself
+only queries cached info. This result does not identify the pen's scan protocol
+or prove whether it requires an attachment-triggered wake/connection exchange.
 
 ## Preserved Wi-Fi baseline
 

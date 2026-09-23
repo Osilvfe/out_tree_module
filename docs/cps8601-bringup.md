@@ -1,8 +1,9 @@
 # Caihong CPS8601 pen charger
 
 The user confirms OPN2402 has power, can charge under another system and shows
-a connection in stock when magnetically attached. Linux Bluetooth discovery,
-automatic attachment and pen input remain unconfirmed. The user has confirmed
+a connection in stock when magnetically attached. Linux Bluetooth discovery
+receives nearby devices, but has not identified the pen. Automatic attachment
+and pen input remain unconfirmed. The user has confirmed
 stage4 touchscreen suspend/resume.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
@@ -12,7 +13,7 @@ The user has deferred the minor all-key touchpad pause and asked to resume
 OPN2402 testing. The working image remains
 `mainline-boot-v2-stage6b-pogo-f4-wifi-v9.img`; it already contains the tested
 Stage4 touch module, pen input device and diagnostics. No new image is needed
-for the current discovery step. For later input/controller snapshots, use:
+for the current manual diagnostic. For later input/controller snapshots, use:
 
 ```sh
 sudo caihong-pen-status --skip-charger
@@ -28,18 +29,29 @@ Proceed according to the evidence:
 | Check | Current evidence | Next step |
 | --- | --- | --- |
 | Pen power | User confirms it has power and charges under another system | Investigate discovery/wake; Linux wireless charging remains unconfirmed. |
-| Linux Bluetooth | Controller present, powered, pairable; central/peripheral roles supported. No discovery result yet. | Run bounded discovery and query the pen device. A missing cached address alone says nothing about pen power. |
-| NT36532E scan protocol | Modes 1–5 acknowledged, with zero IRQs/event reads in every window; OPN2402 mapping unknown | Check pen discovery/connection first; repeat the scan test after a wake/connection change. Last sweep restored mode 0. |
+| Linux Bluetooth | Discovery started and received nearby devices, including BLE advertisements; pen's known address absent, anonymous entries unidentified | Investigate missing attachment/wake path. This does not prove the pen never advertises or that Bluetooth is mandatory for coordinates. |
+| NT36532E scan protocol | Modes 1–5 acknowledged, with zero IRQs/event reads in every window; OPN2402 mapping unknown | Repeat the scan test after a wake/connection change. Last sweep restored mode 0. |
 | Raw pen input | No hardware pen report confirmed | After a scan candidate is found, check hover, contact, pressure and leaving proximity in `evtest`. |
 
 The supplied `bluetoothctl show` confirms `Powered: yes`, `Pairable: yes`,
 `Discovering: no` and `Discoverable: no`. Being non-discoverable does not
 prevent this controller from scanning or initiating a connection. Discovery
-can be tested on the current image with:
+was tested on the current image with:
 
 ```sh
 sudo bluetoothctl --timeout 25 scan on
 ```
+
+The user then supplied `Discovery started`, `Discovering: yes`, and multiple
+nearby device results including BLE advertising data. The known pen address
+did not appear and its `bluetoothctl info` result remained unavailable. This
+validates discovery reception, not pen identity or connection. The anonymous
+addresses in the output cannot be identified from names/RSSI alone. Nearby
+device names and addresses are deliberately not copied into this repository.
+Do not repeat the unchanged five-mode sweep or cached address query solely
+because of this result. Proceed with Stage7 transport registration below.
+
+For a future discovery test after a wake/attachment change:
 
 Keep the display awake; take the pen off the magnetic rail, move it and tap
 with its tip during the scan. Record whether other nearby devices appear,
@@ -203,17 +215,112 @@ in the saved snapshot; it does not prove that the pen was awake or connected.
 If an error aborted the run, the summary prints that error and the cleanup
 result. No-IRQ/no-read results make pen wake/connection and controller scanning
 the next checks; they do not identify which side failed. The supplied
-`bluetoothctl show` establishes controller power; pen discovery is the next
-hardware observation needed.
+`bluetoothctl show` establishes controller power and the later discovery log
+confirms reception of other devices; the pen has not been identified.
 Offline tests cover these distinctions and prove the summary path avoids
 device access and writes.
 
-Full stock-like attachment still needs CPS support. Resume that as an
-observable post-boot identification experiment: the previous Stage6 boot
-regression remains undiagnosed and the withdrawn module is not ready to load
-unchanged. First prove provider registration and the power/wake sequence with
+Full stock-like attachment still needs CPS support. Stage7 below prepares an
+observable post-boot identification experiment. The previous Stage6 boot
+regression remains undiagnosed; do not load the withdrawn Stage6 binary.
+First prove provider registration and the power/wake sequence with
 chip ID 0x8601, then add protected wireless operation and address/attachment
 events. Reading the chip ID alone neither charges nor connects the pen.
+
+## Stage7 manual post-boot diagnostic
+
+Use the rebuilt Stage7 `caihong_pen_power.ko` (module version `7`) with the
+existing Stage6b image. The module now creates a regular platform child under
+the existing bound `/pmic-glink` device. It no longer needs the withdrawn DT
+child or an added I2C phandle. GPIO lookup is restricted to the board's main
+`f100000.pinctrl` controller and hub 3 is selected by its exact OF path.
+
+Loading requires explicit `stage=1` or `stage=2`; the default fails before
+device registration. There is no OF module alias and no boot hook. The image
+builder still rejects `--pen-power-module`. The old Stage6 black screen has
+not been attributed to any specific lock, GPIO or firmware operation.
+
+**First hardware checkpoint: stage 1 only.** Copy the newly built module to
+the tablet as `/tmp/caihong_pen_power-stage7.ko`. In a separate terminal keep
+`dmesg -w` running so the last setup marker is visible if a step stalls. Then:
+
+```sh
+insmod /tmp/caihong_pen_power-stage7.ko stage=1
+cat /sys/bus/platform/devices/caihong-pen-power/status
+dmesg | tail -n 80
+```
+
+Use root for these commands. Expect `setup=ready stage=1 hardware_ready=0`,
+`stage=1 hardware_ready=0 attempted=0`, and `transport_up=1` if the remote
+service is up. GPIO fields are **-19 (unavailable)** in this stage, not measured
+levels. It only registers the PMIC-Glink client and observes transport state:
+there are no GPIO requests, I2C clients/transfers or HBOOST messages, including
+during suspend/unload. `probe_once` is rejected with `EOPNOTSUPP` at stage 1.
+A parent busy with another operation returns `EBUSY` rather than waiting for
+its device mutex. Driver probe runs synchronously and a setup failure is
+returned to `insmod`, with the partially registered objects removed.
+
+**Second checkpoint, after stage 1 succeeds:** stage 2 reserves I2C address
+0x41 and acquires GPIO111 high, GPIO10/15/85 low and GPIO12 input with pull-up.
+It sends no HBOOST request and makes no CPS register transfer during loading.
+Changing stages requires unloading the stage-1 instance:
+
+```sh
+rmmod caihong_pen_power
+insmod /tmp/caihong_pen_power-stage7.ko stage=2
+cat /sys/bus/platform/devices/caihong-pen-power/status
+```
+
+Expect `hardware_ready=1 attempted=0 transport_up=1`, `charge_disable=1`, and
+`supply=0 wake=0 scan=0`. If setup fails, retain the log's last `setup=...`
+marker. Do not proceed when setup/state does not match these prerequisites.
+Only after that checkpoint is established, a separate manual request performs
+the existing bounded identification sequence:
+
+```sh
+printf '1\n' > /sys/bus/platform/devices/caihong-pen-power/probe_once
+cat /sys/bus/platform/devices/caihong-pen-power/status
+dmesg | tail -n 80
+```
+
+The request checks charge inhibition, acknowledges HBOOST 5800 mV, enables
+supply, raises chip wake and reads ID/status. It never enables wireless
+charging or flashes firmware. On completion/error it cuts supply/wake first
+and requests minimum HBOOST only if the response state is unambiguous. The
+existing timeout/transport-loss latch and one-attempt rule remain. A failed
+write can still leave useful cached status; capture it and the log. After any
+power attempt, reboot before another attempt rather than reloading to reset
+the latch. ID success alone does not reproduce attachment or wake the pen.
+
+Build just this diagnostic from the workspace root:
+
+```sh
+mkdir -p build/cps8601-stage7/module/charging
+cp external/out_tree_module-sc8547/charging/caihong_pen_power.c \
+    build/cps8601-stage7/module/charging/
+cat > build/cps8601-stage7/module/Makefile <<'EOF'
+obj-m += caihong_pen_power.o
+caihong_pen_power-y := charging/caihong_pen_power.o
+EOF
+make -C linux/out M="$PWD/build/cps8601-stage7/module" \
+    ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- W=1 modules
+```
+
+The module must match the running kernel; the tested Stage6b build uses
+`7.2.0-00012-gb35f5cb0b661-dirty`. The prepared standalone artifact is:
+
+```text
+caihong_pen_power-stage7.ko
+sha256: 2d8c005b8788364175168e713475ed0f54d8a41201321916ee455267fadbbcf1
+```
+
+The existing Stage6b image and Stage4 touch module hashes were checked against
+their recorded working values; both remain identical. Local validation includes W=1 compilation,
+checkpatch, the existing power/ACK/cleanup fault tests, and a new registration
+test covering explicit stage selection, stage-1 suspend/unload without GPIOs,
+synchronous error propagation and cleanup at each mocked setup failure.
+These tests do not model kernel device-core locking or validate actual GPIO,
+PMIC firmware, or on-device registration. Hardware stage 1 is still pending.
 
 ## Stage6 withdrawn; Stage6a boot recovery
 
@@ -275,6 +382,8 @@ Stage5 lacked this sequencing. The user's GPIO snapshot shows all five pins
 as input/low/pulldown, including GPIO10/15/111. This establishes the missing
 GPIO control; it does not measure HBOOST voltage. The withdrawn Stage6 attempted a manual
 bounded identification experiment; it has no successful hardware result.
+Stage7 separates transport registration from GPIO acquisition and power, with
+manual loading on the working image and per-step logs.
 
 ## HBOOST protocol and integration
 

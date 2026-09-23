@@ -41,6 +41,7 @@ typedef uint32_t u32;
 #define spin_lock_irqsave(l, f) do { (void)(l); (f) = 0; } while (0)
 #define spin_unlock_irqrestore(l, f) do { (void)(l); (void)(f); } while (0)
 #define I2C_M_RD 1
+#define dev_info(...) do {} while (0)
 struct completion { bool done; };
 struct gpio_desc { int value, id; };
 struct i2c_client { void *adapter; };
@@ -53,7 +54,7 @@ struct pen_power {
     struct gpio_desc *disable, *supply, *wake, *scan, *irq;
     int ack_lock;
     struct completion ack, lost;
-    bool up, pending, poisoned, active;
+    bool up, pending, poisoned, active, hardware_ready;
     int ack_error;
     u32 rejected, valid;
     u16 values[8];
@@ -128,11 +129,17 @@ static int i2c_transfer(void *adapter, struct i2c_msg *m, int n)
 tests = r'''
 int main(void)
 {
+    /* Transport-only stage must reject power even with no GPIO/I2C objects. */
+    struct pen_power passive = { .up = true };
+    current = &passive;
+    assert(pen_run(&passive) == -EOPNOTSUPP);
+    assert(!sends && !reads && !delays && !supply_was_on);
     for (scenario = 0; scenario <= 10; scenario++) {
         struct gpio_desc gpios[5] = {0};
         struct i2c_client client = {0};
         struct pen_power p = { .i2c = &client, .disable = &gpios[0], .supply = &gpios[1],
-            .wake = &gpios[2], .scan = &gpios[3], .irq = &gpios[4], .up = true, .active = true };
+            .wake = &gpios[2], .scan = &gpios[3], .irq = &gpios[4],
+            .up = true, .active = true, .hardware_ready = true };
         current = &p;
         sends = reads = delays = 0;
         supply_was_on = false;

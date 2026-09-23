@@ -9,8 +9,8 @@ does not mean Caihong integration is removed from the companion kernel tree.
 - `nt36532e_ts.ko`: Novatek NT36532E no-flash SPI touchscreen + pen.
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
-- `caihong_pen_power.ko`: Experimental CPS8601 diagnostic; image integration
-  withdrawn after a Stage6 black-screen report.
+- `caihong_pen_power.ko`: Manual staged CPS8601 diagnostic; boot integration
+  remains withdrawn after a Stage6 black-screen report.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
 
 ## Current driver status
@@ -19,16 +19,18 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | --- | --- | --- |
 | `nt36532e_ts.ko` | Desktop touch, 10 points and sleep/resume confirmed | Stage3 passed desktop touch and a simple browser 10-point test. Stage4 follows panel power and retains firmware in memory; the user confirmed sleep/resume now works. Pen input, Bluetooth connection and wireless pen charging remain unverified. |
 | `oneplus_pogo.ko` | Keymap works; brief touchpad pauses recorded, investigation deferred | Search/Fn and F1–F12 mappings work. Stage6b sends commands to restore the hardware target after F4 and keeps Fn+F4 as the desktop toggle. All-key pauses persist with disable-while-typing off and with the keyboard grabbed by evtest. The user considers the impact minor and has paused this investigation to resume pen testing; see [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
-| `caihong_pen_power.ko` | Boot integration withdrawn | Stage6 produced a reported black screen; the failure point is not yet known. Stage6a omits this module and its DT additions, with the exact Stage5 init/DTB and corrected keyboard mapping. The user confirmed Stage6a boots again. Power/charging tests are paused. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md). |
+| `caihong_pen_power.ko` | Manual stages prepared; hardware unverified; boot integration withdrawn | Stage7 loads on the working DT with explicit `stage=1` (transport only) or `stage=2` (GPIO/I2C setup, separate one-shot ID request). It logs registration/power stages and requires no new image. The previous Stage6 black-screen cause remains unknown. See [`docs/cps8601-bringup.md`](docs/cps8601-bringup.md#stage7-manual-post-boot-diagnostic). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
 The user confirms OPN2402 has power and charges under another system. On the
 working Stage6b image, the saved five-mode sweep shows acknowledged scan
 commands but zero touch IRQs/event reads and zero pen reports in every
 observation window; it ended with no candidate and restored scan mode 0.
-The Linux Bluetooth controller is present and powered on. The next check is
-Bluetooth discovery of the pen; discovery, connection and raw pen input remain
-unverified. The previous CPS8601 boot integration remains withdrawn. See
+Bluetooth discovery succeeds and receives nearby devices, but the pen's known
+address is absent; anonymous devices cannot be identified from the supplied
+log. Pen connection and raw input remain unverified. Next validate the missing
+CPS8601 attachment path using the manual diagnostic, starting with transport
+registration. The previous CPS8601 boot integration remains withdrawn. See
 [pen test preparation](docs/cps8601-bringup.md#resumed-pen-test-preparation).
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
