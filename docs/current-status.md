@@ -181,11 +181,14 @@ the requested hardware state (enabled by default, or explicit sysfs setting).
 Fn+F4 remains a desktop `KEY_TOUCHPAD_TOGGLE` and does not change that hardware
 target. Host tests cover both MCU usages, disabled targets, pending sysfs
 updates, TX failures and removal; module compilation passes. The user reports
-a brief pause with Stage6b and clarifies that all keys cause a pause. Desktop
-disable-while-typing needs an on-device comparison with that setting off;
-upstream libinput excludes F-keys, so an additional F4 firmware interruption
-remains possible. Pause-free behavior and the full restoration matrix are
-not confirmed.
+a brief pause with Stage6b and clarifies that all keys cause a pause. The
+pause persists with disable-while-typing off and while evtest exclusively
+grabs the keyboard. Desktop handling of these key events is therefore unlikely
+to explain it. Raw touch-event gaps, contact releases and transport error
+counters still need a hardware capture; MCU suppression and receive-path
+problems remain hypotheses. The standalone `scripts/caihong-pogo-capture.py`
+collects these on the existing image. Pause-free behavior and the full
+restoration matrix are not confirmed.
 See [pogo keymap](pogo-keymap.md) for mapping and reproduction commands.
 Stage6a preserves the exact tested stage4 touch module and v9 Wi-Fi payload;
 its init and DTB match Stage5 byte for byte. Stage6b changes only the pogo

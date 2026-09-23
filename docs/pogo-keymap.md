@@ -109,29 +109,62 @@ finish; persistent disable and a brief MCU interruption are different results.
 
 ## Brief pauses while typing
 
-The user reports that every key briefly pauses touchpad motion. The driver's
-restore worker is queued only by changes in the two physical F4 usages;
-ordinary letter presses do not queue it. Desktop disable-while-typing is a
-candidate for the broader pause, but has not yet been confirmed on the tablet.
-Upstream libinput enables this feature by default and ignores function keys,
-Esc and standalone modifiers in its typing filter, so it cannot by itself
-explain a pause on every key, including F4. See
+The user reports that every key briefly pauses touchpad motion, even after
+turning off **Disable while typing** and then testing with the keyboard
+exclusively grabbed by `sudo timeout 30s evtest --grab`. This makes desktop
+handling of the key events unlikely as the cause. Upstream libinput also
+excludes F-keys from its typing filter; see
 [`tp_key_ignore_for_dwt` and `tp_keyboard_event`](https://gitlab.freedesktop.org/libinput/libinput/-/blob/main/src/evdev-mt-touchpad.c).
 
-On KDE Plasma, open System Settings → Mouse & Touchpad (Input Devices on
-older versions) → Touchpad and turn off **Disable while typing**, then apply.
-Keep moving a finger and test a letter such as A, F1 and F4 separately on the
-same Stage6b image. If letters stop causing pauses but F4 still pauses, the
-F4-specific firmware correction still needs investigation. This setting
-allows touchpad motion during typing, so incidental palm motion may move the
-pointer.
+Code review finds no ordinary-key delay or touchpad-disable command: the
+restore worker is queued only by changes in the two physical F4 usages.
+The key decoder does not release touch contacts. MCU suppression, serial
+receive loss and touchpad event handling still need to be distinguished using
+actual raw event timing. The stock driver exposes touchpad enable and gesture
+commands, but no documented switch disabling suppression during key activity
+was found; do not treat an unrelated gesture command as that switch.
 
-If pauses remain with that setting off, run `sudo evtest` and select
-**OnePlus Pogo Touchpad** (without `--grab`). Compare raw motion events while
-moving a finger and pressing those same keys: continuous raw events with a
-paused pointer point toward desktop filtering; a gap in raw events requires
-investigating the MCU/driver path. Do not rebuild or change Wi-Fi/touchscreen
-modules to test this desktop setting.
+Run the standalone collector on the tablet with the current Stage6b image:
+
+```sh
+sudo python3 scripts/caihong-pogo-capture.py
+```
+
+It requires only Python 3, automatically finds **OnePlus Pogo Keyboard** and
+**OnePlus Pogo Touchpad**, and temporarily grabs only the keyboard. Keep moving
+a finger in circles in the touchpad's center throughout the test: 4 seconds
+without keys, then 7 seconds each pressing A, F1 and F4 about every 2 seconds
+as prompted. After about 25 seconds the keyboard fd closes, releasing the
+grab; error exits also close it. The touchpad stays available to the desktop.
+
+The collector uses monotonic evdev timestamps for both devices, retains only
+A/F1/F4 keyboard events, and records raw touchpad events. It reads existing
+pogo counters before and after capture and omits raw identity bytes. It sends
+no UART commands and changes no driver, GPIO or power settings. The current
+driver's normal F4 correction still runs when F4 is pressed.
+
+Provide the printed summary and, if needed, the generated
+`pogo-capture-*.json`. The summary reports motion-event gaps near key press
+and release, touch-contact releases, and changes in RX/TX/error counters.
+A missing or ambiguous device, unavailable status node, evdev overflow and
+counter reset are reported explicitly. Keep the raw JSON when there is an
+error; it contains the partial capture. No kernel rebuild or new image is
+needed for this test.
+
+These are raw event intervals, not measured pointer pauses: holding a finger
+still, lifting it, or reaching the pad edge can also create gaps. Continuous
+raw motion during a visible pause points above evdev; a raw motion gap narrows
+the investigation to the MCU/transport/driver path but does not alone identify
+which one. Counter differences cover the entire run, including F4 traffic,
+and cannot by themselves attribute an error to a particular key.
+
+Host validation uses synthetic timing gaps, contact releases, queue overflow,
+counter resets, native event decoding, device discovery, fd cleanup on errors
+and a simulated 25-second capture:
+
+```sh
+python3 -B scripts/test-caihong-pogo-capture.py
+```
 
 ## Build the test image
 
