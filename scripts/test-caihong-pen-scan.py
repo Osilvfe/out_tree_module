@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Powered-pen scan helper tests with fake sysfs and a virtual clock."""
 import contextlib
+import copy
 import importlib.util
 import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -145,6 +148,74 @@ class ScanTest(unittest.TestCase):
     def test_parse_hex_formats_decimal_counts_and_unknown_mode(self):
         self.assertEqual(scan.parse_stats("scan_type=-1 format=ff reports=10 fw=15 protocol=01"),
                          {"scan_type": -1, "format": 255, "reports": 10, "fw": 21, "protocol": 1})
+
+
+class SummaryTest(unittest.TestCase):
+    def log(self):
+        before = FakeController(original=1, working=5).snapshot()
+        before["touch"].update({"irq": 100, "reads": 100, "frames": 100,
+                                "contacts": 0, "boot_events": 0})
+        return {"version": 1, "candidate": None, "restored_mode": 0,
+                "trials": [{"mode": 1, "candidate": False, "before": before,
+                            "samples": [copy.deepcopy(before)]}]}
+
+    def test_no_irq_event_reads_differ_from_empty_pen_packets(self):
+        result = self.log()
+        row = scan.summarize(result)[0]
+        self.assertTrue(row["ack_observed"])
+        self.assertEqual(row["evidence"], "no_new_event_reads")
+        self.assertEqual(row["delta"]["touch"]["reads"], 0)
+        sample = result["trials"][0]["samples"][0]
+        sample["touch"]["irq"] += 10
+        sample["touch"]["reads"] += 10
+        sample["pen"]["packets"] += 10
+        self.assertEqual(scan.summarize(result)[0]["evidence"], "events_without_pen_coordinates")
+        sample["pen"]["reports"] += 4
+        self.assertEqual(scan.summarize(result)[0]["evidence"], "pen_coordinates_seen")
+
+    def test_boot_events_do_not_imply_pen_decoder_received_packets(self):
+        result = self.log()
+        sample = result["trials"][0]["samples"][0]
+        sample["touch"]["reads"] += 2
+        sample["touch"]["boot_events"] += 2
+        self.assertEqual(scan.summarize(result)[0]["evidence"], "events_read_without_pen_dispatch")
+        sample["touch"]["spi_errors"] += 1
+        self.assertEqual(scan.summarize(result)[0]["evidence"], "controller_restart_or_spi_error")
+
+    def test_partial_failed_missing_and_reset_data_remain_inconclusive(self):
+        for failure in ("partial", "ack", "missing", "reset"):
+            result = self.log()
+            trial = result["trials"][0]
+            if failure == "partial":
+                del trial["candidate"]
+            elif failure == "ack":
+                trial["before"]["pen"]["command_error"] = -110
+            elif failure == "missing":
+                del trial["before"]["touch"]["reads"]
+            else:
+                trial["samples"][0]["touch"]["reads"] = 1
+            row = scan.summarize(result)[0]
+            self.assertEqual(row["evidence"], "incomplete_or_changed_state")
+            if failure == "missing":
+                self.assertIsNone(row["delta"]["touch"]["reads"])
+            if failure == "reset":
+                self.assertEqual(row["counter_resets"], ["touch.reads"])
+
+    def test_offline_cli_does_not_access_hardware_require_root_or_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pen-scan-example.json"
+            saved = json.dumps(self.log())
+            path.write_text(saved)
+            with patch("sys.argv", ["pen-scan", "--summarize", str(path)]), \
+                    patch.object(scan, "discover", side_effect=AssertionError("hardware access")), \
+                    patch.object(scan.os, "geteuid", side_effect=AssertionError("root check")), \
+                    patch.object(scan.fcntl, "flock", side_effect=AssertionError("lock write")), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(scan.main(), 0)
+            self.assertIn("ack=observed irq=0 reads=0", output.getvalue())
+            self.assertIn("no_new_event_reads", output.getvalue())
+            self.assertEqual(path.read_text(), saved)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
 
 
 if __name__ == "__main__":

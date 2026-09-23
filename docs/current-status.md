@@ -83,8 +83,12 @@ separate `pencil_connected` → type selection → scan command path. The Androi
 component linking these to pairing/UI is not present in the inspected kernel
 sources. `scripts/caihong-pen-scan.py --sweep` now tests the five documented
 NT36532E modes on the existing image and keeps a candidate only after fresh
-moving coordinates and tip pressure are observed. Host tests pass; no device
-result is available yet. The withdrawn CPS boot integration is not reinstated.
+moving coordinates and tip pressure are observed. The user reports all printed
+counter deltas are zero for the scan sweep. No pen input has been confirmed;
+the saved touch IRQ/read counters and error/cleanup status have not yet been
+provided. `--summarize` reads that existing JSON without rerunning modes or
+accessing devices. Host tests pass. The withdrawn CPS boot integration is not
+reinstated.
 Bluetooth address-not-available was also reported; the helper only queries
 BlueZ's cache and does not discover devices, so pen power cannot be inferred.
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,

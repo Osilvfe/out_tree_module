@@ -146,8 +146,42 @@ does not mean the charged pen is dead: pen-side wake/connection, the protocol
 selection or the touch event path may still be missing. The log includes
 touch/pen counters and sampled raw coordinates for that next diagnosis.
 Host tests cover candidate selection, false positives, timeout, cleanup,
-interruption, sleeping/restarted controllers and counter resets; actual
-hardware scan results are pending.
+interruption, sleeping/restarted controllers and counter resets.
+
+The user reports that all printed counter deltas are zero in the first
+five-mode sweep. These are increments during each observation window, not
+the absolute lifetime counters. Since `nvt_report_pen()` increments `packets`
+before checksum/format/coordinate handling, a zero packet delta means no new
+event reached that handler during the window. It does not establish whether
+there were no IRQs, reads failed, boot events were filtered, or another path
+prevented pen dispatch. The current command bytes, ACK polling, 120-byte
+event payload and pen data offset 66 match the inspected stock NT36532 path.
+No specific decoder change is justified by the zero deltas alone.
+
+The original JSON already contains touch IRQ/read counters for every sample.
+Use the updated helper to summarize it without another hardware test:
+
+```sh
+python3 scripts/caihong-pen-scan.py --summarize /path/to/pen-scan-TIMESTAMP.json
+```
+
+`--summarize` without a filename reads the most recently modified
+`pen-scan-*.json` in the current directory and prints its path. It does not
+require root, discover input devices, take the scan lock, write a file or
+change scan mode. It works with logs from the first helper version. Missing
+fields print as `?`, not zero; partial trials, command errors, counter resets
+and changing controller state remain inconclusive.
+
+The summary distinguishes no new event reads, reads that did not reach pen
+dispatch, packets without valid coordinates, and valid-coordinate reports.
+`ack=observed` reflects the driver's reported applied mode/zero command error
+in the saved snapshot; it does not prove that the pen was awake or connected.
+If an error aborted the run, the summary prints that error and the cleanup
+result. No-IRQ/no-read results make pen wake/connection and controller scanning
+the next checks; they do not identify which side failed. The Bluetooth
+controller's current state can be collected separately with `bluetoothctl show`.
+Offline tests cover these distinctions and prove the summary path avoids
+device access and writes.
 
 Full stock-like attachment still needs CPS support. Resume that as an
 observable post-boot identification experiment: the previous Stage6 boot

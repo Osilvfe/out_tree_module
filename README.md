@@ -24,8 +24,10 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 The user confirms OPN2402 has power and charges under another system. The
 current priority is testing its scan protocol and raw pen input on the working
-Stage6b image using `scripts/caihong-pen-scan.py --sweep`. Linux pen input and
-automatic attachment/connection remain unverified. The previous CPS8601 boot
+Stage6b image using `scripts/caihong-pen-scan.py --sweep`. The first sweep
+returned all-zero counter increments; `--summarize` extracts IRQ/read evidence
+from the saved log without rerunning the test. Linux pen input and automatic
+attachment/connection remain unverified. The previous CPS8601 boot
 integration remains withdrawn. See [pen test preparation](docs/cps8601-bringup.md#resumed-pen-test-preparation).
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its

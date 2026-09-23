@@ -6,6 +6,7 @@ Only changes the documented touchscreen scan mode. No CPS/I2C, GPIO, HBOOST,
 firmware-flash or Bluetooth commands. A candidate mode is kept for evtest;
 otherwise restore the prior known mode, or disable scanning if it was -1.
 Python standard library only. Keep the display awake and draw with the pen.
+--summarize reads an existing JSON log without accessing hardware.
 """
 
 import argparse
@@ -21,6 +22,7 @@ import time
 MODES = {1: "Havon", 2: "Maxeye", 3: "Maxeye 2nd", 4: "Sunwoda", 5: "Maxeye 3rd"}
 PEN_COUNTS = ("packets", "reports", "checksum_errors", "out_of_range", "unknown_formats")
 HEX_FIELDS = {"format", "fw", "protocol"}
+TOUCH_COUNTS = ("irq", "reads", "frames", "contacts", "spi_errors", "boot_events", "starts")
 
 
 def parse_stats(text):
@@ -134,7 +136,6 @@ def run_scan(controller, modes, seconds, result):
             if observe(controller, mode, seconds, trial, before["touch"]["starts"]):
                 result["candidate"] = mode
                 break
-            print(f"模式 {mode}: {trial['delta']}", flush=True)
     except (OSError, RuntimeError, ValueError, KeyError, KeyboardInterrupt) as error:
         result["error"] = str(error) or "Interrupted"
         result["candidate"] = None
@@ -151,15 +152,101 @@ def run_scan(controller, modes, seconds, result):
             result["after_error"] = str(error)
 
 
+def summarize(result):
+    if not isinstance(result, dict) or result.get("version") != 1 or not isinstance(result.get("trials"), list):
+        raise ValueError("Not a version-1 pen scan log")
+    rows = []
+    for trial in result["trials"]:
+        if not isinstance(trial, dict) or not isinstance(trial.get("samples"), list):
+            raise ValueError("Invalid pen scan trial")
+        snapshots = ([trial["before"]] if "before" in trial else []) + trial["samples"]
+        if any(not isinstance(s, dict) or
+               any(not isinstance(s.get(group), dict) for group in ("touch", "pen"))
+               for s in snapshots):
+            raise ValueError("Invalid touch/pen snapshot")
+        delta = {}
+        resets = []
+        for group, keys in (("touch", TOUCH_COUNTS), ("pen", PEN_COUNTS)):
+            delta[group] = {}
+            for key in keys:
+                values = [s[group].get(key) for s in snapshots]
+                if len(values) < 2 or any(value is None for value in values):
+                    delta[group][key] = None
+                    continue
+                if any(type(value) is not int or value < 0 for value in values):
+                    raise ValueError(f"Invalid counter {group}.{key}")
+                if any(right < left for left, right in zip(values, values[1:])):
+                    resets.append(f"{group}.{key}")
+                delta[group][key] = values[-1] - values[0]
+        before = trial.get("before", {}).get("pen", {})
+        mode = trial.get("mode")
+        if type(mode) is not int or mode not in MODES:
+            raise ValueError("Invalid scan mode in log")
+        ack = before.get("scan_type") == mode and before.get("command_error") == 0
+        stable = bool(snapshots) and all(
+            s["touch"].get("enabled") == 1 and s["touch"].get("panel_ready") == 1
+            and s["touch"].get("suspended") == 0 and s["touch"].get("start_error") == 0
+            and s["pen"].get("scan_type") == mode and s["pen"].get("command_error") == 0
+            for s in snapshots)
+        complete = "before" in trial and bool(trial["samples"]) and "candidate" in trial
+        touch, pen = delta["touch"], delta["pen"]
+        if (not ack or not stable or not complete or resets or
+                any(value is None for group in delta.values() for value in group.values())):
+            evidence = "incomplete_or_changed_state"
+        elif touch["starts"] or touch["spi_errors"]:
+            evidence = "controller_restart_or_spi_error"
+        elif pen["reports"] > 0:
+            evidence = "pen_coordinates_seen"
+        elif pen["packets"] > 0:
+            evidence = "events_without_pen_coordinates"
+        elif touch["reads"] > 0:
+            evidence = "events_read_without_pen_dispatch"
+        else:
+            evidence = "no_new_event_reads"
+        rows.append({"mode": mode, "ack_observed": ack, "complete": complete,
+                     "delta": delta, "counter_resets": resets, "evidence": evidence})
+    return rows
+
+
+def print_summary(result):
+    print("各模式观察期间的计数增量（? 表示日志缺项，不代表 0）：")
+    for row in summarize(result):
+        touch, pen = row["delta"]["touch"], row["delta"]["pen"]
+        fields = [("irq", touch["irq"]), ("reads", touch["reads"]),
+                  ("touch_frames", touch["frames"]), ("spi_errors", touch["spi_errors"]),
+                  ("boot_events", touch["boot_events"]), ("pen_packets", pen["packets"]),
+                  ("pen_reports", pen["reports"]), ("pen_checksum_errors", pen["checksum_errors"])]
+        values = " ".join(f"{key}={value if value is not None else '?'}" for key, value in fields)
+        print(f"模式 {row['mode']}: ack={'observed' if row['ack_observed'] else 'unknown'} "
+              f"{values} evidence={row['evidence']}")
+        if row["counter_resets"]:
+            print("counter_resets=" + ",".join(row["counter_resets"]))
+    for key in ("candidate", "error", "restore_error", "after_error", "restored_mode"):
+        if key in result:
+            print(f"{key}={result[key]}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--sweep", action="store_true", help="test documented modes 1–5")
     group.add_argument("--type", type=int, choices=MODES, help="test one known vendor mode")
+    group.add_argument("--summarize", type=Path, nargs="?", const=Path("latest"), metavar="FILE",
+                       help="read a saved log only; defaults to the newest pen-scan-*.json here")
     parser.add_argument("--seconds", type=float, default=8, help="seconds per mode (3–15; default 8)")
     parser.add_argument("--output", type=Path,
                         default=Path(datetime.now().strftime("pen-scan-%Y%m%d-%H%M%S.json")))
     args = parser.parse_args()
+    if args.summarize is not None:
+        log = args.summarize
+        if log == Path("latest"):
+            logs = list(Path.cwd().glob("pen-scan-*.json"))
+            if not logs:
+                parser.error("No pen-scan-*.json here; supply the saved JSON path with --summarize")
+            log = max(logs, key=lambda path: path.stat().st_mtime_ns)
+        print(f"读取已有日志：{log.resolve()}")
+        print_summary(json.loads(log.read_text()))
+        return 0
     if not 3 <= args.seconds <= 15:
         parser.error("--seconds must be between 3 and 15")
     if os.geteuid() != 0:
@@ -182,9 +269,7 @@ def main():
               "请用 evtest 的 Novatek NT36532E Pen 验证悬停、压力和离开屏幕。")
     else:
         print("未确认可用模式；这不能单独区分笔唤醒/连接、扫描协议和触控上报问题。")
-    for key in ("error", "restore_error", "after_error", "restored_mode"):
-        if key in result:
-            print(f"{key}={result[key]}")
+    print_summary(result)
     print(f"完整记录：{args.output.resolve()}")
     if any(key in result for key in ("error", "restore_error", "after_error")):
         return 1
@@ -197,5 +282,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, interrupted)
     try:
         raise SystemExit(main())
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error))
