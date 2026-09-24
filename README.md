@@ -9,8 +9,9 @@ does not mean Caihong integration is removed from the companion kernel tree.
 - `nt36532e_ts.ko`: Novatek NT36532E no-flash SPI touchscreen + pen.
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
-- `caihong_pen_power.ko`: Manual staged CPS8601 diagnostic; boot integration
-  remains withdrawn after a Stage6 black-screen report.
+- `caihong_pen_power.ko`: Stage9c CPS8601 diagnostic with a rootfs automatic
+  supervisor; boot-image integration remains withdrawn after a Stage6
+  black-screen report.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
 
 ## Current driver status
@@ -19,7 +20,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 | --- | --- | --- |
 | `nt36532e_ts.ko` | Touch, pen input and sleep/resume confirmed | Desktop touch and 10 points work; Stage4 touch resume is confirmed. After filtered Bluetooth discovery and pairing, the existing firmware with pen scan mode 1 reports coordinates, pressure, hover and releases; the user confirms desktop pen taps, pen sleep/resume and working basic pressure in native Wayland Krita. Automatic connection and scan restoration pass a full reboot, with drawing and pressure confirmed afterwards. Tilt/buttons and sustained wireless charging still need testing. |
 | `oneplus_pogo.ko` | Keymap works; brief touchpad pauses recorded, investigation deferred | Search/Fn and F1–F12 mappings work. Stage6b sends commands to restore the hardware target after F4 and keeps Fn+F4 as the desktop toggle. All-key pauses persist with disable-while-typing off and with the keyboard grabbed by evtest. The user considers the impact minor and has paused this investigation to resume pen testing; see [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
-| `caihong_pen_power.ko` | Bounded CPS8601 charge path validated | Stage9c completes identity, protection setup and a 12-second charge-permission observation with nonzero input current, stable temperature and no fault/EPT/stop event, then powers off cleanly. Pen battery gain and automatic charging still require longer validation and policy integration. See [`docs/cps8601-attachment.md`](docs/cps8601-attachment.md). |
+| `caihong_pen_power.ko` | Bounded CPS8601 charge path validated; automatic supervisor enabled | Stage9c completes identity, protection setup and a 12-second charge-permission observation with nonzero input current, stable temperature and no fault/EPT/stop event, then powers off cleanly. A rootfs timer now repeats this bounded path with battery, touch, current, voltage, temperature and fault gates. See [`docs/pen-autocharge.md`](docs/pen-autocharge.md) and [`docs/cps8601-attachment.md`](docs/cps8601-attachment.md). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
 
 OPN2402 pen input is confirmed on 2026-09-24 with the existing Stage6b image

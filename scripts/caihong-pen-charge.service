@@ -1,0 +1,23 @@
+[Unit]
+Description=Bounded automatic Caihong pen charging attempt
+After=bluetooth.service
+ConditionPathExists=/etc/caihong-pen.json
+ConditionPathExists=/usr/local/lib/caihong/caihong_pen_power.ko
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/caihong-pen-charge
+TimeoutStartSec=45
+TimeoutStopSec=25
+RuntimeDirectory=caihong-pen-charge
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/lock /run/caihong-pen-charge
+CapabilityBoundingSet=CAP_SYS_MODULE
+AmbientCapabilities=CAP_SYS_MODULE
+NoNewPrivileges=no
+ProtectKernelModules=no

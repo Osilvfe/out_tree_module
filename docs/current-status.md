@@ -284,6 +284,22 @@ user declined adding the success flag; the prepared metadata repair remains
 unapplied. The subsequent Stage9b reboot returned to the working Linux system.
 See [the boot-slot findings](boot-slot-status.md).
 
+The user then authorized automatic charging with monitoring and termination.
+The tested Stage9c module and rootfs systemd timer are now installed and
+enabled on the running tablet:
+each 45-second timer run makes one bounded 15-second CPS attempt, skips a full
+battery or unready touchscreen, shares the diagnostic lock, backs off after
+failures, and unloads the module after every attempt. The kernel watchdog and
+user-space monitor both terminate on removal, stop, EPT, fault/undefined flags,
+voltage/current/temperature limits, transport loss or service stop. This
+supervisor is independent of pen Bluetooth reconnection and is documented in
+[`pen-autocharge.md`](pen-autocharge.md). Sustained battery gain is still
+unverified because the validated observation held the Bluetooth battery
+reading at 94% over its short window. The first automatic rounds completed with
+`charging-observed`, zero failures and clean module removal; subsequent
+Bluetooth readings varied from 90% to 91%, which is not yet a controlled gain
+measurement.
+
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

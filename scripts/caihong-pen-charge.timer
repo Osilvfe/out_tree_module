@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic automatic Caihong pen charging attempts
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=45s
+AccuracySec=5s
+Unit=caihong-pen-charge.service
+
+[Install]
+WantedBy=timers.target
