@@ -103,6 +103,36 @@ leaves `vddio-supply` unset until the corresponding mainline PMIC regulator
 phandle is proven.  With the property absent the driver assumes the board or
 firmware keeps that rail powered.
 
+## ICM42607 upstream driver port
+
+The IMU module uses the official Linux `inv_icm42607` implementation from
+commit `512d321b9397` (the complete upstream series, including the SPI front
+end, accelerometer, gyroscope and temperature support).  It is built here as
+three external modules:
+
+- `inv_icm42607.ko` (shared core and IIO devices)
+- `inv_icm42607_spi.ko` (SPI transport)
+- `inv_icm42607_i2c.ko` (I2C transport)
+
+The source is kept under `sensors/inv_icm42607/` without local protocol or
+register changes.  Caihong's registry identifies the IMU as `icm4x607` on SSC
+SPI instance 3 with a high-level IRQ and the orientation `-x -y +z`; the exact
+ICM42607 versus ICM42607P identity and the AP-visible handoff still require
+runtime evidence.  No DTS node is enabled by this module branch until that
+handoff, chip-select, interrupt GPIO and `vdd`/`vddio` regulator mapping are
+confirmed.
+
+Build it with:
+
+```sh
+make -C sensors KDIR=/path/to/linux ARCH=arm64 \
+    CROSS_COMPILE=aarch64-linux-gnu-
+```
+
+The resulting modules only prove source/API compatibility.  Loading them on a
+kernel whose DTS still assigns the same SPI controller to SSC is deliberately
+unsupported.
+
 ## Next sensor work
 
 1. map SSC SPI instance 3 and I2C instance 2 to the exact SM8650 QUP serial

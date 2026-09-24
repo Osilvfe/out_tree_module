@@ -5,6 +5,7 @@ on:
     paths:
       - 'sensors/**/*.c'
       - 'sensors/**/*.h'
+      - 'sensors/**/Kconfig'
       - 'sensors/Makefile'
       - 'sensors/**/Makefile'
       - '.github/workflows/build-sensors-linux-v7.2.yml'
@@ -12,6 +13,7 @@ on:
     paths:
       - 'sensors/**/*.c'
       - 'sensors/**/*.h'
+      - 'sensors/**/Kconfig'
       - 'sensors/Makefile'
       - 'sensors/**/Makefile'
       - '.github/workflows/build-sensors-linux-v7.2.yml'
@@ -51,15 +53,26 @@ jobs:
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e IIO
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI_MASTER
 
           # REGMAP_I2C is a hidden Kconfig symbol in v7.2 and cannot be
           # enabled directly by scripts/config. The in-tree MMC5633 option
           # selects it through the normal Kconfig dependency graph. This also
           # makes the CI configuration describe the exact transport under test.
           "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MMC5633
+
+          # The ICM42607 port uses the same IIO buffer and timestamp helpers as
+          # the in-tree InvenSense IMU drivers.  Enable the official ICM42600
+          # SPI transport so Kconfig selects the hidden shared dependencies
+          # (including REGMAP_SPI and IIO_INV_SENSORS_TIMESTAMP) through their
+          # normal dependency path.
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e INV_ICM42600_SPI
           make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C MMC5633 REGMAP_I2C; do
+          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C SPI SPI_MASTER \
+                     MMC5633 INV_ICM42600_SPI REGMAP_I2C REGMAP_SPI IIO_BUFFER \
+                     IIO_INV_SENSORS_TIMESTAMP; do
             grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
               echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
               exit 1

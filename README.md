@@ -9,12 +9,21 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
+- `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the
+  SSC-registry-derived BU52053NVX Hall input, MMC56x3x magnetometer, TCS3701
+  direct-I2C IIO baseline, and the official upstream ICM42607 IMU core with
+  SPI/I2C transports.
 
 The touchscreen driver is written against the DTS currently used by Caihong:
 `spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
 coordinate transform properties, and optional `novatek,pen-support`.
 
 The pogo driver remains in the tree, but current work is focused on charging.
+
+Sensor work is tracked on `port/sm8650-camera-sensors`.  The sensor modules
+are compile- and modpost-validated against Linux v7.2; they do not enable a
+device-tree node or take ownership from the Qualcomm SSC until the AP bus,
+chip identity, interrupt and regulator mapping have been verified on Caihong.
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is
