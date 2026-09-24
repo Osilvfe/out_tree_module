@@ -1,18 +1,23 @@
 # Caihong NT36532E bring-up
 
-Status: 2026-09-23. Stage3 desktop touch and a simple browser 10-point test
+Status: 2026-09-24. Stage3 desktop touch and a simple browser 10-point test
 passed. Sleep/resume later failed with no `evtest` events and a reported
 `nt36532e_resume` PM error of `-110`. Stage4 contains a panel-sequencing fix
-and pen diagnostics; the user confirmed sleep/resume now works. The user now
-confirms OPN2402 has power and charges under another system; Linux Bluetooth
-connection, automatic attachment and pen input remain unverified. The first
-five-mode sweep acknowledged every command but produced zero IRQs/event reads
-and zero pen reports; it restored scan mode 0. Bluetooth is present and powered
-on, and discovery receives nearby devices but has not identified the pen.
-The Stage7a manual diagnostic now confirms CPS8601 power/ID access, with Wi-Fi
-connected and touch counters advancing without new errors. Attachment/pen
-wake remains the next step; see
-[the recorded result and next steps](cps8601-bringup.md#resumed-pen-test-preparation).
+and pen diagnostics; the user confirmed touch sleep/resume now works.
+
+OPN2402 pen input now works on this existing module and firmware. Stage8d
+receives and validates the CPS8601 startup address exchange. The pen's
+connectable Bluetooth advertisement uses flags `0x04` and ordinary discovery
+omits it; an address Pattern filter exposed OnePlus Pencil Pro for connection
+and pairing. After bonding, scan mode 1 immediately produced coordinates and
+pressure. Evtest verified hover, pressure release and leaving proximity; the
+user confirmed desktop pen taps. The firmware, touch module, boot image and
+Wi-Fi payload remain unchanged. GATT reports manufacturer Maxeye, but the
+observed working scan type is 1 regardless of its stock Havon label.
+
+Automatic attachment/charging, Bluetooth reconnection across boot, pen
+sleep/resume and tilt/buttons are not yet validated. See the
+[connection and reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 ## Stage1 packaging failure
 

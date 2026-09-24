@@ -54,7 +54,7 @@ struct pen_power {
     struct gpio_desc *disable, *supply, *wake, *scan, *irq;
     int ack_lock;
     struct completion ack, lost;
-    bool up, pending, poisoned, active, hardware_ready, attach_requested;
+    bool up, pending, poisoned, active, hardware_ready, attach_requested, startup_requested;
     int ack_error;
     u32 rejected, valid;
     u16 values[8];
@@ -72,6 +72,13 @@ static struct pen_power *current;
 static int sends, reads, scenario, delays;
 static bool supply_was_on;
 static int pen_attach(struct pen_power *p) { assert(false); return -EINVAL; }
+static int pen_startup(struct pen_power *p)
+{
+    assert(scenario == 11 || scenario == 12);
+    assert(p->disable->value == 1 && p->supply->value == 1 && p->wake->value == 1);
+    assert(delays == 1 && !reads);
+    return scenario == 11 ? 0 : -EBADMSG;
+}
 static void pen_reply(const void *, size_t, void *);
 static void pen_transport(void *, int);
 static int pmic_glink_send(void *client, void *data, size_t len)
@@ -135,13 +142,14 @@ int main(void)
     current = &passive;
     assert(pen_run(&passive) == -EOPNOTSUPP);
     assert(!sends && !reads && !delays && !supply_was_on);
-    for (scenario = 0; scenario <= 10; scenario++) {
+    for (scenario = 0; scenario <= 12; scenario++) {
         struct gpio_desc gpios[5] = {0};
         struct i2c_client client = {0};
         struct pen_power p = { .i2c = &client, .disable = &gpios[0], .supply = &gpios[1],
             .wake = &gpios[2], .scan = &gpios[3], .irq = &gpios[4],
             .up = true, .active = true, .hardware_ready = true };
         current = &p;
+        p.startup_requested = scenario >= 11;
         sends = reads = delays = 0;
         supply_was_on = false;
         int result = pen_run(&p);
@@ -160,6 +168,8 @@ int main(void)
         case 8: assert(result == -ETIMEDOUT && p.poisoned && p.valid == 0xff && sends == 2); break;
         case 9: assert(result == -EIO && p.poisoned && sends == 1 && !supply_was_on); break;
         case 10: assert(result == -ENXIO && reads == 1 && !p.valid && sends == 2); break;
+        case 11: assert(!result && !reads && sends == 2 && delays == 1 && !p.cleanup); break;
+        case 12: assert(result == -EBADMSG && !reads && sends == 2 && !p.cleanup); break;
         }
         if (p.poisoned) {
             /* Late success cannot clear the ambiguity or allow another request. */

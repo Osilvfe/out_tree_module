@@ -1,17 +1,17 @@
 # Caihong CPS8601 pen charger
 
 The user confirms OPN2402 has power, can charge under another system and shows
-a connection in stock when magnetically attached. Linux Bluetooth discovery
-receives nearby devices, but has not identified the pen. Automatic attachment
-and pen input remain unconfirmed. The user has confirmed
-stage4 touchscreen suspend/resume.
+a connection in stock when magnetically attached. Address-filtered Linux
+Bluetooth discovery now identifies and pairs the pen as OnePlus Pencil Pro;
+scan mode 1 on the existing Stage4 module provides working pen input and
+desktop taps. The user has also confirmed Stage4 touchscreen suspend/resume.
 The Stage7a manual test confirms CPS8601 ID/firmware access and successful
-power cleanup. Stage8 attachment tests now verify protection settings, but
-have not recovered a validated pen address or confirmed charging. The GPIO-only
-test timed out; explicit TX produced undefined flags `0x800` and then I2C NACK.
-Stage8b's saved startup mailbox decodes to the user's known pen address, but
-the checksum frame is missing. Its supply-cycle experiment was blocked by
-mismatching power-on protection defaults, with successful cleanup.
+power cleanup. Stage8d now receives both startup ASK frames and validates the
+user's OPN2402 address, with clean shutdown. Automatic attachment, pen
+reconnection/resume and charging still need work. Earlier GPIO-only observation
+missed the initial exchange; an explicit TX command produced undefined flags
+`0x800` then I2C NACK. The guarded supply-cycle experiment was blocked by
+mismatching power-on protection defaults and remains untested.
 See [bounded attachment experiments](cps8601-attachment.md).
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
@@ -36,11 +36,11 @@ Proceed according to the evidence:
 
 | Check | Current evidence | Next step |
 | --- | --- | --- |
-| Pen power | User confirms it has power and charges under another system | Investigate attachment/wake; Linux wireless charging remains unconfirmed. |
-| CPS8601 access | ID/firmware, protection readbacks and cleanup confirmed; startup ASK address matches the pen but lacks its checksum frame | Capture the complete startup exchange earlier; see [attachment results](cps8601-attachment.md). |
-| Linux Bluetooth | Discovery started and received nearby devices, including BLE advertisements; pen's known address absent, anonymous entries unidentified | Investigate missing attachment/wake path. This does not prove the pen never advertises or that Bluetooth is mandatory for coordinates. |
-| NT36532E scan protocol | Modes 1–5 acknowledged, with zero IRQs/event reads in every window; OPN2402 mapping unknown | Repeat the scan test after a wake/connection change. Last sweep restored mode 0. |
-| Raw pen input | No hardware pen report confirmed | After a scan candidate is found, check hover, contact, pressure and leaving proximity in `evtest`. |
+| Pen power | User confirms stock charging; Bluetooth initially reported 94% | Linux automatic wireless charging remains unimplemented. |
+| CPS8601 access | Stage8d validates both startup frames; cleanup passes | Keep the manual diagnostic boundary; automatic attachment remains separate. |
+| Linux Bluetooth | Address-filtered discovery exposed connectable, non-discoverable OnePlus Pencil Pro; connected/paired/bonded and services resolved | Test later reconnection/resume; see [reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input). |
+| NT36532E scan protocol | Mode 1 produces sustained moving coordinates and pressure after Bluetooth pairing | Keep tested mode 1 for this setup; manufacturer Maxeye does not imply mode 2/3/5. |
+| Raw pen input | Hover, contact, pressure-zero release and proximity exit verified; desktop pen taps confirmed | Tilt, buttons and pen sleep/resume remain to be tested. |
 
 The supplied `bluetoothctl show` confirms `Powered: yes`, `Pairable: yes`,
 `Discovering: no` and `Discoverable: no`. Being non-discoverable does not

@@ -3,17 +3,22 @@
 The Stage7a manual power/ID test established CPS8601 ID `0x8601`, firmware
 `0x0118`, HBOOST control and I2C access on the working Stage6b image. Stage8
 adds a short attachment/ASK experiment; it is not an automatic pen charger.
-No boot image, Wi-Fi payload, touchscreen module or device tree is changed.
+Stage8d now captures and validates both startup ASK frames on hardware.
+Address-filtered Bluetooth discovery and pairing then enabled working pen
+input on the existing touchscreen firmware. No boot image, Wi-Fi payload,
+touchscreen module or device tree is changed.
 
 The pen must be magnetically attached during the experiment. After any power
 attempt, reboot before another attempt. Stage 2 only reserves resources when
 loaded; a separate root-only sysfs request enables the experiment:
 
 ```sh
-insmod /tmp/caihong_pen_power-stage8b.ko stage=2
+insmod /tmp/caihong_pen_power-stage8d.ko stage=2
 cat /sys/bus/platform/devices/caihong-pen-power/status
-# GPIO-controlled automatic operation:
-printf '1\n' > /sys/bus/platform/devices/caihong-pen-power/attach_once
+# Current startup receiver (keeps charge inhibit high):
+printf 'startup\n' > /sys/bus/platform/devices/caihong-pen-power/attach_once
+# Separate boot only, older GPIO-controlled automatic-operation experiment:
+# printf '1\n' > /sys/bus/platform/devices/caihong-pen-power/attach_once
 # On a separate boot only, explicit stock ENTER_TX_MODE experiment instead:
 # printf 'tx\n' > /sys/bus/platform/devices/caihong-pen-power/attach_once
 # On another fresh boot, guarded stock final supply-cycle experiment instead:
@@ -22,7 +27,9 @@ cat /sys/bus/platform/devices/caihong-pen-power/status
 cat /sys/bus/platform/devices/caihong-pen-power/attach_status
 ```
 
-The module keeps the one-attempt latch shared with `probe_once`. Firmware must
+The module keeps the one-attempt latch shared with `probe_once`. The `startup`
+request is described below; the older `1`, `tx` and `cycle` experiments use
+the following protection setup. Firmware must
 match the identified `0x0118` before configuration writes are allowed. It
 programs the Caihong stock thresholds and verifies each readback: OCP 500,
 UVP 4000, OVP 12000 and FOD 400, plus the stock `0xffff` interrupt enable mask.
@@ -105,12 +112,16 @@ retry cannot obscure the original errno. The driver's latch prevented a
 second power attempt.
 
 Local validation includes W=1 compilation, checkpatch, the power/ACK tests,
-registration cleanup tests and 37 attachment fault cases. These cover checked
+registration cleanup tests and 55 attachment/startup fault cases. These cover checked
 protection writes, fresh identity validation and ordering, invalid/partial
 addresses, new-attachment reset, current/voltage/temperature limits, transport
 loss, deadline cutoff, explicit TX command gating, startup-mailbox isolation,
 supply-cycle default/readback failures, cutoff during the off interval and
-cleanup. They do not
+cleanup. Startup cases additionally cover both packet orders, readiness after
+1.5 seconds, permanent NACK, non-retryable I2C errors, unknown ID/firmware,
+IRQ-write failure, partial/invalid identities, transport loss and deadline
+cleanup. Startup permits only IRQ enable/clear writes; tests also check that
+the common power path cleans up startup success and failure. They do not
 replace the hardware test or prove reliable wireless charging.
 
 ## Explicit TX command result
@@ -176,16 +187,142 @@ was already present before testing. The working boot image and Stage4 touch
 module hashes are unchanged. Do not repeat the same sweep without a new
 wake/handshake result.
 
-Resume with the pen attached and a fresh boot before another powered test.
-Implement reception during the initial wake interval, capturing both checksum
-and address frames within one startup epoch. Keep the existing protection and
-cleanup checks; do not use the unmatched initial address as an authenticated
-identity or bypass the supply-cycle default gate. Early reception is the next
-implementation step, not functionality already present in Stage8b.
+At that checkpoint, the next step was reception during the initial wake
+interval, capturing both checksum and address frames within one startup epoch.
+Stage8d below implements and validates that step. The unmatched Stage8b
+snapshot is never promoted to a checksum-validated identity, and the
+supply-cycle default gate remains unchanged.
+
+## Stage8d: complete startup exchange
+
+The user resumed testing on 2026-09-24 with the pen attached. The `startup`
+request replaces the blind 2.5-second wake wait with early identification and
+IRQ/ASK handling inside the same 2.5-second observation budget. Only initial
+ID reads returning `-ENXIO` are retried, until the deadline; other I2C errors
+stop the test. ID `0x8601` and firmware `0x0118` must match before IRQ writes.
+The driver enables IRQs and processes the first pending flags, rather than
+clearing a baseline without reading its packet. The observer checks IRQ
+completion with a 5 ms polling fallback and retains both checksum/address
+frames within the current startup epoch.
+
+GPIO111 stays high; GPIO85 stays low. There is no permission-to-charge
+transition, TX command, protection-threshold write or supply reset in this
+request. The software cutoff covers readiness and packet reception. Telemetry
+uses the existing experiment limits, and success, timeout or fault all lead
+to physical power-off and minimum-HBOOST cleanup. Chip activity during this
+initial supply/wake sequence does not establish an automatic charging policy.
+
+An initial Stage8c test used only a 250 ms readiness window. It received 20
+ID NACKs and stopped after 0.282 seconds with successful cleanup and no
+configuration writes. Stage8d permits readiness throughout the existing wake
+window and records its duration. On a separate boot, it completed in 1.004
+seconds with `result=0 cleanup=0 poisoned=0 valid=0xff`:
+
+- ID `0x8601`, firmware `0x0118`, initial raw mode `0x1`.
+- Six IRQs, seven processed flag snapshots, two ASK packets, one checksum
+  frame and one address frame; `invalid=0 mac_valid=1`.
+- The checksum-validated address matches the user's known OPN2402 exactly.
+- Last telemetry VIN 5817, IIN 155, temperature 25, EPT 0.
+- End state inhibit high, supply/wake/scan low; the module unloaded cleanly.
+
+The event log puts the checksum frame about 0.46 seconds after supply-on and
+the address frame about 1.00 seconds after supply-on. This confirms that the
+old delayed receiver missed startup exchange data. Stage8d's first ID read
+already succeeded (`startup_ready_reads=1 startup_ready_ms=0`), so this run
+does **not** prove a longer readiness delay caused the success or explain
+Stage8c's NACKs. Keep the bounded NACK handling and record further occurrences.
+
+Ordinary Bluetooth discovery alongside this exchange did not expose the known
+pen address. While it remained attached, direct management pairing requests
+as LE Public and LE Random did not establish a connection and were cancelled.
+The cancellation's `Disconnected` result is a local outcome, not a pen
+rejection. The subsequent detached capture and filtered discovery below
+resolved this checkpoint. The existing NT36532E scan commands match the
+inspected vendor table; no new command or touch firmware was needed.
+
+## Bluetooth discovery and working pen input
+
+After the user removed the pen and tapped the screen, ordinary discovery
+again omitted it. HCI capture, however, received its exact verified public
+address in a connectable/scannable legacy `ADV_IND`, with name **OnePlus Pencil
+Pro** and appearance **Digital Pen (0x03c7)**. Its advertising flags were
+`0x04` (BR/EDR not supported), without the LE discoverable flags. Ordinary
+discovery received 79 other device entries in that run. Absence from the
+`bluetoothctl` list therefore did not mean absence of pen advertisements.
+
+An address `Pattern` discovery filter exposed the same device to BlueZ.
+`Connect` completed GATT service resolution; subsequent pairing with a
+NoInputNoOutput agent succeeded. Final state was Connected/Paired/Bonded and
+ServicesResolved true. Battery was initially 94%, later 93%. Standard device
+information reports manufacturer **Maxeye**, firmware
+`4D45.03.00.10 09:48:54 Feb 8 2025` (spacing normalized). The Bluetooth HID
+report map describes mouse/keyboard reports; touchscreen pen coordinates are
+confirmed separately through the existing Novatek input device. Actual
+addresses and raw captures remain private.
+
+With the pen connected and bonded, the existing scan helper found **mode 1**
+immediately: 171 IRQ/event reads and 170 new valid pen reports in its candidate
+window, with moving coordinates and nonzero tip pressure. No new SPI or pen
+checksum errors occurred. The helper stopped and retained mode 1. Although
+the stock enum calls this mode Havon, the pen's manufacturer string does not
+select the enum; use the observed result for this tested setup.
+
+A subsequent evtest capture recorded 13 matching pen-proximity enter/leave
+pairs, 13 tip-down/up pairs, 13 pressure-zero releases, 652 hover frames and
+462 contact frames. Maximum observed pressure was 10584 within the configured
+0–16383 range. The user confirmed working desktop pen taps. This establishes
+coordinates, pressure, hover and release behavior, without claiming tilt,
+buttons, reconnection or pen sleep/resume validation.
+
+No firmware was flashed or replaced. Keep the working Stage6b image, Stage4
+touch module and mode 1. The CPS diagnostic is unloaded and its supply is off;
+the Bluetooth bond is retained. Automatic wireless charging remains a separate
+implementation task.
+
+### Reproduce discovery and connection
+
+Use the locally known or CPS-checksum-validated address; it is deliberately not
+hardcoded in the repository. Take the powered pen off the magnetic rail and
+move/tap it before discovery. Start an interactive client so the discovery
+filter's D-Bus owner remains alive:
+
+```sh
+bluetoothctl --agent NoInputNoOutput
+```
+
+Within that client, replace `<pen-address>` with the actual address:
+
+```text
+menu scan
+transport le
+pattern <pen-address>
+back
+scan on
+```
+
+After the named device appears, run `connect <pen-address>`. On first setup,
+run `pair <pen-address>` as well; an existing bond does not need re-pairing.
+Use `info <pen-address>` to confirm connection and pairing, then `scan off`
+and `quit`. This workflow does not require making the host discoverable or
+modifying its address. No vendor GATT payload, firmware update or factory
+reset command is sent.
+
+For this already validated OPN2402 setup, enable the tested scan mode as root:
+
+```sh
+printf '1\n' > /sys/bus/spi/devices/spi0.0/pen_scan
+cat /sys/bus/spi/devices/spi0.0/pen_scan
+```
+
+The driver retains the selection across its panel/touch restarts, but a whole
+system reboot returns it to the unknown firmware default (`-1`). Automatic
+BlueZ reconnection and mode selection across boot are not installed by this
+manual diagnostic. The existing scan helper remains available when validating
+a different setup; a manufacturer label alone is not a protocol choice.
 
 ## Tested module artifacts
 
-All three modules target `7.2.0-00012-gb35f5cb0b661-dirty`. Local build
+All listed modules target `7.2.0-00012-gb35f5cb0b661-dirty`. Local build
 directories retain the exact source, binary, verification manifest and private
 hardware captures. The root-level copies now match the tested binaries:
 
@@ -194,6 +331,8 @@ hardware captures. The root-level copies now match the tested binaries:
 | `caihong_pen_power-stage8.ko` (GPIO-only test) | `25b62d7fe6894761cb6fdf827e82f2358833b5ee652de990af9011c320fa84d1` |
 | `caihong_pen_power-stage8a.ko` (explicit TX) | `a84a11d1b630ab021ce7ce5597628250b70ff1d7c37a832f21a36fe7abaf9f2e` |
 | `caihong_pen_power-stage8b.ko` (startup mailbox/default gate) | `ef5f0693147b8dece26590aee2f1293e7d890f26a983ae953201003adfccac45` |
+| `caihong_pen_power-stage8c.ko` (250 ms readiness experiment) | `d449a9f77ca0e70aa247a5aeb60b25d08efdf8bf498a74a70fcae2e5507dca71` |
+| `caihong_pen_power-stage8d.ko` (complete startup exchange) | `66936cfc82d8379ee00054312aa57ecb0aeb3acbc496df7d8cff0b89e618b65c` |
 
 These are manually loaded diagnostics, not boot-image updates or an automatic
 wireless charging service.

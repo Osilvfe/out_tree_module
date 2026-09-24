@@ -1,6 +1,6 @@
 # Caihong out-of-tree driver status
 
-Status date: 2026-09-23.
+Status date: 2026-09-24.
 
 This repository carries Caihong drivers that are not yet upstream and archives
 their bring-up evidence. The companion kernel tree remains the integration
@@ -179,6 +179,46 @@ unloaded and its supply was disabled; Wi-Fi/SSH remains working, and touch
 IRQ/frame counts advanced to 1092 without new SPI/checksum/start errors.
 Resume by implementing early startup reception and capturing both checksum
 and address frames with the pen attached, before another coordinate sweep.
+
+Testing resumed on 2026-09-24. Stage8c's early receiver allowed 250 ms for ID
+readiness, received only NACKs and exited cleanly without writes. Stage8d
+extends readiness across the existing 2.5-second wake window and services ASK
+as soon as the verified chip/firmware is ready. It keeps inhibit high and only
+writes IRQ enable/clear registers. On a separate boot, the full exchange passed
+in 1.004 seconds: `result=0 cleanup=0 poisoned=0`, six IRQs, seven flag
+snapshots, two ASK packets, one checksum frame, one address frame and
+`mac_valid=1`. The validated address matches the user's OPN2402. Last telemetry
+was VIN 5817, IIN 155, temperature 25 and EPT 0. Supply/wake/scan ended low and
+inhibit high; the module unloaded. Stage8d's first ID read succeeded, so the
+earlier NACK cause remains unresolved. Both frames arrived within the first
+second, explaining why the old 2.5-second delayed observation missed them.
+
+Bluetooth discovery during the exchange still did not show the known pen.
+Targeted LE Public and LE Random pairing requests did not connect and were
+cancelled; their final Disconnected status was caused by local cancellation.
+These attempts were made while the pen was attached. W=1 build,
+checkpatch, 55 attachment/startup cases and the existing registration/power
+checks pass, including common power cleanup on startup success/failure.
+
+After detachment, the HCI capture did receive a connectable advertisement from
+the verified address: **OnePlus Pencil Pro**, Digital Pen appearance, flags
+`0x04`. Ordinary BlueZ discovery omitted this non-discoverable advertisement.
+An address Pattern filter exposed it, after which connection, service
+resolution and pairing/bonding succeeded. Battery initially read 94%; GATT
+device information reports Maxeye and firmware `4D45.03.00.10` (2025-02-08).
+No firmware update or vendor GATT command was used.
+
+The connected/bonded pen then passed the existing mode-1 scan test: 171 fresh
+event reads, 170 valid coordinate/pressure reports, no new SPI/pen checksum
+errors. Mode 1 is retained. Evtest confirmed hover, contact, pressure-zero
+release and proximity exit (13 complete enter/leave and down/up pairs), and
+the user confirmed desktop pen taps. The stock Havon label for mode 1 does not
+override this measured result with a Maxeye-manufactured pen. Wi-Fi and touch
+remain working; no boot image or touchscreen module was replaced. The CPS
+diagnostic is unloaded with its supply off. Automatic Bluetooth reconnection,
+mode restoration across boot, pen suspend/resume, tilt/buttons and automatic
+wireless charging remain future tests/work. Reproduction steps are in
+[`cps8601-attachment.md`](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
