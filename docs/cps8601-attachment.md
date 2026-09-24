@@ -8,6 +8,12 @@ Address-filtered Bluetooth discovery and pairing then enabled working pen
 input on the existing touchscreen firmware. No boot image, Wi-Fi payload,
 touchscreen module or device tree is changed.
 
+Stage9 adds a separate bounded `charge` request after startup identity
+validation. Its first hardware run stopped before allowing charge because
+cold-start readiness consumed most of the handshake window. Stage9a separates
+those deadlines; hardware validation of that revision is pending. See
+[the bounded charge experiment](#stage9-bounded-charge-after-startup-identity).
+
 The pen must be magnetically attached during the experiment. After any power
 attempt, reboot before another attempt. Stage 2 only reserves resources when
 loaded; a separate root-only sysfs request enables the experiment:
@@ -326,6 +332,76 @@ restored connection and scan mode automatically. This does not run the CPS diagn
 Stop its timer before using the existing scan helper to validate a different
 setup; a manufacturer label alone is not a protocol choice.
 
+## Stage9: bounded charge after startup identity
+
+The stock driver allows charging by lowering GPIO111. Its final initialization
+also lowers wake GPIO15 and cycles the supply, but the earlier experiments
+did not establish reliable operation through those transitions. Stage8d
+instead established successful address exchange with GPIO15 high. The new
+`charge` request tests that already working wake state without a supply reset
+or explicit TX command. The older `cycle` default-protection gate is unchanged.
+
+On a fresh boot with the pen attached:
+
+```sh
+insmod /root/caihong_pen_power-stage9a.ko stage=2
+python3 - <<'PY'
+import os
+fd = os.open('/sys/bus/platform/devices/caihong-pen-power/attach_once', os.O_WRONLY)
+try:
+    os.write(fd, b'charge\n')
+finally:
+    os.close(fd)
+PY
+cat /sys/bus/platform/devices/caihong-pen-power/status
+cat /sys/bus/platform/devices/caihong-pen-power/attach_status
+rmmod caihong_pen_power
+```
+
+This remains one powered attempt per boot. The request must first identify
+chip `0x8601` / firmware `0x0118` and receive both checksum-valid address
+frames. It then requires current mode 1, checks telemetry and programs the
+stock OCP/UVP/OVP/FOD values 500/4000/12000/400 with readbacks. Pending
+removal, replacement, stop or fault events prevent the permission transition.
+Only then does it set GPIO85 high and GPIO111 low, keeping GPIO15 high.
+
+An independent delayed work cutoff covers the entire startup/charge attempt
+for 15 seconds. During the observation window, the existing voltage/current/
+temperature/EPT limits continue to apply, along with removal, identity loss,
+transport failure, pen stop packets and undefined IRQ bits. A stop packet
+records its SOC byte; it is never ignored as a normal data packet. Samples,
+current extrema, temperature maximum, duration and completion are exposed in
+the root-only attachment status. `charge_complete=1` means the bounded
+observation window completed, not proof that the pen battery gained energy.
+Common cleanup inhibits charge, cuts supply/wake/scan and lowers HBOOST.
+
+The first Stage9 (version 9.0) run took 2.519 seconds. Initial I2C readiness
+required 163 ID reads and 2024 ms. The initial mode was 2; subsequent IRQs
+included one checksum packet, but no address frame arrived before the
+original 2.5-second startup deadline. It stopped with `result=-110`,
+`enabled=0`, zero charge samples, `cleanup=0` and no transport poison. Last
+VIN/IIN/temperature were 5817/154/25 with EPT 0. All power controls were off
+after cleanup, the module unloaded and Wi-Fi stayed connected. Bluetooth
+battery was 90% before and after. No protection writes or charge-permission
+transition occurred because complete identity was absent.
+
+Stage9a (version 9.1) retains the 2.5-second initial readiness limit and, for
+the new `charge` request only, starts a separate 2.5-second handshake window
+after identification. The total independent cutoff remains 15 seconds. The
+legacy `startup` request keeps its original 2.5-second total window. This
+addresses the measured cold-start timing, without treating a checksum-only
+exchange as identity or increasing the powered charge budget. Stage9a passed
+W=1 compilation, checkpatch and 76 attachment/startup/charge cases, plus the
+power/ACK and registration tests. The cases include a chip ready only at
+2 seconds, an address arriving at 3 seconds, missing identity, wrong mode,
+protection write/readback failures, removal/replacement, stop packets,
+undefined IRQs, telemetry limits and independent cutoff cleanup.
+
+After the first run, the tablet was rebooted for the next powered attempt.
+Stage9a hardware validation is pending reconnection. Neither version is an
+automatic charger or boot-time module; the existing paired-pen recovery
+service remains independent.
+
 ## Tested module artifacts
 
 All listed modules target `7.2.0-00012-gb35f5cb0b661-dirty`. Local build
@@ -339,6 +415,8 @@ hardware captures. The root-level copies now match the tested binaries:
 | `caihong_pen_power-stage8b.ko` (startup mailbox/default gate) | `ef5f0693147b8dece26590aee2f1293e7d890f26a983ae953201003adfccac45` |
 | `caihong_pen_power-stage8c.ko` (250 ms readiness experiment) | `d449a9f77ca0e70aa247a5aeb60b25d08efdf8bf498a74a70fcae2e5507dca71` |
 | `caihong_pen_power-stage8d.ko` (complete startup exchange) | `66936cfc82d8379ee00054312aa57ecb0aeb3acbc496df7d8cff0b89e618b65c` |
+| `caihong_pen_power-stage9.ko` (timed out before charge permission) | `76ea742b81b30c043fc49e5afe76c96074366a1e66dc2dddd48fa14e51a628d8` |
+| `caihong_pen_power-stage9a.ko` (built; hardware test pending) | `e35d9c5078667bb6fbb27239edd1a2b27a8b502d814ee2e765de85e3414ade15` |
 
 These are manually loaded diagnostics, not boot-image updates or an automatic
 wireless charging service.

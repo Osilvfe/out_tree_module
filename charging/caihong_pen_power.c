@@ -34,6 +34,7 @@
 #define PEN_INT_REMOVE BIT(10)
 #define PEN_INT_ASK BIT(5)
 #define PEN_INT_FAULT (BIT(6) | BIT(7) | BIT(8) | BIT(13))
+#define PEN_INT_UNDEFINED (BIT(11) | BIT(14) | BIT(15))
 
 /* No boot-time activation: select a stage explicitly after reaching userspace. */
 static unsigned int stage;
@@ -71,12 +72,16 @@ struct pen_boost_request {
 
 struct pen_exchange {
 	u32 events, attaches, removes, asks, checks, addresses, invalid;
+	u32 charge_samples, charge_ms, stop_packets;
+	u16 flags_seen, charge_iin_min, charge_iin_max, charge_temp_max;
+	u8 stop_soc;
 	u16 initial_flags, last_flags, vin, iin, temp, ept;
 	u16 command_before, command_after, mode_after;
 	u16 defaults[4], after_cycle[4];
 	u8 defaults_valid, cycle_valid, initial_raw[11];
 	u8 raw[11], mac[6], check[3];
 	bool have_check, have_address, mac_valid, enabled, initial_raw_valid, cycled;
+	bool charge_complete;
 };
 
 struct pen_power {
@@ -93,6 +98,7 @@ struct pen_power {
 	atomic_t cutoff_fired, irq_count;
 	struct pen_exchange exchange;
 	bool attach_requested, tx_requested, cycle_requested, startup_requested;
+	bool charge_requested;
 	u32 startup_ready_reads, startup_ready_ms;
 	bool up, pending, poisoned, active, suspended;
 	bool hardware_ready;
@@ -261,7 +267,8 @@ static int pen_write(struct pen_power *pen, u16 reg, unsigned int len, u16 value
 	int ret;
 
 	/* Only stock protection/IRQ registers and the explicitly requested TX bit. */
-	if (pen->startup_requested && reg != 5 && reg != 9)
+	if (pen->startup_requested && reg != 5 && reg != 9 &&
+	    !(pen->charge_requested && pen->exchange.mac_valid))
 		return -EPERM;
 	if (reg == 0xb) {
 		if (len != 1 || value != BIT(1) || !pen->tx_requested ||
@@ -325,7 +332,12 @@ static int pen_packet(struct pen_exchange *ex)
 		ex->have_address = true;
 	} else {
 		/* Stock treats 0x28/0x17 as an instruction to stop charging. */
-		return p[0] == 0x28 && p[1] == 0x17 ? -ECANCELED : 0;
+		if (p[0] == 0x28 && p[1] == 0x17) {
+			ex->stop_packets++;
+			ex->stop_soc = p[2];
+			return -ECANCELED;
+		}
+		return 0;
 	}
 	if (!ex->have_check || !ex->have_address)
 		return 0;
@@ -516,6 +528,7 @@ static int pen_receive(struct pen_power *pen)
 		return ret;
 	ex->events++;
 	ex->last_flags = flags;
+	ex->flags_seen |= flags;
 	/* Consume stale/aborted identity before accepting any new packet. */
 	if (flags & PEN_INT_ATTACH) {
 		ex->attaches++;
@@ -621,17 +634,111 @@ static int pen_attach(struct pen_power *pen)
 	return ret;
 }
 
+static int pen_charge(struct pen_power *pen, unsigned long deadline)
+{
+	struct pen_exchange *ex = &pen->exchange;
+	unsigned long started, sample_at;
+	int ret;
+
+	pen->phase = "charge-protect";
+	if (!pen->charge_requested || !ex->mac_valid || pen->valid != 0xff ||
+	    pen->values[0] != 0x8601 || pen->values[1] != 0x0118)
+		return -EOPNOTSUPP;
+	ret = pen_read(pen, 4, 1, &ex->mode_after);
+	if (!ret && ex->mode_after != 1)
+		ret = -EOPNOTSUPP;
+	if (!ret)
+		ret = pen_sample(pen);
+	if (!ret)
+		ret = pen_write_checked(pen, 0x28, 500);
+	if (!ret)
+		ret = pen_write_checked(pen, 0x2c, 4000);
+	if (!ret)
+		ret = pen_write_checked(pen, 0x2a, 12000);
+	if (!ret)
+		ret = pen_write_checked(pen, 0x2f, 400);
+	/* Do not discard a removal, new attachment or stop packet during setup. */
+	if (!ret)
+		ret = pen_receive(pen);
+	if (!ret && !ex->mac_valid)
+		ret = -ENOLINK;
+	if (!ret && (ex->flags_seen & PEN_INT_UNDEFINED))
+		ret = -EPROTO;
+	if (ret)
+		return ret;
+	mutex_lock(&pen->power_lock);
+	if (atomic_read(&pen->cutoff_fired) || completion_done(&pen->lost) ||
+	    time_after_eq(jiffies, deadline)) {
+		ret = -ECANCELED;
+	} else if (gpiod_get_value_cansleep(pen->disable) != 1 ||
+		   gpiod_get_value_cansleep(pen->supply) != 1 ||
+		   gpiod_get_value_cansleep(pen->wake) != 1) {
+		ret = -EIO;
+	} else {
+		/* Keep the verified startup wake state; no reset or TX command. */
+		gpiod_set_value_cansleep(pen->scan, 1);
+		gpiod_set_value_cansleep(pen->disable, 0);
+		ex->enabled = true;
+		if (gpiod_get_value_cansleep(pen->disable) != 0 ||
+		    gpiod_get_value_cansleep(pen->scan) != 1)
+			ret = -EIO;
+	}
+	mutex_unlock(&pen->power_lock);
+	if (ret)
+		return ret;
+	pen->phase = "charge-observe";
+	started = jiffies;
+	sample_at = jiffies;
+	dev_info(pen->dev, "charge=observe; total startup/charge budget %u ms\n", PEN_ATTACH_MS);
+	while (!ret) {
+		if (time_after_eq(jiffies, deadline)) {
+			ex->charge_complete = true;
+			break;
+		}
+		if (atomic_read(&pen->cutoff_fired) || completion_done(&pen->lost)) {
+			ret = -ECANCELED;
+			break;
+		}
+		if (time_after_eq(jiffies, sample_at)) {
+			ret = pen_sample(pen);
+			if (ret)
+				break;
+			if (!ex->charge_samples || ex->iin < ex->charge_iin_min)
+				ex->charge_iin_min = ex->iin;
+			if (ex->iin > ex->charge_iin_max)
+				ex->charge_iin_max = ex->iin;
+			if (ex->temp > ex->charge_temp_max)
+				ex->charge_temp_max = ex->temp;
+			ex->charge_samples++;
+			if (ex->charge_samples % 10 == 1)
+				dev_info(pen->dev, "charge=sample vin=%u iin=%u temp=%u ept=%#x\n",
+					 ex->vin, ex->iin, ex->temp, ex->ept);
+			sample_at = jiffies + msecs_to_jiffies(100);
+		}
+		ret = pen_receive(pen);
+		if (!ret && !ex->mac_valid)
+			ret = -ENOLINK;
+		if (!ret && (ex->flags_seen & PEN_INT_UNDEFINED))
+			ret = -EPROTO;
+		if (!ret)
+			wait_for_completion_timeout(&pen->event, msecs_to_jiffies(20));
+	}
+	ex->charge_ms = jiffies_to_msecs(jiffies - started);
+	return ret;
+}
+
 static int pen_startup(struct pen_power *pen)
 {
 	unsigned long started = jiffies;
 	unsigned long deadline = started + msecs_to_jiffies(PEN_STARTUP_MS);
+	unsigned int budget = pen->charge_requested ? PEN_ATTACH_MS : PEN_STARTUP_MS;
 	unsigned long sample_at = jiffies;
 	u16 id;
 	int ret;
 
 	pen->phase = "startup-identify";
 	if (!queue_delayed_work(system_unbound_wq, &pen->cutoff_work,
-				msecs_to_jiffies(PEN_STARTUP_MS)))
+				msecs_to_jiffies(budget)))
 		return -EBUSY;
 	/* Only initial address NACK is retryable while firmware starts executing. */
 	for (;;) {
@@ -656,7 +763,13 @@ static int pen_startup(struct pen_power *pen)
 		ret = -EOPNOTSUPP;
 	if (ret)
 		goto out;
-	/* No TX/protection writes or permission transition in this experiment. */
+	/* A cold start can consume 2 s before the first ACK. Give the charge
+	 * request its full handshake window after identification, still covered
+	 * by the original 15 s physical cutoff. Legacy startup stays unchanged.
+	 */
+	if (pen->charge_requested)
+		deadline = jiffies + msecs_to_jiffies(PEN_STARTUP_MS);
+	/* Initial reception keeps charge inhibit high and scan low. */
 	if (gpiod_get_value_cansleep(pen->disable) != 1 ||
 	    gpiod_get_value_cansleep(pen->supply) != 1 ||
 	    gpiod_get_value_cansleep(pen->wake) != 1 ||
@@ -685,10 +798,12 @@ static int pen_startup(struct pen_power *pen)
 		if (!ret && !pen->exchange.mac_valid)
 			wait_for_completion_timeout(&pen->event, msecs_to_jiffies(5));
 	}
+	if (!ret && pen->charge_requested)
+		ret = pen_charge(pen, started + msecs_to_jiffies(budget));
 out:
 	cancel_delayed_work_sync(&pen->cutoff_work);
 	pen_off(pen);
-	if (atomic_read(&pen->cutoff_fired))
+	if (atomic_read(&pen->cutoff_fired) && !pen->exchange.charge_complete)
 		ret = -ETIMEDOUT;
 	dev_info(pen->dev, "startup result=%d reads=%u checks=%u addresses=%u valid=%u\n",
 		 ret, pen->startup_ready_reads, pen->exchange.checks,
@@ -764,7 +879,7 @@ static ssize_t pen_start(struct device *dev, const char *buf, size_t count, bool
 
 	if (!sysfs_streq(buf, "1") &&
 	    !(attach && (sysfs_streq(buf, "tx") || sysfs_streq(buf, "cycle") ||
-			 sysfs_streq(buf, "startup"))))
+			 sysfs_streq(buf, "startup") || sysfs_streq(buf, "charge"))))
 		return -EINVAL;
 	if (!pen->hardware_ready)
 		return -EOPNOTSUPP;
@@ -787,7 +902,8 @@ static ssize_t pen_start(struct device *dev, const char *buf, size_t count, bool
 	pen->attach_requested = attach;
 	pen->tx_requested = attach && sysfs_streq(buf, "tx");
 	pen->cycle_requested = attach && sysfs_streq(buf, "cycle");
-	pen->startup_requested = attach && sysfs_streq(buf, "startup");
+	pen->charge_requested = attach && sysfs_streq(buf, "charge");
+	pen->startup_requested = attach && (sysfs_streq(buf, "startup") || pen->charge_requested);
 	pm_stay_awake(dev);
 	pen->result = pen_run(pen);
 	spin_lock_irqsave(&pen->ack_lock, flags);
@@ -827,6 +943,7 @@ static ssize_t attach_status_show(struct device *dev, struct device_attribute *a
 		"enabled=%u cutoff=%d irq=%d events=%u attaches=%u removes=%u asks=%u checks=%u addresses=%u invalid=%u initial_flags=%#x last_flags=%#x\n"
 		"tx_requested=%u command_before=%#x command_after=%#x mode_after=%#x\n"
 		"startup_requested=%u startup_ready_reads=%u startup_ready_ms=%u\n"
+		"charge_requested=%u charge_complete=%u charge_samples=%u charge_ms=%u charge_iin_min=%u charge_iin_max=%u charge_temp_max=%u stop_packets=%u stop_soc=%u flags_seen=%#x\n"
 		"cycle_requested=%u cycled=%u defaults_valid=%#x defaults=%u,%u,%u,%u cycle_valid=%#x after_cycle=%u,%u,%u,%u\n"
 		"initial_raw_valid=%u initial_raw=%*ph\n"
 		"mac_valid=%u mac=%pM vin=%u iin=%u temperature=%u ept=%#x raw=%*ph\n",
@@ -835,6 +952,9 @@ static ssize_t attach_status_show(struct device *dev, struct device_attribute *a
 		ex->invalid, ex->initial_flags, ex->last_flags,
 		pen->tx_requested, ex->command_before, ex->command_after, ex->mode_after,
 		pen->startup_requested, pen->startup_ready_reads, pen->startup_ready_ms,
+		pen->charge_requested, ex->charge_complete, ex->charge_samples, ex->charge_ms,
+		ex->charge_iin_min, ex->charge_iin_max, ex->charge_temp_max,
+		ex->stop_packets, ex->stop_soc, ex->flags_seen,
 		pen->cycle_requested, ex->cycled, ex->defaults_valid,
 		ex->defaults[0], ex->defaults[1], ex->defaults[2], ex->defaults[3],
 		ex->cycle_valid, ex->after_cycle[0], ex->after_cycle[1],
@@ -1196,5 +1316,5 @@ static void __exit pen_exit(void)
 module_exit(pen_exit);
 
 MODULE_DESCRIPTION("Caihong CPS8601 bounded power, ID and attachment diagnostics");
-MODULE_VERSION("8.4");
+MODULE_VERSION("9.1");
 MODULE_LICENSE("GPL");

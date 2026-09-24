@@ -247,6 +247,16 @@ Wi-Fi reconnected as well. The user confirmed normal drawing and pressure in
 Krita after this reboot without manual connection or mode commands; see
 [`pen-autoconnect.md`](pen-autoconnect.md) for installation and rollback.
 
+The subsequent charging investigation adds a bounded `charge` diagnostic
+after the validated startup identity exchange. Stage9's first attached-pen
+run needed 2024 ms for I2C readiness, received only the checksum frame and
+timed out before permitting charge. Cleanup and module removal succeeded;
+Wi-Fi remained connected. Stage9a separates readiness and handshake windows
+while retaining a 15-second total cutoff. Its 76 fault cases, W=1 build,
+checkpatch and existing power/registration tests pass; hardware validation is
+pending reconnection after the required fresh boot. See
+[`cps8601-attachment.md`](cps8601-attachment.md#stage9-bounded-charge-after-startup-identity).
+
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

@@ -14,6 +14,10 @@ missed the initial exchange; an explicit TX command produced undefined flags
 `0x800` then I2C NACK. The guarded supply-cycle experiment was blocked by
 mismatching power-on protection defaults and remains untested.
 See [bounded attachment experiments](cps8601-attachment.md).
+The new [bounded charge diagnostic](cps8601-attachment.md#stage9-bounded-charge-after-startup-identity)
+requires fresh identity, TX mode and checked protection thresholds before
+allowing a short observation. Its first run stopped before enabling charge;
+Stage9a adjusts the measured cold-start handshake timing and awaits testing.
 Keep that touch module and the v9 Wi-Fi payload unchanged while investigating.
 
 ## Resumed pen test preparation
