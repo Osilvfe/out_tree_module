@@ -66,6 +66,7 @@
 		port {
 			caihong_front_cam_ep: endpoint {
 				data-lanes = <0 1 2 3>;
+				clock-lanes = <7>;
 				/*
 				 * 366 MHz is derived from known SC820CS 732 Mbps/lane
 				 * 4-lane configurations.  Streaming remains disabled in
