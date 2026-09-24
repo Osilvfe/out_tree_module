@@ -35,9 +35,9 @@ sensor set below.
 
 | Function | Registry hardware | Downstream bus / IRQ | Mainline plan |
 | --- | --- | --- | --- |
-| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | identify exact ICM42607-family variant, then adapt the upstream IIO support that landed after Linux 7.2; transport split is intentionally deferred |
-| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | `mmc5633.ko` is an external I2C-only variant derived from the MMC5603/MMC5633 driver already present in Linux v7.2; exact silicon compatible still needs runtime/firmware evidence |
-| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | `tcs3701.ko` provides a direct-I2C IIO bring-up path for raw clear/R/G/B and proximity data; IRQ thresholds, board calibration and lux/CCT conversion remain future work |
+| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | official `inv_icm42607` modules are available; keep the AP node disabled until SSC ownership and both rails are confirmed |
+| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | `mmc5633.ko` is an external I2C-only variant derived from the official MMC5603/MMC5633 driver; the optional `caihong-i2c2-sensors.dtsi` uses the registry's MMC5603 name |
+| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | `tcs3701.ko` provides a direct-I2C IIO bring-up path for raw clear/R/G/B and proximity data; the optional DTS fragment omits rails and IRQ until they are mapped |
 | Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | `bu52053nvx.ko` in this tree exposes standard `EV_SW/SW_LID` |
 | free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
 | barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
@@ -133,17 +133,34 @@ The resulting modules only prove source/API compatibility.  Loading them on a
 kernel whose DTS still assigns the same SPI controller to SSC is deliberately
 unsupported.
 
+## AP bus mapping and optional probe fragment
+
+The vendor QUPv3 description numbers its first wrapper's serial engines from
+zero.  Therefore SSC SPI instance 3 maps to mainline `spi3` at `0x00a8c000`
+(QUPv3 SE3), and SSC I2C instance 2 maps to mainline `i2c2` at `0x00a88000`
+(QUPv3 SE2).  The Caihong board currently enables `spi4` for the touchscreen;
+`spi3` remains disabled, so this mapping does not overlap the touch controller.
+
+`caihong-i2c2-sensors.dtsi` contains the registry-confirmed `0x30` MMC5603
+and `0x39` TCS3701 child nodes.  It is an opt-in probe fragment: include it
+only after confirming SSC has released I2C2 and the sensor rails are powered.
+The official ICM42607 driver requires `vdd` and `vddio` regulators and is kept
+out of DTS until those rails are mapped.  Its current upstream implementation
+uses one-shot IIO reads and does not consume the registry's SSC IRQ number;
+that IRQ remains a future buffered-sampling concern.
+
 ## Next sensor work
 
-1. map SSC SPI instance 3 and I2C instance 2 to the exact SM8650 QUP serial
-   engines and pin states;
+1. confirm SSC release and hardware-test the optional I2C2 fragment;
 2. identify the exact `icm4x607` silicon variant from SSC firmware/WHO_AM_I;
-3. identify MMC5603 vs MMC5633 from runtime/firmware evidence and select the
+3. map the ICM42607 `vdd`/`vddio` rails and select the matching `spi3` DT
+   compatible;
+4. identify MMC5603 vs MMC5633 from runtime/firmware evidence and retain the
    matching DT compatible for `mmc5633.ko`;
-4. hardware-test TCS3701 raw ALS/proximity over the AP-owned I2C path, then add
+5. hardware-test TCS3701 raw ALS/proximity over the AP-owned I2C path, then add
    IRQ thresholds and calibration only after the electrical path is proven;
-5. recover the PMIC regulator behind `sensor_vddio` / `sensor_vdd`;
-6. identify the barometer only from evidence (SSC registry/runtime info), not
+6. recover the PMIC regulator behind `sensor_vddio` / `sensor_vdd`;
+7. identify the barometer only from evidence (SSC registry/runtime info), not
    from a generic SM8650 parts list.
 
 ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE

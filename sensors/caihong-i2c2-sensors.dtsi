@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Optional Caihong sensor probe nodes.
+ *
+ * The SSC registry maps sensor I2C instance 2 to SM8650 QUPv3 SE2
+ * (mainline &i2c2 at 0x00a88000), with the devices at 0x30 and 0x39.
+ * This fragment is intentionally not included by the Caihong board DTS.
+ * Include it only for a controlled AP-bus probe after confirming that SSC
+ * has released this bus and that the sensor rails are already powered.
+ */
+
+&i2c2 {
+	mmc5603@30 {
+		compatible = "memsic,mmc5603";
+		reg = <0x30>;
+		status = "okay";
+	};
+
+	tcs3701@39 {
+		compatible = "ams,tcs3701";
+		reg = <0x39>;
+		status = "okay";
+	};
+};

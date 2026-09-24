@@ -5,6 +5,7 @@ on:
     paths:
       - 'sensors/**/*.c'
       - 'sensors/**/*.h'
+      - 'sensors/**/*.dtsi'
       - 'sensors/**/Kconfig'
       - 'sensors/Makefile'
       - 'sensors/**/Makefile'
@@ -13,6 +14,7 @@ on:
     paths:
       - 'sensors/**/*.c'
       - 'sensors/**/*.h'
+      - 'sensors/**/*.dtsi'
       - 'sensors/**/Kconfig'
       - 'sensors/Makefile'
       - 'sensors/**/Makefile'
