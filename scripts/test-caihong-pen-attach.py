@@ -65,6 +65,8 @@ static void put_unaligned_be16(u16 v, u8 *p) { p[0] = v >> 8; p[1] = v; }
 static void *memchr_inv(const void *ptr, int value, size_t n)
 { const u8 *p = ptr; for (size_t i = 0; i < n; i++) if (p[i] != value) return (void *)(p+i); return NULL; }
 '''
+shim += next(line for line in source.splitlines()
+             if line.startswith('#define PEN_SYS_MODE_TX ')) + '\n'
 hardware = r'''
 struct pen_power {
     struct i2c_client *i2c;
@@ -83,7 +85,7 @@ struct pen_power {
 static unsigned long jiffies;
 static int system_unbound_wq;
 static struct pen_power *current;
-static unsigned int scenario, allow_count, event_index, writes;
+static unsigned int scenario, allow_count, event_index, writes, id_reads;
 static u8 registers[0x50];
 static bool cutoff_checked;
 static const u8 check_packet[11] = {0x48, 0xc1, 0x77, 0x55, 0x31};
@@ -154,7 +156,7 @@ static int i2c_transfer(void *adapter, struct i2c_msg *m, int n)
     if (current->startup_requested && !current->charge_requested)
         assert(reg == 5 || reg == 6 || reg == 9 || reg == 10);
     if (current->charge_requested) {
-        assert(reg != 0xb);
+        assert(reg != 0xb && reg != 4);
         if (reg != 5 && reg != 6 && reg != 9 && reg != 10)
             assert(current->exchange.mac_valid && !current->exchange.enabled);
     }
@@ -163,7 +165,7 @@ static int i2c_transfer(void *adapter, struct i2c_msg *m, int n)
     if (reg == 0xb) {
         assert(current->tx_requested && current->exchange.enabled && m->buf[2] == 2);
         if (scenario == 25) return -EIO;
-        registers[0xb] = 0; registers[4] = 1;
+        registers[0xb] = 0; registers[4] = 2;
         return 1;
     }
     const u16 failed_regs[] = {0x28, 0x2c, 0x2a, 0x2f, 5};
@@ -178,11 +180,27 @@ static int pen_read(struct pen_power *p, u16 reg, unsigned int len, u16 *value)
 {
     if (p->lost.done) return -ENOTCONN;
     assert(reg + len <= ARRAY_SIZE(registers) && (len == 1 || len == 2));
+    if (reg == 0) id_reads++;
+    if (reg == 0 && id_reads == 2) {
+        if (scenario == 80) return -ENXIO;
+        if (scenario == 82) return -EIO;
+    }
+    if (scenario == 81 && reg == 2) return -ENXIO;
+    if (scenario == 83) {
+        if (reg == 0 && p->startup_ready_reads == 2) assert(!p->valid);
+        if (reg == 0x3e && p->startup_ready_reads == 1) return -ENXIO;
+    }
     if (p->charge_requested) {
         if (reg == 0 && ((scenario == 73 || scenario == 75) && jiffies < 2000)) return -ENXIO;
         if (reg == 0 && scenario == 74) return -ENXIO;
         if (reg == 7 && event_index == 1 && scenario == 73 && jiffies < 3000) { *value = 0; return 0; }
-        if (scenario == 56 && reg == 4) { *value = 2; return 0; }
+        if (scenario == 56 && reg == 4) { *value = 1; return 0; }
+        if (reg == 4 && event_index >= 2) {
+            if (scenario == 76) { *value = 0; return 0; }
+            if (scenario == 77) { *value = 3; return 0; }
+            if (scenario == 78) return -ENXIO;
+            if (scenario == 79) { *value = 2; return 0; }
+        }
         if (scenario == 60 && reg == 0x2f) { *value = 399; return 0; }
         if (scenario == 69 && reg == 0x28) pen_cutoff(&p->cutoff_work.work);
         if (event_index >= 2 && reg == 7) {
@@ -253,12 +271,12 @@ static int pen_read(struct pen_power *p, u16 reg, unsigned int len, u16 *value)
 tests = r'''
 int main(void)
 {
-    for (scenario = 0; scenario <= 75; scenario++) {
+    for (scenario = 0; scenario <= 83; scenario++) {
         struct gpio_desc gpios[4] = {{1},{1},{1},{0}};
         struct i2c_client client = {0};
         struct pen_power p = { .i2c=&client, .disable=&gpios[0], .supply=&gpios[1],
           .wake=&gpios[2], .scan=&gpios[3], .valid=0xff, .values={0x8601, 0x0118} };
-        current=&p; jiffies=0; writes=allow_count=event_index=0; cutoff_checked=false;
+        current=&p; jiffies=0; writes=allow_count=event_index=id_reads=0; cutoff_checked=false;
         memset(registers, 0, sizeof(registers));
         set_reg(0, 0x8601); set_reg(2, 0x0118);
         set_reg(7, 0x3d); set_reg(0x34, 5800); set_reg(0x38, 125); registers[0x3a]=25;
@@ -273,23 +291,27 @@ int main(void)
         }
         if (scenario == 28) set_reg(0x28, 600);
         if (scenario >= 37) p.startup_requested = true;
-        if (scenario >= 55) { p.charge_requested = true; registers[4] = 1; }
+        if (scenario >= 55) { p.charge_requested = true; registers[4] = 2; }
+        if (scenario == 79) registers[4] = 1;
         int ret=p.startup_requested ? pen_startup(&p) : pen_attach(&p);
         assert(!p.cutoff_work.queued);
         if (p.charge_requested) {
             assert(p.disable->value == 1 && !p.supply->value && !p.wake->value && !p.scan->value);
             assert(!p.exchange.cycled && !p.tx_requested && !p.cycle_requested);
-            if (scenario == 55 || scenario == 73) {
+            if (scenario == 55 || scenario == 73 || scenario == 79 || scenario == 80 || scenario == 83) {
                 assert(!ret && p.exchange.charge_complete && p.exchange.mac_valid && allow_count == 1);
                 assert(jiffies >= PEN_ATTACH_MS && jiffies < PEN_ATTACH_MS + 20 && cutoff_checked);
-                assert(p.exchange.charge_samples == (scenario == 55 ? 150 : 120));
+                assert(p.exchange.charge_samples == (scenario == 73 ? 120 : 150));
+                assert(p.exchange.mode_after == 2);
+                if (scenario == 79) assert(p.values[2] == 1);
                 assert(p.exchange.charge_iin_min == 125 && p.exchange.charge_iin_max == 125);
                 assert(p.exchange.charge_temp_max == 25);
             } else assert(ret < 0 && !p.exchange.charge_complete);
-            if (scenario <= 61 || scenario == 69 || scenario == 71 || scenario >= 74) {
+            if (scenario <= 61 || scenario == 69 || scenario == 71 || (scenario >= 74 && scenario <= 78) || scenario == 81 || scenario == 82) {
                 if (scenario != 55) assert(!allow_count && !p.exchange.enabled);
             } else assert(allow_count == 1);
-            if (scenario == 56) assert(ret == -EOPNOTSUPP);
+            if (scenario == 56 || scenario == 76 || scenario == 77) assert(ret == -EOPNOTSUPP);
+            if (scenario == 78) assert(ret == -ENXIO);
             if (scenario == 57) assert(ret == -ETIMEDOUT && jiffies == PEN_STARTUP_MS);
             if (scenario == 58) assert(ret == -EBADMSG);
             if (scenario == 61 || scenario == 70) assert(ret == -ENOLINK);
@@ -301,6 +323,9 @@ int main(void)
             if (scenario == 73 || scenario == 75) assert(p.startup_ready_ms == 2000);
             if (scenario == 74) assert(ret == -ETIMEDOUT && jiffies == 2500 && !writes);
             if (scenario == 75) assert(ret == -ETIMEDOUT && jiffies == 4500);
+            if (scenario == 80 || scenario == 83) assert(p.startup_ready_reads == 2 && p.startup_ready_ms == 5 && p.valid == 0xff);
+            if (scenario == 81) assert(ret == -ETIMEDOUT && jiffies == 2500 && !writes);
+            if (scenario == 82) assert(ret == -EIO && p.startup_ready_reads == 1 && !writes);
             continue;
         }
         if (p.startup_requested) {
@@ -344,7 +369,7 @@ int main(void)
         if (scenario == 2) assert(ret == -EBADMSG && p.exchange.invalid == 1);
         if (scenario == 19) assert(ret == -ENOTCONN);
         if (scenario == 20) assert(ret == -EIO);
-        if (scenario == 24) assert(p.exchange.mode_after == 1 && !p.exchange.command_after);
+        if (scenario == 24) assert(p.exchange.mode_after == 2 && !p.exchange.command_after);
         if (scenario == 27) assert(p.exchange.cycled && p.exchange.cycle_valid == 15);
         if (scenario == 29) assert(ret == -EIO && p.exchange.cycle_valid == 1);
         if (scenario == 30 || scenario == 31) assert(!p.exchange.cycled && !p.supply->value);
@@ -356,7 +381,7 @@ int main(void)
         assert(pen_write(&p, 0xb, 1, 2) == -EPERM);
         assert(pen_write(&p, 0x1234, 2, 0) == -EPERM && writes == previous);
     }
-    puts("PASS: 76 cases; attachment, startup and bounded charge; cold-start handshake, protections, limits, stop/removal, loss/cutoff and cleanup");
+    puts("PASS: 84 cases; attachment, startup and bounded charge; firmware TX mode, transient startup NACK, cold-start handshake, protections, limits, stop/removal, loss/cutoff and cleanup");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='pen-attach-') as temp:

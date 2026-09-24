@@ -11,7 +11,11 @@ touchscreen module or device tree is changed.
 Stage9 adds a separate bounded `charge` request after startup identity
 validation. Its first hardware run stopped before allowing charge because
 cold-start readiness consumed most of the handshake window. Stage9a separates
-those deadlines; hardware validation of that revision is pending. See
+those deadlines and validated identity on hardware, but its mode-1 guard
+stopped before charge permission. Stage9b corrects the guard to mode 2 using
+the stock application firmware, but its hardware run stopped earlier on a
+startup NACK after the first ID ACK. Stage9c addresses that incomplete
+readiness check; its powered hardware test is pending. See
 [the bounded charge experiment](#stage9-bounded-charge-after-startup-identity).
 
 The pen must be magnetically attached during the experiment. After any power
@@ -344,7 +348,7 @@ or explicit TX command. The older `cycle` default-protection gate is unchanged.
 On a fresh boot with the pen attached:
 
 ```sh
-insmod /root/caihong_pen_power-stage9a.ko stage=2
+insmod /root/caihong_pen_power-stage9c.ko stage=2
 python3 - <<'PY'
 import os
 fd = os.open('/sys/bus/platform/devices/caihong-pen-power/attach_once', os.O_WRONLY)
@@ -360,7 +364,7 @@ rmmod caihong_pen_power
 
 This remains one powered attempt per boot. The request must first identify
 chip `0x8601` / firmware `0x0118` and receive both checksum-valid address
-frames. It then requires current mode 1, checks telemetry and programs the
+frames. Stage9b then requires current mode 2, checks telemetry and programs the
 stock OCP/UVP/OVP/FOD values 500/4000/12000/400 with readbacks. Pending
 removal, replacement, stop or fault events prevent the permission transition.
 Only then does it set GPIO85 high and GPIO111 low, keeping GPIO15 high.
@@ -397,9 +401,83 @@ power/ACK and registration tests. The cases include a chip ready only at
 protection write/readback failures, removal/replacement, stop packets,
 undefined IRQs, telemetry limits and independent cutoff cleanup.
 
-After the first run, the tablet was rebooted for the next powered attempt.
-Stage9a hardware validation is pending reconnection. Neither version is an
-automatic charger or boot-time module; the existing paired-pen recovery
+After the first run, the user reported an unexpected boot-slot switch and
+restored Linux startup. Stage9a then ran once on that fresh boot. It received
+both checksum and address frames, validated the known pen identity, and
+stopped after 0.971 seconds with `result=-95`, `phase=charge-protect`. Initial
+mode was 1; the guard read mode 2 after the handshake. Readiness succeeded on
+the first ID read; there were 6 IRQs, 7 receive events, 2 ASK packets and flags
+`0x3d`. No protection writes or charge-permission transition occurred:
+`enabled=0 charge_samples=0 charge_complete=0`. Last VIN/IIN/temperature were
+5811/109/25, EPT 0. Cleanup succeeded with no poison, inhibit high and supply,
+wake and scan low; the module unloaded and Wi-Fi stayed up. The attached pen
+was disconnected over Bluetooth, so no current battery reading was available.
+
+### Stage9b: firmware-backed TX mode check
+
+The vendor header defines `SYS_MODE_TX` as 1, but its driver never uses that
+constant or reads the system-mode register. To resolve the mismatch, the
+tablet's stock ODM image was mapped and mounted read-only. Project 23927's
+`firmware/wireless_pen/23927/cps8601_firmware.bin` links to project 23978;
+23926 links to 23976. Both target files are identical: 15360 bytes, version
+bytes `01 18` at file offset `0xc4`, SHA256
+`cfac67370d543b8b31a914a240dca5b043743388da539465260e6df6400f9e81`.
+The temporary mounts/mappings were removed. Firmware copies and full
+disassembly remain local; no firmware was flashed or redistributed.
+
+The binary contains 8051 code. Analysis establishes the following specific
+behavior in this firmware revision:
+
+| Code offset | Evidence |
+| --- | --- |
+| `0x1e40` | Initialization writes 1 to XDATA address `0x0004`. |
+| `0x2bee` | The command handler tests bit 1 of `0x000b`, matching `TX_CMD_ENTER_TX_MODE`, and references the string `cmd enter tx mode`. |
+| `0x2c07` | That handler writes 2 to `0x0004`: bytes `90 00 04 74 02 f0` (`MOV DPTR,#4; MOV A,#2; MOVX @DPTR,A`). |
+| `0x2d82` | A subsequent processing routine proceeds only when `0x0004` equals 2. |
+
+Stage9b (version 9.2) therefore requires `PEN_SYS_MODE_TX=2` after validated
+startup. It does not accept arbitrary modes, write the mode register or send
+an explicit TX command. The chip/firmware checks, four verified thresholds,
+identity and fault gates, 15-second total cutoff and cleanup are unchanged.
+This corrects a firmware-confirmed constant; mode 2 alone still does not prove
+charging or pen presence.
+
+All 80 attachment/startup/charge cases pass, including rejection of modes
+0/1/3, a failed post-handshake mode read, and the observed initial-1 to
+post-handshake-2 transition. W=1 compilation, checkpatch and the existing
+power/ACK and registration tests pass. The user declined the prepared
+[boot-slot metadata repair](boot-slot-status.md), and a single reboot without
+that repair returned normally to the working Linux system. Stage9b then ran
+once and stopped after 20 ms in `startup-identify`, with `result=-6` (NACK),
+one successful readiness ID read and `valid=0`. This identifies failure on the
+immediately repeated ID read inside `pen_identify()`, before any firmware,
+mode, IRQ or telemetry read completed. It never reached the corrected mode
+guard or charge permission. IRQs, receive events, address frames and charge
+samples were all zero. Cleanup succeeded without poison and the module
+unloaded. Wi-Fi and the paired-pen recovery service remained up, with scan 1
+restored and Bluetooth connected; battery was reported as 100% before and
+after the attempt. That reading is not proof of charging by this diagnostic.
+
+### Stage9c: finish identification before declaring readiness
+
+The first successful ID read did not guarantee that the following reads would
+be acknowledged. Stage9c (version 9.3) includes the complete read-only
+identification pass in the original 2.5-second readiness budget. Only NACK
+(`-ENXIO`) is retried, with the existing 5 ms delay. Each attempt clears the
+partial validity mask and values, so samples cannot be combined across
+attempts. Wrong chip/firmware or any other error still stops immediately;
+no IRQ/protection writes happen until the complete pass succeeds. The
+deadline/cutoff is checked again before entering the handshake phase.
+
+The separate charge handshake window and total 15-second cutoff are unchanged.
+Retries are confined to initial identification; transport loss after that
+phase still stops the experiment. All 84 cases pass, including first-ACK then
+NACK recovery, permanent NACK on firmware reads, a non-retryable error after
+the first ACK, and recovery after a partial identification pass. W=1 build,
+checkpatch and power/ACK/registration checks pass. The binary is copied and
+hash-verified on the tablet, but has not been loaded there. The current boot
+has already used Stage9b's single attempt; a new powered test requires a fresh
+boot. These revisions remain manual diagnostics; the paired-pen recovery
 service remains independent.
 
 ## Tested module artifacts
@@ -416,7 +494,9 @@ hardware captures. The root-level copies now match the tested binaries:
 | `caihong_pen_power-stage8c.ko` (250 ms readiness experiment) | `d449a9f77ca0e70aa247a5aeb60b25d08efdf8bf498a74a70fcae2e5507dca71` |
 | `caihong_pen_power-stage8d.ko` (complete startup exchange) | `66936cfc82d8379ee00054312aa57ecb0aeb3acbc496df7d8cff0b89e618b65c` |
 | `caihong_pen_power-stage9.ko` (timed out before charge permission) | `76ea742b81b30c043fc49e5afe76c96074366a1e66dc2dddd48fa14e51a628d8` |
-| `caihong_pen_power-stage9a.ko` (built; hardware test pending) | `e35d9c5078667bb6fbb27239edd1a2b27a8b502d814ee2e765de85e3414ade15` |
+| `caihong_pen_power-stage9a.ko` (identity valid; old mode guard blocked charge) | `e35d9c5078667bb6fbb27239edd1a2b27a8b502d814ee2e765de85e3414ade15` |
+| `caihong_pen_power-stage9b.ko` (first ID ACK followed by startup NACK) | `beedfc98b2fafae18a8779e412b3dfc5c65200d4b340e3ba02d45c6e7d974718` |
+| `caihong_pen_power-stage9c.ko` (complete readiness retry; hardware test pending) | `ae32dbb3c8bfda0bf53f2e704f79c6d086413b4b6579ba5ab0519d6a68bf2713` |
 
 These are manually loaded diagnostics, not boot-image updates or an automatic
 wireless charging service.

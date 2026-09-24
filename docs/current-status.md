@@ -253,9 +253,31 @@ run needed 2024 ms for I2C readiness, received only the checksum frame and
 timed out before permitting charge. Cleanup and module removal succeeded;
 Wi-Fi remained connected. Stage9a separates readiness and handshake windows
 while retaining a 15-second total cutoff. Its 76 fault cases, W=1 build,
-checkpatch and existing power/registration tests pass; hardware validation is
-pending reconnection after the required fresh boot. See
+checkpatch and existing power/registration tests pass. Its hardware run then
+received both valid identity frames, but stopped with `-EOPNOTSUPP` because
+register 4 changed from 1 to 2. Charging remained inhibited and cleanup passed.
+Read-only extraction and analysis of the stock `0x0118` application firmware
+established that its TX-entry command writes mode 2; the vendor header's
+unused mode-1 constant is not correct for that firmware. Stage9b requires mode
+2 and passes 80 fault cases plus W=1/checkpatch and power/registration checks.
+After a normal reboot, its hardware run stopped after 20 ms: the first ID ACK
+was followed by NACK on the repeated ID read. No IRQ/protection writes or
+charge permission occurred. Cleanup passed and the pen reconnected with
+mode 1 and Bluetooth-reported battery 100%, which does not prove charging by
+this diagnostic. Stage9c retries only incomplete read-only identification
+within the original 2.5-second readiness deadline; 84 fault cases and the
+build/style/power/registration checks pass. Its hash-verified module is staged
+on the tablet for a future fresh-boot test. See
 [`cps8601-attachment.md`](cps8601-attachment.md#stage9-bounded-charge-after-startup-identity).
+
+The user reported an unexpected slot switch during the intervening reboot.
+The restored Linux system has the known working Stage6b image in active slot
+B, but `boot_b` lacks the Qualcomm boot-success flag. Read-only GPT checks
+also found an invalid backup entry-array CRC on the boot LUN; its primary GPT
+is valid. Partition-table snapshots are saved locally and on the tablet. The
+user declined adding the success flag; the prepared metadata repair remains
+unapplied. The subsequent Stage9b reboot returned to the working Linux system.
+See [the boot-slot findings](boot-slot-status.md).
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.

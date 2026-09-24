@@ -30,6 +30,8 @@
 #define PEN_TLMM_PATH "/soc@0/pinctrl@f100000"
 #define PEN_ATTACH_MS 15000
 #define PEN_STARTUP_MS 2500
+/* FW 0x0118 writes 2 to register 0x0004 on TX entry; see attachment docs. */
+#define PEN_SYS_MODE_TX 2
 #define PEN_INT_ATTACH BIT(9)
 #define PEN_INT_REMOVE BIT(10)
 #define PEN_INT_ASK BIT(5)
@@ -645,7 +647,7 @@ static int pen_charge(struct pen_power *pen, unsigned long deadline)
 	    pen->values[0] != 0x8601 || pen->values[1] != 0x0118)
 		return -EOPNOTSUPP;
 	ret = pen_read(pen, 4, 1, &ex->mode_after);
-	if (!ret && ex->mode_after != 1)
+	if (!ret && ex->mode_after != PEN_SYS_MODE_TX)
 		ret = -EOPNOTSUPP;
 	if (!ret)
 		ret = pen_sample(pen);
@@ -740,14 +742,24 @@ static int pen_startup(struct pen_power *pen)
 	if (!queue_delayed_work(system_unbound_wq, &pen->cutoff_work,
 				msecs_to_jiffies(budget)))
 		return -EBUSY;
-	/* Only initial address NACK is retryable while firmware starts executing. */
+	/* An early ID ACK can precede a startup NACK. Retry only read-only
+	 * identification, before any IRQ/protection write, within one deadline.
+	 */
 	for (;;) {
 		if (atomic_read(&pen->cutoff_fired) || time_after_eq(jiffies, deadline)) {
 			ret = -ETIMEDOUT;
 			goto out;
 		}
+		pen->valid = 0;
+		memset(pen->values, 0, sizeof(pen->values));
 		pen->startup_ready_reads++;
 		ret = pen_read(pen, 0, 2, &id);
+		if (!ret && id != 0x8601)
+			ret = -ENODEV;
+		if (!ret)
+			ret = pen_identify(pen);
+		if (!ret && pen->values[1] != 0x0118)
+			ret = -EOPNOTSUPP;
 		pen->startup_ready_ms = jiffies_to_msecs(jiffies - started);
 		if (ret != -ENXIO)
 			break;
@@ -755,12 +767,8 @@ static int pen_startup(struct pen_power *pen)
 		if (ret)
 			goto out;
 	}
-	if (!ret && id != 0x8601)
-		ret = -ENODEV;
-	if (!ret)
-		ret = pen_identify(pen);
-	if (!ret && pen->values[1] != 0x0118)
-		ret = -EOPNOTSUPP;
+	if (!ret && (atomic_read(&pen->cutoff_fired) || time_after_eq(jiffies, deadline)))
+		ret = -ETIMEDOUT;
 	if (ret)
 		goto out;
 	/* A cold start can consume 2 s before the first ACK. Give the charge
@@ -1316,5 +1324,5 @@ static void __exit pen_exit(void)
 module_exit(pen_exit);
 
 MODULE_DESCRIPTION("Caihong CPS8601 bounded power, ID and attachment diagnostics");
-MODULE_VERSION("9.1");
+MODULE_VERSION("9.3");
 MODULE_LICENSE("GPL");
