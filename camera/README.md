@@ -95,6 +95,13 @@ No foreign-device register table is written during this stage. Public SC820CS
 mode tables are useful references, but they are not assumed to be Caihong's
 exact tuning/configuration.
 
+The first hardware probe image now enables the upstream SM8650 `camcc`, CCI,
+CAMSS and CSIPHY4 graph, then loads `sc820cs.ko` from initramfs. Its only
+sensor transaction is the powered read of registers `0x3107` and `0x3108`; a
+successful result is logged as `SC820CS detected, chip ID 0xd154`. Video
+streaming remains deliberately disabled until that ID and the board's mode
+timing are confirmed.
+
 `caihong-front-sc820cs.dtsi` maps the front sensor onto mainline
 `cci0_i2c0 -> CAMSS CSIPHY4`. The downstream-style 8-bit SC820CS address `0x6c`
 corresponds to Linux 7-bit address `0x36`; this remains an item to verify on the
