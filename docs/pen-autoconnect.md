@@ -3,7 +3,10 @@
 Status: 2026-09-24. The rootfs service is installed and its timer enabled on
 the test tablet. Live tests verify restoration from scan mode 0 to the tested
 mode 1, respect for the scan diagnostic's lock, and reconnection after a
-deliberate Bluetooth disconnection. Full reboot validation is pending.
+deliberate Bluetooth disconnection. A full reboot also passed: the bonded pen
+was connected automatically and the service restored scan mode 1 without a
+manual command. The user confirmed drawing and pressure work in Krita after
+this reboot without manual connection or scan commands.
 Basic pressure drawing in native Wayland Krita and pen sleep/resume were
 already confirmed by the user.
 
@@ -108,5 +111,10 @@ configuration parsing and scan failure. Fourteen cases passed.
 The installed systemd unit passed `systemd-analyze verify`. On the live tablet,
 a service run while the diagnostic lock was held left mode 0 alone; the next
 run restored mode 1. Disconnecting the known paired pen and invoking the
-service restored the Bluetooth connection. Wi-Fi remained connected. Full
-reboot, long absences and long-term connection stability remain separate tests.
+service restored the Bluetooth connection. After a full reboot, its first run
+restored mode 1 and found the pen already connected; the boot log therefore
+proves automatic link recovery, not that this service itself issued the boot's
+Connect call. The installed configuration and enabled timer persisted, and
+Wi-Fi reconnected. The user then confirmed normal drawing and pressure in
+Krita on this new boot. Long absences and long-term connection stability
+remain separate tests.

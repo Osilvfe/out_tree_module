@@ -7,8 +7,9 @@ scan mode 1 on the existing Stage4 module provides working pen input and
 desktop taps. The user has also confirmed touchscreen and pen suspend/resume.
 The Stage7a manual test confirms CPS8601 ID/firmware access and successful
 power cleanup. Stage8d now receives both startup ASK frames and validates the
-user's OPN2402 address, with clean shutdown. Automatic attachment, pen
-reconnection across boot and charging still need work. Earlier GPIO-only observation
+user's OPN2402 address, with clean shutdown. Automatic attachment and charging
+still need work. A [rootfs recovery service](pen-autoconnect.md) is now enabled;
+connection and scan-mode restoration pass a full reboot. Earlier GPIO-only observation
 missed the initial exchange; an explicit TX command produced undefined flags
 `0x800` then I2C NACK. The guarded supply-cycle experiment was blocked by
 mismatching power-on protection defaults and remains untested.
@@ -38,7 +39,7 @@ Proceed according to the evidence:
 | --- | --- | --- |
 | Pen power | User confirms stock charging; Bluetooth initially reported 94% | Linux automatic wireless charging remains unimplemented. |
 | CPS8601 access | Stage8d validates both startup frames; cleanup passes | Keep the manual diagnostic boundary; automatic attachment remains separate. |
-| Linux Bluetooth | Address-filtered discovery exposed connectable, non-discoverable OnePlus Pencil Pro; connected/paired/bonded and services resolved | Test reconnection across boot; see [reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input). |
+| Linux Bluetooth | Address-filtered discovery exposed connectable, non-discoverable OnePlus Pencil Pro; connection and mode restoration also pass a full reboot | Rootfs recovery service enabled; test longer absences and connection stability. See [reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input). |
 | NT36532E scan protocol | Mode 1 produces sustained moving coordinates and pressure after Bluetooth pairing | Keep tested mode 1 for this setup; manufacturer Maxeye does not imply mode 2/3/5. |
 | Raw pen input | Hover, contact, pressure-zero release and proximity exit verified; user confirms desktop pen taps, pen sleep/resume and basic pressure in native Wayland Krita | Tilt and buttons remain unvalidated. |
 

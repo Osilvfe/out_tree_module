@@ -215,9 +215,10 @@ release and proximity exit (13 complete enter/leave and down/up pairs), and
 the user confirmed desktop pen taps. The stock Havon label for mode 1 does not
 override this measured result with a Maxeye-manufactured pen. Wi-Fi and touch
 remain working; no boot image or touchscreen module was replaced. The CPS
-diagnostic is unloaded with its supply off. Automatic Bluetooth reconnection,
-mode restoration across boot, tilt/buttons and automatic
-wireless charging remain future tests/work. Reproduction steps are in
+diagnostic is unloaded with its supply off. Automatic Bluetooth reconnection
+and mode restoration across boot were still pending at this initial checkpoint;
+tilt/buttons and automatic wireless charging remain future tests/work.
+Reproduction steps are in
 [`cps8601-attachment.md`](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 The user subsequently reported a crosshair on initial pen detection followed
@@ -240,7 +241,10 @@ the already paired pen, with bounded calls and retry backoff. Live tests pass
 for diagnostic-lock exclusion, restoration from mode 0 to 1 and reconnection
 after deliberate Bluetooth disconnection. Fourteen host tests and systemd
 unit verification pass. No boot image, firmware, charging control or Wi-Fi
-component changed. Full reboot validation is pending; see
+component changed. A subsequent full reboot passed: the service restored mode
+1, found the bonded pen already connected and continued its normal timer runs.
+Wi-Fi reconnected as well. The user confirmed normal drawing and pressure in
+Krita after this reboot without manual connection or mode commands; see
 [`pen-autoconnect.md`](pen-autoconnect.md) for installation and rollback.
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,

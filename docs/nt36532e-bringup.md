@@ -17,8 +17,10 @@ observed working scan type is 1 regardless of its stock Havon label.
 
 The user subsequently confirmed pen sleep/resume works. The
 [paired-pen recovery service](pen-autoconnect.md) is now installed and enabled;
-scan restoration and reconnection tests pass, with full reboot validation
-pending. Automatic attachment/charging and tilt/buttons are not yet validated. See the
+scan restoration and reconnection tests pass, including automatic connection
+and mode restoration after a full reboot. The user confirmed drawing and
+pressure also work after reboot. Automatic attachment/charging and tilt/buttons
+are not yet validated. See the
 [connection and reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 ## Pen cursor on KDE Wayland
@@ -62,8 +64,8 @@ application pressure pass, without claiming a calibrated pressure curve or
 full-range sensitivity test. Pen sleep/resume is also user-confirmed.
 A subsequent passive check showed 55577 pen reports, zero pen checksum/range
 errors and zero controller startup/sleep errors across three starts and two
-stops. Reconnection and scan-mode restoration after a full reboot remain
-separate tests.
+stops. A subsequent full reboot passed automatic connection and scan-mode
+restoration; the user confirmed normal drawing and pressure in that new boot.
 
 ## Stage1 packaging failure
 

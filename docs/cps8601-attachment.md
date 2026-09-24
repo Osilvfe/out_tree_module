@@ -272,8 +272,9 @@ pairs, 13 tip-down/up pairs, 13 pressure-zero releases, 652 hover frames and
 462 contact frames. Maximum observed pressure was 10584 within the configured
 0–16383 range. The user confirmed working desktop pen taps. This establishes
 coordinates, pressure, hover and release behavior. The user subsequently
-confirmed pen sleep/resume works; tilt, buttons and reconnection across boot
-remain unvalidated. The subsequent native Wayland Krita test received positive
+confirmed pen sleep/resume works; tilt and buttons remain unvalidated.
+Automatic connection and scan restoration later passed a full reboot with
+the rootfs recovery service enabled. The native Wayland Krita test received positive
 user feedback for basic pressure drawing.
 
 No firmware was flashed or replaced. Keep the working Stage6b image, Stage4
@@ -320,8 +321,8 @@ The driver retains the selection across its panel/touch restarts, but a whole
 system reboot returns it to the unknown firmware default (`-1`). A separate
 [rootfs recovery service](pen-autoconnect.md) now restores the configured mode
 and reconnects the already paired pen. It is installed with its timer enabled;
-scan restoration and disconnect/reconnect tests pass, while full reboot
-validation is pending. This does not run the CPS diagnostic automatically.
+scan restoration and disconnect/reconnect tests pass. A full reboot also
+restored connection and scan mode automatically. This does not run the CPS diagnostic automatically.
 Stop its timer before using the existing scan helper to validate a different
 setup; a manufacturer label alone is not a protocol choice.
 
