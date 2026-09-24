@@ -15,9 +15,10 @@ user confirmed desktop pen taps. The firmware, touch module, boot image and
 Wi-Fi payload remain unchanged. GATT reports manufacturer Maxeye, but the
 observed working scan type is 1 regardless of its stock Havon label.
 
-The user subsequently confirmed pen sleep/resume works. Automatic
-attachment/charging, Bluetooth reconnection across boot and tilt/buttons
-are not yet validated. See the
+The user subsequently confirmed pen sleep/resume works. The
+[paired-pen recovery service](pen-autoconnect.md) is now installed and enabled;
+scan restoration and reconnection tests pass, with full reboot validation
+pending. Automatic attachment/charging and tilt/buttons are not yet validated. See the
 [connection and reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 ## Pen cursor on KDE Wayland

@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry Caihong pen recovery after boot or reconnection
+
+[Timer]
+OnBootSec=15
+OnUnitInactiveSec=15
+AccuracySec=1
+Unit=caihong-pen-autoconnect.service
+
+[Install]
+WantedBy=timers.target

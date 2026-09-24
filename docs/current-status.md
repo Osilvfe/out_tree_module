@@ -232,8 +232,16 @@ a native Wayland launcher and an initial 1600 by 1200 canvas; the live process
 loads the Wayland platform plugin. The user reports pressure appears normal
 in the drawing test, establishing a basic application pressure pass. A passive
 check shows zero pen checksum/range errors and zero controller startup/sleep
-errors across three starts and two stops. Full reboot/reconnection remains
-unvalidated.
+errors across three starts and two stops.
+
+The rootfs paired-pen recovery service is now installed with its timer enabled.
+It restores configured mode 1 when the controller is ready and connects only
+the already paired pen, with bounded calls and retry backoff. Live tests pass
+for diagnostic-lock exclusion, restoration from mode 0 to 1 and reconnection
+after deliberate Bluetooth disconnection. Fourteen host tests and systemd
+unit verification pass. No boot image, firmware, charging control or Wi-Fi
+component changed. Full reboot validation is pending; see
+[`pen-autoconnect.md`](pen-autoconnect.md) for installation and rollback.
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.

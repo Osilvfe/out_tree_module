@@ -35,8 +35,10 @@ See [connection and reproduction steps](docs/cps8601-attachment.md#bluetooth-dis
 
 Wi-Fi and touch remain working. The CPS diagnostic is unloaded with supply
 off; pen scan mode 1 is retained for the session. The user also confirms pen
-sleep/resume works. Automatic Bluetooth reconnection across boot and wireless
-charging are not yet validated. In Krita 6.0.4 running natively on Wayland,
+sleep/resume works. A [paired-pen recovery service](docs/pen-autoconnect.md)
+is installed and enabled; scan restoration and deliberate disconnect/reconnect
+tests pass, with full reboot validation pending. Automatic wireless charging
+remains unimplemented. In Krita 6.0.4 running natively on Wayland,
 the user reports basic pressure works; see the
 [application pressure test](docs/nt36532e-bringup.md#krita-pressure-test).
 

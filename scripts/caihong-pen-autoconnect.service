@@ -1,0 +1,19 @@
+[Unit]
+Description=Restore the configured Caihong pen connection and scan mode
+After=bluetooth.service
+ConditionPathExists=/etc/caihong-pen.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/caihong-pen-autoconnect
+TimeoutStartSec=50
+TimeoutStopSec=35
+RuntimeDirectory=caihong-pen-autoconnect
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/lock

@@ -317,10 +317,13 @@ cat /sys/bus/spi/devices/spi0.0/pen_scan
 ```
 
 The driver retains the selection across its panel/touch restarts, but a whole
-system reboot returns it to the unknown firmware default (`-1`). Automatic
-BlueZ reconnection and mode selection across boot are not installed by this
-manual diagnostic. The existing scan helper remains available when validating
-a different setup; a manufacturer label alone is not a protocol choice.
+system reboot returns it to the unknown firmware default (`-1`). A separate
+[rootfs recovery service](pen-autoconnect.md) now restores the configured mode
+and reconnects the already paired pen. It is installed with its timer enabled;
+scan restoration and disconnect/reconnect tests pass, while full reboot
+validation is pending. This does not run the CPS diagnostic automatically.
+Stop its timer before using the existing scan helper to validate a different
+setup; a manufacturer label alone is not a protocol choice.
 
 ## Tested module artifacts
 
