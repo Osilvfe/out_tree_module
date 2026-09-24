@@ -15,8 +15,8 @@ those deadlines and validated identity on hardware, but its mode-1 guard
 stopped before charge permission. Stage9b corrects the guard to mode 2 using
 the stock application firmware, but its hardware run stopped earlier on a
 startup NACK after the first ID ACK. Stage9c addresses that incomplete
-readiness check; its powered hardware test is pending. See
-[the bounded charge experiment](#stage9-bounded-charge-after-startup-identity).
+readiness check and completes the bounded hardware observation successfully.
+See [the bounded charge experiment](#stage9-bounded-charge-after-startup-identity).
 
 The pen must be magnetically attached during the experiment. After any power
 attempt, reboot before another attempt. Stage 2 only reserves resources when
@@ -474,11 +474,27 @@ Retries are confined to initial identification; transport loss after that
 phase still stops the experiment. All 84 cases pass, including first-ACK then
 NACK recovery, permanent NACK on firmware reads, a non-retryable error after
 the first ACK, and recovery after a partial identification pass. W=1 build,
-checkpatch and power/ACK/registration checks pass. The binary is copied and
-hash-verified on the tablet, but has not been loaded there. The current boot
-has already used Stage9b's single attempt; a new powered test requires a fresh
-boot. These revisions remain manual diagnostics; the paired-pen recovery
-service remains independent.
+checkpatch and power/ACK/registration checks pass.
+
+The fresh-boot hardware run completed in 15.042 seconds with `result=0`,
+`phase=done`, complete identity matching the known pen and system mode 2.
+Cold-start readiness required 166 attempts and 2072 ms. The receiver then saw
+6 IRQs/events, one checksum frame, one address frame and flags `0x3d`, with no
+invalid packet. Protection setup and charge permission succeeded. During the
+12.036-second observation it collected 101 samples: input-current raw values
+ranged from 83 to 168, maximum temperature was 25, EPT remained zero, and no
+stop packet, removal, undefined interrupt or transport loss occurred. Final
+VIN/IIN/temperature were 5811/93/25.
+
+The cutoff ended the observation normally (`charge_complete=1`), common
+cleanup returned zero, and the final GPIO state was inhibit high with supply,
+wake and scan low. The module unloaded. Wi-Fi remained up; touch retained
+mode 1 with no new SPI/range/start error, and the paired-pen recovery state
+was connected. Bluetooth reported 94% immediately before and after the short
+window, so this result validates the bounded CPS8601 power/observation path
+but does not yet demonstrate measurable battery gain or reliable automatic
+charging. Stage9c remains a manual diagnostic; the paired-pen recovery service
+is independent.
 
 ## Tested module artifacts
 
@@ -496,7 +512,7 @@ hardware captures. The root-level copies now match the tested binaries:
 | `caihong_pen_power-stage9.ko` (timed out before charge permission) | `76ea742b81b30c043fc49e5afe76c96074366a1e66dc2dddd48fa14e51a628d8` |
 | `caihong_pen_power-stage9a.ko` (identity valid; old mode guard blocked charge) | `e35d9c5078667bb6fbb27239edd1a2b27a8b502d814ee2e765de85e3414ade15` |
 | `caihong_pen_power-stage9b.ko` (first ID ACK followed by startup NACK) | `beedfc98b2fafae18a8779e412b3dfc5c65200d4b340e3ba02d45c6e7d974718` |
-| `caihong_pen_power-stage9c.ko` (complete readiness retry; hardware test pending) | `ae32dbb3c8bfda0bf53f2e704f79c6d086413b4b6579ba5ab0519d6a68bf2713` |
+| `caihong_pen_power-stage9c.ko` (bounded charge observation passed) | `ae32dbb3c8bfda0bf53f2e704f79c6d086413b4b6579ba5ab0519d6a68bf2713` |
 
 These are manually loaded diagnostics, not boot-image updates or an automatic
 wireless charging service.

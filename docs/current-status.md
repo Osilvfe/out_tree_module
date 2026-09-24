@@ -266,8 +266,13 @@ charge permission occurred. Cleanup passed and the pen reconnected with
 mode 1 and Bluetooth-reported battery 100%, which does not prove charging by
 this diagnostic. Stage9c retries only incomplete read-only identification
 within the original 2.5-second readiness deadline; 84 fault cases and the
-build/style/power/registration checks pass. Its hash-verified module is staged
-on the tablet for a future fresh-boot test. See
+build/style/power/registration checks pass. Its fresh-boot hardware run then
+completed successfully: valid identity and mode 2, 101 samples over 12.036
+seconds, nonzero input current from 83 to 168, maximum temperature 25, and no
+EPT, stop packet, undefined interrupt or cleanup failure. The 15.042-second
+total request ended normally and powered the hardware off. Bluetooth reported
+94% before and after, so this validates the bounded power path but not a
+measurable battery gain. Wi-Fi, touch and pen recovery remained working. See
 [`cps8601-attachment.md`](cps8601-attachment.md#stage9-bounded-charge-after-startup-identity).
 
 The user reported an unexpected slot switch during the intervening reboot.
