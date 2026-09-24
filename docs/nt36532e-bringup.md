@@ -15,8 +15,9 @@ user confirmed desktop pen taps. The firmware, touch module, boot image and
 Wi-Fi payload remain unchanged. GATT reports manufacturer Maxeye, but the
 observed working scan type is 1 regardless of its stock Havon label.
 
-Automatic attachment/charging, Bluetooth reconnection across boot, pen
-sleep/resume and tilt/buttons are not yet validated. See the
+The user subsequently confirmed pen sleep/resume works. Automatic
+attachment/charging, Bluetooth reconnection across boot and tilt/buttons
+are not yet validated. See the
 [connection and reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
 ## Pen cursor on KDE Wayland
@@ -36,6 +37,28 @@ fallback followed by an application-selected arrow; cursor shape alone does
 not establish loss of tablet input or pressure. No driver, firmware or cursor
 setting was changed for this observation. Pressure-sensitive drawing in an
 application still needs separate validation; evtest pressure already works.
+
+## Krita pressure test
+
+Krita 6.0.4 was installed from the tablet's Arch Linux ARM repository for the
+user's application pressure test. It runs as the desktop user with
+`QT_QPA_PLATFORM=wayland`; the running process loads `libqwayland.so` and no
+XCB platform plugin. A user-local `org.kde.krita.desktop` override also sets
+this environment variable for future menu launches. No kernel or firmware
+change is involved.
+
+The initial test opens a 1600 by 1200 canvas:
+
+```sh
+QT_QPA_PLATFORM=wayland krita --nosplash --new-image RGBA,U8,1600,1200
+```
+
+Choose the `b) Basic-5 Size` brush preset, set a visible brush size (for example
+30 px), and draw with changing tip pressure. Stroke width should change with
+pressure; hovering or lifting the tip should stop painting. Application-level
+pressure results are still pending the user's test. Pen sleep/resume is
+user-confirmed, while reconnection and scan-mode restoration after a full
+reboot remain separate tests.
 
 ## Stage1 packaging failure
 

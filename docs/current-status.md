@@ -216,7 +216,7 @@ the user confirmed desktop pen taps. The stock Havon label for mode 1 does not
 override this measured result with a Maxeye-manufactured pen. Wi-Fi and touch
 remain working; no boot image or touchscreen module was replaced. The CPS
 diagnostic is unloaded with its supply off. Automatic Bluetooth reconnection,
-mode restoration across boot, pen suspend/resume, tilt/buttons and automatic
+mode restoration across boot, tilt/buttons and automatic
 wireless charging remain future tests/work. Reproduction steps are in
 [`cps8601-attachment.md`](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
@@ -226,6 +226,11 @@ tool, not a pointer; no Bluetooth mouse input device appeared. This matches
 KWin's unset-tablet-cursor fallback before the application supplies its cursor.
 No input changes were needed. See the
 [cursor investigation](nt36532e-bringup.md#pen-cursor-on-kde-wayland).
+
+The user then confirmed pen sleep/resume works. Krita 6.0.4 is installed with
+a native Wayland launcher and an initial 1600 by 1200 canvas; the live process
+loads the Wayland platform plugin. Application pressure testing is now pending
+the user's drawing test. Full reboot/reconnection remains unvalidated.
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.

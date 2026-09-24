@@ -271,8 +271,9 @@ A subsequent evtest capture recorded 13 matching pen-proximity enter/leave
 pairs, 13 tip-down/up pairs, 13 pressure-zero releases, 652 hover frames and
 462 contact frames. Maximum observed pressure was 10584 within the configured
 0–16383 range. The user confirmed working desktop pen taps. This establishes
-coordinates, pressure, hover and release behavior, without claiming tilt,
-buttons, reconnection or pen sleep/resume validation.
+coordinates, pressure, hover and release behavior. The user subsequently
+confirmed pen sleep/resume works; tilt, buttons and reconnection across boot
+remain unvalidated. Krita is prepared for an application pressure test.
 
 No firmware was flashed or replaced. Keep the working Stage6b image, Stage4
 touch module and mode 1. The CPS diagnostic is unloaded and its supply is off;
