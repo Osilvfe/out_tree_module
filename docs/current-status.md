@@ -220,6 +220,13 @@ mode restoration across boot, pen suspend/resume, tilt/buttons and automatic
 wireless charging remain future tests/work. Reproduction steps are in
 [`cps8601-attachment.md`](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
+The user subsequently reported a crosshair on initial pen detection followed
+by an arrow. KDE Wayland/KWin 6.7.5 identifies the device as an absolute tablet
+tool, not a pointer; no Bluetooth mouse input device appeared. This matches
+KWin's unset-tablet-cursor fallback before the application supplies its cursor.
+No input changes were needed. See the
+[cursor investigation](nt36532e-bringup.md#pen-cursor-on-kde-wayland).
+
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
 

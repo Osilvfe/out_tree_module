@@ -19,6 +19,24 @@ Automatic attachment/charging, Bluetooth reconnection across boot, pen
 sleep/resume and tilt/buttons are not yet validated. See the
 [connection and reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input).
 
+## Pen cursor on KDE Wayland
+
+After desktop taps passed, the user observed a crosshair when the screen first
+detects the pen, followed by an ordinary arrow. Read-only checks on the same
+session show `ID_INPUT_TABLET=1`; KWin reports `tabletTool=true`,
+`tabletToolIsRelative=false` and `pointer=false` for the Novatek pen. Bluetooth
+pairing did not add a mouse or keyboard input device. Pen reports continued
+with zero pen checksum/range errors.
+
+The installed KWin version is 6.7.5. Its
+[`SurfaceCursor` implementation](https://github.com/KDE/kwin/blob/v6.7.5/src/tablet_input.cpp#L43)
+uses a cross cursor while the tablet cursor is unset, then accepts the client
+surface or cursor shape. The reported transition is consistent with this
+fallback followed by an application-selected arrow; cursor shape alone does
+not establish loss of tablet input or pressure. No driver, firmware or cursor
+setting was changed for this observation. Pressure-sensitive drawing in an
+application still needs separate validation; evtest pressure already works.
+
 ## Stage1 packaging failure
 
 The reported boot had no NT36532E module in `lsmod` and no Novatek probe logs.

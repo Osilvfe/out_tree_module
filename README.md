@@ -84,8 +84,9 @@ sc8547_cp.ko
 
 ## Touchscreen DTS
 
-The current test node includes the reset GPIO and pen properties. Stage3 touch
-and Stage4 resume are confirmed; pen input still needs hardware validation:
+The current test node includes the reset GPIO and pen properties. Stage3 touch,
+Stage4 touch resume and OPN2402 pen input are confirmed; pen sleep/resume still
+needs hardware validation:
 
 ```dts
 &spi4 {
