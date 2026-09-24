@@ -40,7 +40,7 @@ Proceed according to the evidence:
 | CPS8601 access | Stage8d validates both startup frames; cleanup passes | Keep the manual diagnostic boundary; automatic attachment remains separate. |
 | Linux Bluetooth | Address-filtered discovery exposed connectable, non-discoverable OnePlus Pencil Pro; connected/paired/bonded and services resolved | Test reconnection across boot; see [reproduction steps](cps8601-attachment.md#bluetooth-discovery-and-working-pen-input). |
 | NT36532E scan protocol | Mode 1 produces sustained moving coordinates and pressure after Bluetooth pairing | Keep tested mode 1 for this setup; manufacturer Maxeye does not imply mode 2/3/5. |
-| Raw pen input | Hover, contact, pressure-zero release and proximity exit verified; user confirms desktop pen taps and pen sleep/resume | Test application pressure in the installed native Wayland Krita; tilt and buttons remain unvalidated. |
+| Raw pen input | Hover, contact, pressure-zero release and proximity exit verified; user confirms desktop pen taps, pen sleep/resume and basic pressure in native Wayland Krita | Tilt and buttons remain unvalidated. |
 
 The supplied `bluetoothctl show` confirms `Powered: yes`, `Pairable: yes`,
 `Discovering: no` and `Discoverable: no`. Being non-discoverable does not

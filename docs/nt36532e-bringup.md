@@ -35,8 +35,8 @@ uses a cross cursor while the tablet cursor is unset, then accepts the client
 surface or cursor shape. The reported transition is consistent with this
 fallback followed by an application-selected arrow; cursor shape alone does
 not establish loss of tablet input or pressure. No driver, firmware or cursor
-setting was changed for this observation. Pressure-sensitive drawing in an
-application still needs separate validation; evtest pressure already works.
+setting was changed for this observation. Evtest pressure works; the subsequent
+Krita application test below also received positive user feedback.
 
 ## Krita pressure test
 
@@ -55,10 +55,14 @@ QT_QPA_PLATFORM=wayland krita --nosplash --new-image RGBA,U8,1600,1200
 
 Choose the `b) Basic-5 Size` brush preset, set a visible brush size (for example
 30 px), and draw with changing tip pressure. Stroke width should change with
-pressure; hovering or lifting the tip should stop painting. Application-level
-pressure results are still pending the user's test. Pen sleep/resume is
-user-confirmed, while reconnection and scan-mode restoration after a full
-reboot remain separate tests.
+pressure; hovering or lifting the tip should stop painting. The user then
+reported that pressure appears to work normally. Record this as a basic visual
+application pressure pass, without claiming a calibrated pressure curve or
+full-range sensitivity test. Pen sleep/resume is also user-confirmed.
+A subsequent passive check showed 55577 pen reports, zero pen checksum/range
+errors and zero controller startup/sleep errors across three starts and two
+stops. Reconnection and scan-mode restoration after a full reboot remain
+separate tests.
 
 ## Stage1 packaging failure
 

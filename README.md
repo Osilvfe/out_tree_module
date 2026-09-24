@@ -17,7 +17,7 @@ does not mean Caihong integration is removed from the companion kernel tree.
 
 | Driver | Status | Hardware state |
 | --- | --- | --- |
-| `nt36532e_ts.ko` | Touch, pen input and sleep/resume confirmed | Desktop touch and 10 points work; Stage4 touch resume is confirmed. After filtered Bluetooth discovery and pairing, the existing firmware with pen scan mode 1 reports coordinates, pressure, hover and releases; the user confirms desktop pen taps and pen sleep/resume. Reconnection across boot, tilt/buttons and wireless charging still need testing. |
+| `nt36532e_ts.ko` | Touch, pen input and sleep/resume confirmed | Desktop touch and 10 points work; Stage4 touch resume is confirmed. After filtered Bluetooth discovery and pairing, the existing firmware with pen scan mode 1 reports coordinates, pressure, hover and releases; the user confirms desktop pen taps, pen sleep/resume and working basic pressure in native Wayland Krita. Reconnection across boot, tilt/buttons and wireless charging still need testing. |
 | `oneplus_pogo.ko` | Keymap works; brief touchpad pauses recorded, investigation deferred | Search/Fn and F1–F12 mappings work. Stage6b sends commands to restore the hardware target after F4 and keeps Fn+F4 as the desktop toggle. All-key pauses persist with disable-while-typing off and with the keyboard grabbed by evtest. The user considers the impact minor and has paused this investigation to resume pen testing; see [`docs/pogo-keymap.md`](docs/pogo-keymap.md). |
 | `caihong_pen_power.ko` | Startup address exchange validated; automatic charging unimplemented | Stage8d validates both startup frames and powers off cleanly in about 1 second. Address-filtered BlueZ discovery then exposed OnePlus Pencil Pro, allowing connection/pairing and working pen input. No CPS firmware update or boot integration is involved. See [`docs/cps8601-attachment.md`](docs/cps8601-attachment.md). |
 | `sc8547_cp.ko` | Experimental and paused | Probe, telemetry, guarded profiles and bounded pulse diagnostics are available. Automatic dual-pump charging is paused after the unresolved primary-IBUS excursion documented in [`docs/current-status.md`](docs/current-status.md). |
@@ -36,8 +36,9 @@ See [connection and reproduction steps](docs/cps8601-attachment.md#bluetooth-dis
 Wi-Fi and touch remain working. The CPS diagnostic is unloaded with supply
 off; pen scan mode 1 is retained for the session. The user also confirms pen
 sleep/resume works. Automatic Bluetooth reconnection across boot and wireless
-charging are not yet validated. Krita 6.0.4 is installed and running natively
-on Wayland for the pending [application pressure test](docs/nt36532e-bringup.md#krita-pressure-test).
+charging are not yet validated. In Krita 6.0.4 running natively on Wayland,
+the user reports basic pressure works; see the
+[application pressure test](docs/nt36532e-bringup.md#krita-pressure-test).
 
 The SC8547 driver must currently be treated as a diagnostic bring-up driver. Its
 experimental controls are fail-closed and are not a production charging policy.

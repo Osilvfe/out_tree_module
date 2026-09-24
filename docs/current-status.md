@@ -229,8 +229,11 @@ No input changes were needed. See the
 
 The user then confirmed pen sleep/resume works. Krita 6.0.4 is installed with
 a native Wayland launcher and an initial 1600 by 1200 canvas; the live process
-loads the Wayland platform plugin. Application pressure testing is now pending
-the user's drawing test. Full reboot/reconnection remains unvalidated.
+loads the Wayland platform plugin. The user reports pressure appears normal
+in the drawing test, establishing a basic application pressure pass. A passive
+check shows zero pen checksum/range errors and zero controller startup/sleep
+errors across three starts and two stops. Full reboot/reconnection remains
+unvalidated.
 
 See [`nt36532e-bringup.md`](nt36532e-bringup.md) for reproducible packaging,
 checksums and the logs needed to distinguish module insertion from probe.
