@@ -41,7 +41,7 @@ sensor set below.
 | ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | live lux and vendor RGB/CCT data validated through SSC; proximity remains unavailable; direct `tcs3701.ko` remains optional only |
 | Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | in-tree `gpio-keys` exposes standard `EV_SW/SW_LID`; probe and suspend/resume validated |
 | free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
-| barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
+| barometer | absent from the Caihong device-specific registry and live SSC SUID list | none | no device evidence supports a pressure sensor; do not add one from generic firmware strings |
 
 Qualcomm's SSC communication-port enum confirms registry `bus_type=0` is I2C
 and `bus_type=1` is SPI.  Its interrupt enum confirms trigger type 1 is falling
@@ -213,6 +213,13 @@ The board mount matrix maps SSC axes as `x'=y`, `y'=-x`, `z'=z`. SensorProxy
 reports `normal`, `left-up`, `right-up` and `bottom-up` in the matching physical
 orientations, and KDE automatic display rotation is validated.
 
+SensorProxy also exposes TCS3701 lux as its standard ambient-light property.
+Plasma 6.7 KWin claims that property when automatic brightness is enabled in
+Display & Monitor and adjusts the internal KTZ8866 backlight. This end-to-end
+path is runtime-validated; no separate brightness daemon or private RGB/CCT
+translation is needed. KWin learns its per-user lux curve when the user changes
+brightness while automatic mode is active.
+
 ## AP bus mapping and optional probe fragment
 
 The vendor QUPv3 description numbers its first wrapper's serial engines from
@@ -234,9 +241,7 @@ that IRQ remains a future buffered-sampling concern.
 1. capture the exact `icm4x607` and MMC56x3x WHO-AM-I values if a safe SSC
    diagnostic path becomes available, without taking their buses from SSC;
 2. add a Linux-facing RGB/CCT interface only when a concrete userspace consumer
-   can use the documented 16-float Oplus payload;
-3. identify the barometer only from evidence, not from a generic SM8650 parts
-   list.
+   can use the documented 16-float Oplus payload.
 
 ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE
 (`st21nfc`/`st54spi_gpio`), not this tablet's IMU stack, and remains intentionally

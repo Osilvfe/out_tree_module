@@ -77,6 +77,22 @@ kscreen-doctor output.DSI-1.autoRotatePolicy.always
 KWin persists this policy in the user's `kwinoutputconfig.json`. The four
 physical orientations and automatic landscape/portrait changes are validated.
 
+Plasma 6.7 also consumes the ambient-light value directly. Enable automatic
+brightness in System Settings under Display & Monitor after SensorProxy reports
+`HasAmbientLight=true`; KWin claims the standard SensorProxy light interface
+and drives the internal `ktz8866-backlight` without a board-specific brightness
+daemon. The live path has been validated from the TCS3701 SSC sample through
+SensorProxy to both `org.kde.ScreenBrightness` and the raw backlight device.
+
+KWin stores an `autoBrightnessCurve` alongside `automaticBrightness=true` in
+the user's `kwinoutputconfig.json`. The 11 curve entries are the lux values for
+0%, 10%, ... 100% brightness. While automatic brightness is enabled, manually
+moving the brightness slider teaches the curve at the current light level.
+Immediately after enabling the feature, points outside the observed light
+range can therefore be tightly clustered or negative; this is KWin's normal
+extrapolation behavior, not a bad TCS3701 sample. Adjust the slider in a few
+representative dark, indoor and bright environments to train the native curve.
+
 ## Diagnostic tool
 
 `tools/ssc-inspect` queries arbitrary SSC data types and can subscribe to the
