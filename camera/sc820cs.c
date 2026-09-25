@@ -33,6 +33,12 @@
 #define SC820CS_NATIVE_HEIGHT		2448
 #define SC820CS_NUM_DATA_LANES		4
 
+static const unsigned int sc820cs_supply_loads[] = {
+	300000, /* DOVDD / L4B */
+	600000, /* AVDD / L16B */
+	600000, /* DVDD / L2G */
+};
+
 struct sc820cs {
 	struct device *dev;
 	struct v4l2_subdev sd;
@@ -70,10 +76,21 @@ static int sc820cs_read8(struct sc820cs *sc820cs, u16 reg, u8 *val)
 
 static int sc820cs_power_on(struct sc820cs *sc820cs)
 {
+	unsigned int i;
 	int ret;
 
 	/* Keep the sensor in reset while rails and the input clock settle. */
 	gpiod_set_value_cansleep(sc820cs->reset_gpio, 1);
+
+	for (i = 0; i < ARRAY_SIZE(sc820cs->supplies); i++) {
+		ret = regulator_set_load(sc820cs->supplies[i].consumer,
+					 sc820cs_supply_loads[i]);
+		if (ret)
+			return dev_err_probe(sc820cs->dev, ret,
+					     "failed to set %s load to %u uA\n",
+					     sc820cs_supply_names[i],
+					     sc820cs_supply_loads[i]);
+	}
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(sc820cs->supplies),
 				    sc820cs->supplies);
@@ -87,9 +104,12 @@ static int sc820cs_power_on(struct sc820cs *sc820cs)
 		goto disable_supplies;
 	}
 
-	usleep_range(1000, 2000);
+	usleep_range(5000, 6000);
 	gpiod_set_value_cansleep(sc820cs->reset_gpio, 0);
-	usleep_range(5000, 7000);
+	usleep_range(10000, 12000);
+
+	dev_dbg(sc820cs->dev, "powered: reset released, xvclk=%lu Hz\n",
+		clk_get_rate(sc820cs->xvclk));
 
 	return 0;
 
