@@ -158,6 +158,9 @@ ownership, so the AP `spi3` and `i2c2` probe fragments must remain opt-in and
 disabled in normal images. The board udev rule enables the validated
 `ssc-accel`, `ssc-light` and `ssc-compass` backends in `iio-sensor-proxy`;
 accelerometer orientation, lux and compass heading are available over D-Bus.
+The board mount matrix maps SSC axes as `x'=y`, `y'=-x`, `z'=z`. SensorProxy
+reports `normal`, `left-up`, `right-up` and `bottom-up` in the matching physical
+orientations, and KDE automatic display rotation is validated.
 
 ## AP bus mapping and optional probe fragment
 
@@ -177,11 +180,10 @@ that IRQ remains a future buffered-sampling concern.
 
 ## Next sensor work
 
-1. validate automatic display rotation in all four physical orientations;
-2. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
+1. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
    attributes without taking their buses from SSC;
-3. determine whether the stock RGB stream is useful to Linux applications;
-4. identify the barometer only from evidence, not from a generic SM8650 parts
+2. determine whether the stock RGB stream is useful to Linux applications;
+3. identify the barometer only from evidence, not from a generic SM8650 parts
    list.
 
 ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE

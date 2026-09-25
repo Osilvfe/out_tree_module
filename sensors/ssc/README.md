@@ -41,8 +41,8 @@ This installs the program under `/usr/local`, keeps mutable registry and
 calibration data under `/var/lib/caihong-ssc`, and enables
 `caihong-ssc.service`. It also enables Caihong's SSC accelerometer, light and
 compass backends in `iio-sensor-proxy`, ordered after the FastRPC listener.
-The udev rule keeps the SSC-provided device coordinates unchanged with an
-identity mount matrix and marks the accelerometer as display-mounted.
+The udev rule rotates the SSC coordinates into the panel orientation with the
+Caihong mount matrix and marks the accelerometer as display-mounted.
 
 ## Runtime validation
 
@@ -63,3 +63,14 @@ and live sensor streams recover automatically after cold boot and deep
 suspend/resume. `iio-sensor-proxy 3.9` exposes accelerometer orientation,
 ambient lux and compass heading through its standard D-Bus API; `monitor-sensor
 --all` receives live updates from all three backends.
+
+KDE defaults internal-panel rotation to `inTabletMode`, but Caihong has no
+`SW_TABLET_MODE` input switch. Enable automatic rotation for the current user
+once the SSC service is running:
+
+```sh
+kscreen-doctor output.DSI-1.autoRotatePolicy.always
+```
+
+KWin persists this policy in the user's `kwinoutputconfig.json`. The four
+physical orientations and automatic landscape/portrait changes are validated.
