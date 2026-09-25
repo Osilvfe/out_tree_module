@@ -38,7 +38,7 @@ sensor set below.
 | --- | --- | --- | --- |
 | accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | validated through SSC; live accelerometer and gyroscope data, with the AP SPI node kept disabled |
 | magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | validated through SSC for magnetometer and compass data; direct `mmc5633.ko` remains optional only |
-| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | live lux data validated through SSC; proximity remains unavailable; direct `tcs3701.ko` remains optional only |
+| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | live lux and vendor RGB/CCT data validated through SSC; proximity remains unavailable; direct `tcs3701.ko` remains optional only |
 | Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | in-tree `gpio-keys` exposes standard `EV_SW/SW_LID`; probe and suspend/resume validated |
 | free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
 | barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
@@ -67,6 +67,35 @@ publish either detected register value as a standard attribute. Consequently,
 the evidence confirms the driver families but does not distinguish ICM42607
 from ICM42607P or MMC5603 from MMC5633. A specific compatible must not be
 selected solely from the common range table.
+
+### TCS3701 RGB stream
+
+The stock sensor declaration enables both `android.sensor.light` and
+`qti.sensor.rgb` for TCS3701. Runtime SUID discovery confirms that SSC publishes
+the latter as data type `rgb`, name `tcs3701`, vendor `oplus`, using
+`sns_std_sensor.proto`. `cct` and `wise_rgb` are not independently published
+data types on Caihong.
+
+A live subscription produces 68-byte events containing 16 floats plus status
+3 at about 10 Hz. Matching the values against the firmware's TCS3701 report
+labels and a simultaneous `ambient_light` stream identifies this layout:
+
+| Index | Meaning | Validation |
+| --- | --- | --- |
+| 0 | CCT in kelvin | value and firmware `rpt cct` label |
+| 1--5 | R, G, B, C, W | TCS3701 firmware channel order |
+| 6 | IR ratio | firmware reports `ir_ratio / 1000` |
+| 7--8 | reserved | zero throughout the capture |
+| 9 | lux | exactly matched simultaneous `ambient_light` samples |
+| 10 | report counter | incremented once per event |
+| 11 | report type | constant 1 in the capture |
+| 12--15 | reserved | zero throughout the capture |
+
+This is an Oplus vendor payload rather than a standard Linux userspace ABI.
+`iio-sensor-proxy` has no RGB/CCT interface, while its standard ambient-light
+backend already exposes the same calibrated lux value. The RGB stream is
+therefore validated and available to a dedicated libssc consumer, but is not
+enabled persistently or translated into a made-up SensorProxy property.
 
 ## Upstream/adaptation policy
 
@@ -170,7 +199,8 @@ write-support series and Caihong mapping are documented in
 [`ssc/README.md`](ssc/README.md).
 
 Runtime testing produced stable accelerometer, gyroscope, magnetometer,
-compass and ambient-light samples through `ssccli`. The ADSP remained running,
+compass, ambient-light and vendor RGB/CCT samples through libssc. The ADSP
+remained running,
 and its generated persistent registry files survived listener restart, cold
 boot and deep suspend/resume. The stock Caihong `sensor_config.json` declares
 TCS3701 light and RGB sensors but no Android proximity sensor, which explains
@@ -203,7 +233,8 @@ that IRQ remains a future buffered-sampling concern.
 
 1. capture the exact `icm4x607` and MMC56x3x WHO-AM-I values if a safe SSC
    diagnostic path becomes available, without taking their buses from SSC;
-2. determine whether the stock RGB stream is useful to Linux applications;
+2. add a Linux-facing RGB/CCT interface only when a concrete userspace consumer
+   can use the documented 16-float Oplus payload;
 3. identify the barometer only from evidence, not from a generic SM8650 parts
    list.
 

@@ -53,6 +53,8 @@ been validated with `libssc 0.4.4` and `ssccli`:
 - gyroscope: live three-axis samples;
 - magnetometer and compass: live samples;
 - ambient light: live lux samples;
+- RGB/CCT: the vendor `rgb` SUID publishes the calibrated 16-float TCS3701
+  payload at about 10 Hz; its lux field matches `ambient_light` samples;
 - proximity: intentionally absent from the stock Caihong sensor declaration,
   so the SSC firmware does not publish a proximity SUID.
 
@@ -74,3 +76,19 @@ kscreen-doctor output.DSI-1.autoRotatePolicy.always
 
 KWin persists this policy in the user's `kwinoutputconfig.json`. The four
 physical orientations and automatic landscape/portrait changes are validated.
+
+## Diagnostic tool
+
+`tools/ssc-inspect` queries arbitrary SSC data types and can subscribe to the
+standard float-array event format without taking ownership of the physical
+I2C or SPI buses:
+
+```sh
+cd tools/ssc-inspect
+make
+./ssc-inspect rgb ambient_light
+./ssc-inspect --stream rgb 5
+```
+
+The tool is diagnostic only and is not installed into the root filesystem by
+`install-rootfs.sh`.
