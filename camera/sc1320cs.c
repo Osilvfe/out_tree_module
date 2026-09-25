@@ -18,6 +18,7 @@
 #include <media/media-entity.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-cci.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
@@ -34,6 +35,13 @@
 #define SC1320CS_NATIVE_HEIGHT		3120
 #define SC1320CS_NUM_DATA_LANES		4
 #define SC1320CS_LINK_FREQ		600000000ULL
+#define SC1320CS_PIXEL_RATE		480000000ULL
+
+#define SC1320CS_VTS			3200
+#define SC1320CS_EXPOSURE_MIN		1
+#define SC1320CS_EXPOSURE_MARGIN	4
+#define SC1320CS_EXPOSURE_MAX		(SC1320CS_VTS - SC1320CS_EXPOSURE_MARGIN)
+#define SC1320CS_EXPOSURE_DEFAULT	3196
 
 static const unsigned short sc1320cs_probe_addresses[] = {
 	SC1320CS_CONFIRMED_ADDR, 0x10, 0x20, 0x21, 0x30, 0x31, 0x37, 0x3c,
@@ -53,6 +61,8 @@ struct sc1320cs {
 	struct clk *xvclk;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
+	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *exposure;
 	struct mutex mutex;
 	bool powered;
 	bool streaming;
@@ -60,6 +70,10 @@ struct sc1320cs {
 
 static const char * const sc1320cs_supply_names[] = {
 	"dovdd", "avdd", "dvdd",
+};
+
+static const s64 sc1320cs_link_freq_menu[] = {
+	SC1320CS_LINK_FREQ,
 };
 
 static inline struct sc1320cs *to_sc1320cs(struct v4l2_subdev *sd)
@@ -195,6 +209,74 @@ static int sc1320cs_write_mode(struct sc1320cs *sensor)
 			NULL);
 }
 
+static int sc1320cs_write_exposure(struct sc1320cs *sensor,
+				    unsigned int exposure)
+{
+	/* SmartSens stores exposure in half-line units across 0x3e00..0x3e02. */
+	unsigned int value = exposure << 1;
+	const struct cci_reg_sequence regs[] = {
+		{ CCI_REG8(0x3e00), (value >> 12) & 0x0f },
+		{ CCI_REG8(0x3e01), (value >> 4) & 0xff },
+		{ CCI_REG8(0x3e02), (value & 0x0f) << 4 },
+	};
+
+	return cci_multi_reg_write(sensor->regmap, regs, ARRAY_SIZE(regs), NULL);
+}
+
+static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct sc1320cs *sensor = container_of(ctrl->handler,
+					       struct sc1320cs, ctrls);
+
+	if (!sensor->powered)
+		return 0;
+
+	if (ctrl->id == V4L2_CID_EXPOSURE)
+		return sc1320cs_write_exposure(sensor, ctrl->val);
+
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops sc1320cs_ctrl_ops = {
+	.s_ctrl = sc1320cs_set_ctrl,
+};
+
+static int sc1320cs_init_controls(struct sc1320cs *sensor)
+{
+	struct v4l2_ctrl *link_freq;
+	struct v4l2_ctrl *pixel_rate;
+	int ret;
+
+	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 3);
+	if (ret)
+		return ret;
+
+	sensor->ctrls.lock = &sensor->mutex;
+	link_freq = v4l2_ctrl_new_int_menu(&sensor->ctrls, NULL,
+					   V4L2_CID_LINK_FREQ, 0, 0,
+					   sc1320cs_link_freq_menu);
+	pixel_rate = v4l2_ctrl_new_std(&sensor->ctrls, NULL,
+				       V4L2_CID_PIXEL_RATE, 0,
+				       SC1320CS_PIXEL_RATE, 1,
+				       SC1320CS_PIXEL_RATE);
+	sensor->exposure = v4l2_ctrl_new_std(&sensor->ctrls,
+					     &sc1320cs_ctrl_ops,
+					     V4L2_CID_EXPOSURE,
+					     SC1320CS_EXPOSURE_MIN,
+					     SC1320CS_EXPOSURE_MAX, 1,
+					     SC1320CS_EXPOSURE_DEFAULT);
+	if (sensor->ctrls.error) {
+		ret = sensor->ctrls.error;
+		v4l2_ctrl_handler_free(&sensor->ctrls);
+		return ret;
+	}
+
+	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sensor->sd.ctrl_handler = &sensor->ctrls;
+	return 0;
+}
+
 static void sc1320cs_fill_format(struct v4l2_mbus_framefmt *fmt)
 {
 	fmt->width = SC1320CS_NATIVE_WIDTH;
@@ -300,6 +382,10 @@ static int sc1320cs_set_stream(struct v4l2_subdev *sd, int enable)
 		goto power_off;
 
 	ret = sc1320cs_write_mode(sensor);
+	if (ret)
+		goto power_off;
+
+	ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
 	if (ret)
 		goto power_off;
 
@@ -428,25 +514,37 @@ static int sc1320cs_probe(struct i2c_client *client)
 		return dev_err_probe(&client->dev, ret,
 				     "SC1320CS was not found on CCI0 master 1\n");
 
+	ret = sc1320cs_init_controls(sensor);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to initialize rear-camera controls\n");
+
 	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 	sensor->sd.entity.ops = &sc1320cs_entity_ops;
 	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
-	if (ret)
-		return dev_err_probe(&client->dev, ret,
-				     "failed to initialize rear-camera media entity\n");
+	if (ret) {
+		dev_err_probe(&client->dev, ret,
+			      "failed to initialize rear-camera media entity\n");
+		goto free_ctrls;
+	}
 
 	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
 	if (ret) {
 		media_entity_cleanup(&sensor->sd.entity);
-		return dev_err_probe(&client->dev, ret,
-				     "failed to register rear-camera subdevice\n");
+		dev_err_probe(&client->dev, ret,
+			      "failed to register rear-camera subdevice\n");
+		goto free_ctrls;
 	}
 
 	dev_info(sensor->dev,
 		 "V4L2 subdevice registered; streaming uses Caihong 4208x3120 mode\n");
 	return 0;
+
+free_ctrls:
+	v4l2_ctrl_handler_free(&sensor->ctrls);
+	return ret;
 }
 
 static void sc1320cs_remove(struct i2c_client *client)
@@ -455,6 +553,7 @@ static void sc1320cs_remove(struct i2c_client *client)
 	struct sc1320cs *sensor = to_sc1320cs(sd);
 
 	v4l2_async_unregister_subdev(sd);
+	v4l2_ctrl_handler_free(&sensor->ctrls);
 	media_entity_cleanup(&sd->entity);
 	if (sensor->streaming)
 		cci_write(sensor->regmap, CCI_REG8(0x0100), 0x00, NULL);

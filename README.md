@@ -14,7 +14,9 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
   CSIPHY4.
 - `camera/sc1320cs.ko`: Caihong rear SC1320CS V4L2 driver; chip ID `0xc658`
   at Linux address `0x36` and a validated 4208x3120 RAW10 stream through
-  CSIPHY1.
+  CSIPHY1. Link frequency (600 MHz), pixel rate (480 MHz), and exposure
+  (1..3196 lines) controls are available. Captures at 3196 and 800 lines
+  confirmed that the exposure register writes change the optical output.
 - `camera/gt9772.ko`: Caihong rear GT9772 V4L2 focus actuator; validated at
   Linux address `0x0c` with optical focus movement and park-to-40 behavior.
 - `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the
