@@ -1,0 +1,15 @@
+[Unit]
+Description=Caihong Qualcomm Sensor Subsystem listener
+ConditionPathExists=/dev/fastrpc-adsp
+After=systemd-udev-trigger.service
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/usr/local/lib/caihong-ssc
+ExecStart=/usr/local/libexec/caihong-ssc/hexagonrpcd -f /dev/fastrpc-adsp -d adsp -s -R /var/lib/caihong-ssc/root
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

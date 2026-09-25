@@ -17,15 +17,16 @@ sensors and command plumbing).  `sensor-devinfo` asks the sensor hub for
 `CUST_ACTION_GET_SENSOR_INFO` and receives the physical device name from SSC;
 it is not the physical sensor driver itself.
 
-For mainline Linux the preferred architecture is therefore:
+For mainline Linux the validated architecture is therefore:
 
 1. recover the actual SSC registry hardware configuration;
-2. map SSC bus instances/power rails/pins back to AP-visible resources;
-3. reuse or adapt upstream Linux IIO/input drivers wherever possible;
-4. use standard Linux interfaces rather than importing the Oplus private
-   sensor framework;
-5. keep SSC/remoteproc coexistence and bus ownership as a separate bring-up
-   problem.
+2. run the upstream Hexagon FastRPC default listener for the ADSP sensors
+   process;
+3. serve the stock vendor and Caihong ODM registry configuration through a
+   writable, persistent HexagonFS tree;
+4. consume SSC data through `libssc`, while keeping direct-AP IIO drivers as
+   explicit bus-handoff experiments only;
+5. use the in-tree Linux input driver for the AP-visible GPIO Hall switch.
 
 ## Hardware recovered from Caihong vendor sensor registry
 
@@ -35,9 +36,9 @@ sensor set below.
 
 | Function | Registry hardware | Downstream bus / IRQ | Mainline plan |
 | --- | --- | --- | --- |
-| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | official `inv_icm42607` modules are available; keep the AP node disabled until SSC ownership and both rails are confirmed |
-| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | `mmc5633.ko` is an external I2C-only variant derived from the official MMC5603/MMC5633 driver; the optional `caihong-i2c2-sensors.dtsi` uses the registry's MMC5603 name |
-| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | `tcs3701.ko` provides a direct-I2C IIO bring-up path for raw clear/R/G/B and proximity data; the optional DTS fragment omits rails and IRQ until they are mapped |
+| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | validated through SSC; live accelerometer and gyroscope data, with the AP SPI node kept disabled |
+| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | validated through SSC for magnetometer and compass data; direct `mmc5633.ko` remains optional only |
+| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | live lux data validated through SSC; proximity remains unavailable; direct `tcs3701.ko` remains optional only |
 | Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | in-tree `gpio-keys` exposes standard `EV_SW/SW_LID`; probe and suspend/resume validated |
 | free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
 | barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
@@ -138,6 +139,21 @@ The resulting modules only prove source/API compatibility.  Loading them on a
 kernel whose DTS still assigns the same SPI controller to SSC is deliberately
 unsupported.
 
+## Qualcomm SSC runtime
+
+The official SSC route is now functional. `hexagonrpcd` attaches to
+`/dev/fastrpc-adsp` with `FASTRPC_IOCTL_INIT_ATTACH_SNS` and serves the stock
+registry to the ADSP sensors process. The firmware requires registry writes;
+using a read-only listener causes an ADSP fatal assertion. The pinned upstream
+write-support series and Caihong mapping are documented in
+[`ssc/README.md`](ssc/README.md).
+
+Runtime testing produced stable accelerometer, gyroscope, magnetometer,
+compass and ambient-light samples through `ssccli`. The ADSP remained running,
+and its generated persistent registry files survived listener restart. This
+confirms SSC SE3 and SE2 ownership, so the AP `spi3` and `i2c2` probe fragments
+must remain opt-in and disabled in normal images.
+
 ## AP bus mapping and optional probe fragment
 
 The vendor QUPv3 description numbers its first wrapper's serial engines from
@@ -156,17 +172,15 @@ that IRQ remains a future buffered-sampling concern.
 
 ## Next sensor work
 
-1. confirm SSC release and hardware-test the optional I2C2 fragment;
-2. identify the exact `icm4x607` silicon variant from SSC firmware/WHO_AM_I;
-3. map the ICM42607 `vdd`/`vddio` rails and select the matching `spi3` DT
-   compatible;
-4. identify MMC5603 vs MMC5633 from runtime/firmware evidence and retain the
-   matching DT compatible for `mmc5633.ko`;
-5. hardware-test TCS3701 raw ALS/proximity over the AP-owned I2C path, then add
-   IRQ thresholds and calibration only after the electrical path is proven;
-6. recover the PMIC regulator behind `sensor_vddio` / `sensor_vdd`;
-7. identify the barometer only from evidence (SSC registry/runtime info), not
-   from a generic SM8650 parts list.
+1. integrate and reboot-test `caihong-ssc.service` from the root filesystem;
+2. test listener and sensor recovery across suspend/resume;
+3. determine why the TCS3701 proximity SUID is unavailable while lux works;
+4. expose the validated SSC streams to desktop consumers that require IIO or
+   SensorProxy interfaces;
+5. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
+   attributes without taking their buses from SSC;
+6. identify the barometer only from evidence, not from a generic SM8650 parts
+   list.
 
 ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE
 (`st21nfc`/`st54spi_gpio`), not this tablet's IMU stack, and remains intentionally
