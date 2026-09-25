@@ -17,9 +17,12 @@ mmc5633-y := sensors/mmc5633.o
 obj-m += tcs3701.o
 tcs3701-y := sensors/tcs3701.o
 
-# Caihong front camera: safe probe/V4L2 graph bring-up only for now.
+# Caihong front camera: SC820CS probe and first-stage V4L2 streaming.
 obj-m += sc820cs.o
 sc820cs-y := camera/sc820cs.o
+
+obj-m += sc1320cs.o
+sc1320cs-y := camera/sc1320cs.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

@@ -2,6 +2,7 @@
 
 obj-m += sc820cs.o
 obj-m += gt9772.o
+obj-m += sc1320cs.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

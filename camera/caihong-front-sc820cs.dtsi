@@ -45,10 +45,11 @@
 	#size-cells = <0>;
 	clock-frequency = <400000>;
 
-	front_camera: camera@36 {
+	/* Hardware probe while powered: SC820CS responds at Linux address 0x10. */
+	front_camera: camera@10 {
 		compatible = "smartsens,sc820cs";
-		/* Downstream 8-bit address 0x6c -> Linux 7-bit address 0x36. */
-		reg = <0x36>;
+		/* Verified on Caihong while powered; do not use the Y700 0x36 address. */
+		reg = <0x10>;
 
 		clocks = <&camcc CAM_CC_MCLK4_CLK>;
 		clock-names = "xvclk";

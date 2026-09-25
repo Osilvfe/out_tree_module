@@ -9,6 +9,12 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
+- `camera/sc820cs.ko`: Caihong front SC820CS V4L2 driver; chip ID `0xd154`
+  at Linux address `0x10` and a validated 3264x2448 RAW10 stream through
+  CSIPHY4.
+- `camera/sc1320cs.ko`: Caihong rear SC1320CS read-only V4L2 probe; chip ID
+  `0xc658` at Linux address `0x36`, with power/reset and media-subdevice
+  registration validated. Rear CSI streaming is not enabled yet.
 - `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the
   SSC-registry-derived BU52053NVX Hall input, MMC56x3x magnetometer, TCS3701
   direct-I2C IIO baseline, and the official upstream ICM42607 IMU core with
@@ -20,10 +26,11 @@ coordinate transform properties, and optional `novatek,pen-support`.
 
 The pogo driver remains in the tree, but current work is focused on charging.
 
-Sensor work is tracked on `port/sm8650-camera-sensors`.  The sensor modules
-are compile- and modpost-validated against Linux v7.2; they do not enable a
-device-tree node or take ownership from the Qualcomm SSC until the AP bus,
-chip identity, interrupt and regulator mapping have been verified on Caihong.
+Sensor work is tracked on `port/sm8650-camera-sensors`.  The camera modules
+and Caihong camera DT graph are compile- and modpost-validated against Linux
+v7.2. The remaining `sensors/*.ko` modules do not enable a device-tree node or
+take ownership from the Qualcomm SSC until the AP bus, chip identity,
+interrupt and regulator mapping have been verified on Caihong.
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is

@@ -48,7 +48,7 @@ Caihong uses camera CCI0 for both physical cameras:
 
 | Camera | Sensor | CCI | mainline bus | CSIPHY | MCLK | Reset | Other confirmed hardware |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| rear (`cell-index = 0`, camera id 0) | SmartSens **SC1320CS** | CCI0 master 1 | `cci0_i2c1` | CSIPHY1 | MCLK1, 19.2 MHz | GPIO82 | GT9772 actuator, rear EEPROM, PM8550 flash |
+| rear (`cell-index = 0`, camera id 0) | SmartSens **SC1320CS** | CCI0 master 1 | `cci0_i2c1`, **0x36** | CSIPHY1 | MCLK1, 19.2 MHz | GPIO82 | GT9772 actuator, rear EEPROM, PM8550 flash |
 | front (`cell-index = 1`, camera id 1) | SmartSens **SC820CS** | CCI0 master 0 | `cci0_i2c0` | CSIPHY4 | MCLK4, 19.2 MHz | GPIO7 | front EEPROM |
 
 The sensor models are no longer inferred only from EEPROM names. Caihong's own
@@ -80,32 +80,50 @@ These resources already have mainline SM8650 counterparts.
 
 ## Front SC820CS milestone
 
-`sc820cs.c` is intentionally a safe **probe-only** V4L2 driver. It currently:
+`sc820cs.c` is now a working first-stage V4L2 streaming driver. It currently:
 
 - acquires DOVDD/AVDD/DVDD, MCLK and reset GPIO;
 - uses the Caihong 19.2 MHz input clock;
-- powers the sensor only long enough to read its ID;
+- powers the sensor for identification and on-demand streaming;
 - checks `0x3107/0x3108 == 0xd154`;
 - exposes one 3264x2448 RAW10 source pad;
 - validates a four-lane CSI-2 endpoint;
+- reports the Caihong 366 MHz CSI link frequency through `get_mbus_config`;
 - registers a normal V4L2 sensor subdevice;
-- explicitly returns `-EOPNOTSUPP` when userspace tries to start streaming.
+- writes the official Caihong SC820CS initialization table before streaming;
+- starts and stops the sensor through the normal V4L2 `s_stream` callback.
 
-No foreign-device register table is written during this stage. Public SC820CS
-mode tables are useful references, but they are not assumed to be Caihong's
-exact tuning/configuration.
+The initialization table is the 117-entry `sc820cs_setting` sequence from
+Caihong's downstream camera tree, with its final `0x0100 = 0x01` entry removed
+because the V4L2 driver performs stream-on explicitly. The board-specific
+`0x301f = 0x0e` value and Caihong's power topology are retained; the Lenovo
+Y700 address and power settings are not copied.
 
-The first hardware probe image now enables the upstream SM8650 `camcc`, CCI,
-CAMSS and CSIPHY4 graph, then loads `sc820cs.ko` from initramfs. Its only
-sensor transaction is the powered read of registers `0x3107` and `0x3108`; a
-successful result is logged as `SC820CS detected, chip ID 0xd154`. Video
-streaming remains deliberately disabled until that ID and the board's mode
-timing are confirmed.
+The tested B-slot image enables the upstream SM8650 `camcc`, CCI, CAMSS and
+CSIPHY4 graph, then loads `sc820cs.ko` from initramfs. On hardware it logged
+`SC820CS detected, chip ID 0xd154` and captured two consecutive
+3264x2448 RAW10 frames (`pBAA`, 9,987,840 bytes each) through `/dev/video0`.
+The validated image is
+`mainline-boot-v2-stage6b-front-camera-stream-v2-linkfreq.img` with SHA-256
+`5976133f831b10862350c32e845046612b47eef5ff442bfdaec28559264cd05b`.
+
+CAMSS exposes several possible CSIPHY/CSID/VFE paths, so the non-immutable
+downstream links must currently be enabled by media-controller userspace. The
+validated path is:
+
+```text
+sc820cs 8-0010 -> msm_csiphy4 -> msm_csid0 -> msm_vfe0_rdi0 -> /dev/video0
+```
+
+The media formats on that path are `SBGGR10_1X10/3264x2448`; the video node
+format is the packed `pBAA` fourcc. A camera service or libcamera pipeline
+handler should perform this graph setup before opening the node.
 
 `caihong-front-sc820cs.dtsi` maps the front sensor onto mainline
-`cci0_i2c0 -> CAMSS CSIPHY4`. The downstream-style 8-bit SC820CS address `0x6c`
-corresponds to Linux 7-bit address `0x36`; this remains an item to verify on the
-actual Caihong bus together with the chip ID. On SM8650, CSIPHY4 uses the
+`cci0_i2c0 -> CAMSS CSIPHY4`. A powered read-only probe on Caihong found the
+SC820CS at Linux 7-bit address `0x10` and returned chip ID `0xd154`. This differs
+from the Lenovo Y700 reference driver, which uses `0x36`; that address must not
+be copied to Caihong. On SM8650, CSIPHY4 uses the
 shared `vdd-csiphy24-*` resource group; the board fragment now names that group
 explicitly so CAMSS does not substitute dummy regulators for the active PHY.
 The board DTS also selects GPIO7 as the SC820CS reset output, matching the
@@ -117,18 +135,20 @@ the default `dmic1_data` function and the sensor can remain held in reset.
 The rear sensor is now conclusively identified as SC1320CS. SmartSens documents
 it as a 13 MP, 4224x3134, 30 fps MIPI sensor.
 
-The remaining probe parameters are deliberately still marked unknown until they
-are recovered from Caihong's QTI `com.qti.sensormodule.lce_sc1320cs.bin` or from
-a read-only hardware probe:
+The first read-only rear probe has now been completed on Caihong. It powers the
+sensor through L4B/L16B/L2G, drives MCLK1 at 19.2 MHz, releases GPIO82, and
+reads the two 8-bit chip-ID registers without writing a sensor mode table:
 
-- 7-bit CCI/I2C slave address;
-- chip-ID register address/data width;
-- expected chip-ID value/mask.
+- Linux 7-bit CCI/I2C address: **0x36**;
+- chip-ID registers: **0x3107/0x3108**;
+- chip ID: **0xc658**;
+- CCI path: **CCI0 master 1 (`cci0_i2c1`)**.
 
-Do **not** copy an SC1320CS address or ID from an unrelated phone and call it a
-Caihong value. The first rear driver should mirror the front strategy: power,
-reset, read-only identification and media-subdevice registration before any
-mode table is written.
+The driver registers a read-only V4L2 subdevice after the probe. The DT now
+uses the confirmed `0x36` address and the probe list tries it first, while a
+small fallback list remains available for board-revision diagnostics. No
+SC1320CS initialization table, CSIPHY1 media link, RAW stream, autofocus,
+EEPROM, or flash support is enabled yet.
 
 ## GT9772 autofocus milestone
 
@@ -182,12 +202,11 @@ on hardware.
 
 1. Merge the front-camera graph into the real Caihong DTS and confirm CCI0,
    clocks, rails, reset and SC820CS ID `0xd154` on hardware.
-2. Recover SC1320CS probe address/ID from the Caihong sensor-module blob or a
-   read-only bus probe, then add a safe rear probe-only V4L2 driver.
-3. Recover/validate Caihong SC820CS and SC1320CS mode programming before
-   enabling streaming.
-4. Add exposure, analogue gain, VBLANK and test-pattern controls only after the
-   correct mode tables are proven.
+2. Recover the official SC1320CS mode table from the Caihong sensor-module
+   blob, then add the CSIPHY1 media link and validate a rear RAW stream.
+3. Add exposure, analogue gain, VBLANK and test-pattern controls to SC820CS.
+4. Make the media-graph setup automatic through the camera userspace stack and
+   validate the path with libcamera.
 5. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
    facilities wherever practical.
 6. Bring up the complete media graph under libcamera before considering any
