@@ -89,6 +89,9 @@ These resources already have mainline SM8650 counterparts.
 - exposes one 3264x2448 RAW10 source pad;
 - validates a four-lane CSI-2 endpoint;
 - reports the Caihong 366 MHz CSI link frequency through `get_mbus_config`;
+- exposes pixel-rate, fixed blanking, exposure and analogue-gain controls using
+  the official SC820CS timing and register encoding;
+- exposes the full pixel-array selection targets required by libcamera;
 - registers a normal V4L2 sensor subdevice;
 - writes the official Caihong SC820CS initialization table before streaming;
 - starts and stops the sensor through the normal V4L2 `s_stream` callback.
@@ -107,17 +110,15 @@ The validated image is
 `mainline-boot-v2-stage6b-front-camera-stream-v2-linkfreq.img` with SHA-256
 `5976133f831b10862350c32e845046612b47eef5ff442bfdaec28559264cd05b`.
 
-CAMSS exposes several possible CSIPHY/CSID/VFE paths, so the non-immutable
-downstream links must currently be enabled by media-controller userspace. The
-validated path is:
+CAMSS exposes several possible CSIPHY/CSID/VFE paths. The libcamera simple
+pipeline now selects the graph automatically; the validated raw path is:
 
 ```text
 sc820cs 8-0010 -> msm_csiphy4 -> msm_csid0 -> msm_vfe0_rdi0 -> /dev/video0
 ```
 
 The media formats on that path are `SBGGR10_1X10/3264x2448`; the video node
-format is the packed `pBAA` fourcc. A camera service or libcamera pipeline
-handler should perform this graph setup before opening the node.
+format is the packed `pBAA` fourcc.
 
 `caihong-front-sc820cs.dtsi` maps the front sensor onto mainline
 `cci0_i2c0 -> CAMSS CSIPHY4`. A powered read-only probe on Caihong found the
@@ -165,8 +166,28 @@ The tested B-slot image is
 `mainline-boot-v2-stage6b-front-rear-camera-stream-v1.img`, SHA-256
 `5300bbb60f0931164f09656bfb4a324a539e32ed121c73cbd31dc1bd718eec9f`.
 
-Autofocus, EEPROM, flash, sensor exposure/gain controls and a camera userspace
-pipeline are separate follow-up stages.
+The rear driver exposes link-frequency, pixel-rate, fixed horizontal/vertical
+blanking, exposure and fixed 1x analogue-gain controls, plus full-frame
+selection targets. The fixed gain is intentional until a reliable official
+SC1320CS gain mapping is available.
+
+## libcamera application milestone
+
+Both sensors enumerate through libcamera's simple pipeline and software ISP.
+Hardware validation as the unprivileged desktop user includes:
+
+- `cam` 1280x720 RGB capture from both cameras, with five consecutive frames;
+- full-resolution front capture at 3256x2448 RGB;
+- GStreamer `libcamerasrc` capture from both cameras;
+- Plasma Camera allocation of four full-resolution buffers and transition to
+  `readyForCapture`.
+
+The DMA-BUF system and CMA heap modules must be loaded before camera userspace.
+Desktop users are granted access only to `/dev/dma_heap/system`: libcamera's
+software ISP output does not require physically contiguous memory, while the
+board's 32 MiB reserved CMA heap cannot hold multiple full-resolution RGB
+buffers. Front/back orientation and the common 180-degree sensor mounting
+rotation are supplied by the Caihong device tree.
 
 ## GT9772 autofocus milestone
 
@@ -231,13 +252,13 @@ on hardware.
 
 ## Next stages
 
-1. Add exposure, analogue gain, VBLANK and test-pattern controls to both
-   SmartSens sensor drivers.
-2. Make the media-graph setup automatic through the camera userspace stack and
-   validate the path with libcamera.
-3. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
+1. Add the official SC1320CS analogue-gain mapping when a reliable source is
+   available, and tune libcamera sensor helpers/configuration.
+2. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
    facilities wherever practical.
-4. Bring up the complete media graph under libcamera before considering any
+3. Validate autofocus and still capture from the desktop camera application.
+4. Consider any required downstream CamX compatibility only after the native
+   libcamera path is complete.
    downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,

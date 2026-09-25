@@ -19,6 +19,7 @@
 #include <media/media-entity.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-cci.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
@@ -35,6 +36,17 @@
 #define SC820CS_NATIVE_HEIGHT		2448
 #define SC820CS_NUM_DATA_LANES		4
 #define SC820CS_LINK_FREQ		366000000ULL
+#define SC820CS_PIXEL_RATE		292800000ULL
+
+#define SC820CS_HTS			3888
+#define SC820CS_VTS			2500
+#define SC820CS_EXPOSURE_MIN		1
+#define SC820CS_EXPOSURE_MARGIN		6
+#define SC820CS_EXPOSURE_MAX		(SC820CS_VTS - SC820CS_EXPOSURE_MARGIN)
+#define SC820CS_EXPOSURE_DEFAULT	750
+#define SC820CS_ANALOGUE_GAIN_MIN	1024
+#define SC820CS_ANALOGUE_GAIN_MAX	16384
+#define SC820CS_ANALOGUE_GAIN_DEFAULT	1024
 
 static bool keep_power_on_on_probe_failure;
 module_param_named(keep_power_on_on_probe_failure,
@@ -61,6 +73,7 @@ struct sc820cs {
 	struct clk *xvclk;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
+	struct v4l2_ctrl_handler ctrls;
 	struct mutex mutex;
 	bool powered;
 	bool streaming;
@@ -70,6 +83,23 @@ static const char * const sc820cs_supply_names[] = {
 	"dovdd",
 	"avdd",
 	"dvdd",
+};
+
+static const s64 sc820cs_link_freq_menu[] = {
+	SC820CS_LINK_FREQ,
+};
+
+struct sc820cs_gain_step {
+	u32 gain;
+	u8 coarse;
+};
+
+static const struct sc820cs_gain_step sc820cs_gain_steps[] = {
+	{ 1024, 0x00 },
+	{ 2048, 0x08 },
+	{ 4096, 0x09 },
+	{ 8192, 0x0b },
+	{ 16384, 0x0f },
 };
 
 static inline struct sc820cs *to_sc820cs(struct v4l2_subdev *sd)
@@ -178,6 +208,126 @@ static int sc820cs_write_mode(struct sc820cs *sc820cs)
 			ARRAY_SIZE(sc820cs_caihong_3264x2448_regs) - 1, NULL);
 }
 
+static int sc820cs_write_exposure(struct sc820cs *sc820cs,
+				    unsigned int exposure)
+{
+	unsigned int encoded = exposure * 2;
+	const struct cci_reg_sequence regs[] = {
+		{ CCI_REG8(0x3e20), (encoded >> 20) & 0x0f },
+		{ CCI_REG8(0x3e00), (encoded >> 12) & 0xff },
+		{ CCI_REG8(0x3e01), (encoded >> 4) & 0xff },
+		{ CCI_REG8(0x3e02), (exposure & 0x07) << 5 },
+	};
+
+	return cci_multi_reg_write(sc820cs->regmap, regs, ARRAY_SIZE(regs), NULL);
+}
+
+static int sc820cs_write_gain(struct sc820cs *sc820cs, unsigned int gain)
+{
+	const struct sc820cs_gain_step *step = &sc820cs_gain_steps[0];
+	struct cci_reg_sequence regs[2];
+	unsigned int fine;
+	unsigned int i;
+
+	for (i = 1; i < ARRAY_SIZE(sc820cs_gain_steps); i++) {
+		if (gain < sc820cs_gain_steps[i].gain)
+			break;
+		step = &sc820cs_gain_steps[i];
+	}
+
+	fine = (gain * 128 + step->gain / 2) / step->gain;
+	regs[0].reg = CCI_REG8(0x3e08);
+	regs[0].val = step->coarse;
+	regs[1].reg = CCI_REG8(0x3e07);
+	regs[1].val = clamp_val(fine, 0, 0xff);
+
+	return cci_multi_reg_write(sc820cs->regmap, regs, ARRAY_SIZE(regs), NULL);
+}
+
+static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct sc820cs *sc820cs = container_of(ctrl->handler,
+					       struct sc820cs, ctrls);
+
+	if (!sc820cs->powered)
+		return 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_EXPOSURE:
+		return sc820cs_write_exposure(sc820cs, ctrl->val);
+	case V4L2_CID_ANALOGUE_GAIN:
+		return sc820cs_write_gain(sc820cs, ctrl->val);
+	default:
+		return 0;
+	}
+}
+
+static const struct v4l2_ctrl_ops sc820cs_ctrl_ops = {
+	.s_ctrl = sc820cs_set_ctrl,
+};
+
+static int sc820cs_init_controls(struct sc820cs *sc820cs)
+{
+	struct v4l2_fwnode_device_properties props;
+	struct v4l2_ctrl *link_freq;
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *vblank;
+	int ret;
+
+	ret = v4l2_ctrl_handler_init(&sc820cs->ctrls, 8);
+	if (ret)
+		return ret;
+
+	sc820cs->ctrls.lock = &sc820cs->mutex;
+	link_freq = v4l2_ctrl_new_int_menu(&sc820cs->ctrls, NULL,
+					   V4L2_CID_LINK_FREQ, 0, 0,
+					   sc820cs_link_freq_menu);
+	pixel_rate = v4l2_ctrl_new_std(&sc820cs->ctrls, NULL,
+				       V4L2_CID_PIXEL_RATE,
+				       SC820CS_PIXEL_RATE, SC820CS_PIXEL_RATE,
+				       1, SC820CS_PIXEL_RATE);
+	hblank = v4l2_ctrl_new_std(&sc820cs->ctrls, NULL, V4L2_CID_HBLANK,
+				   SC820CS_HTS - SC820CS_NATIVE_WIDTH,
+				   SC820CS_HTS - SC820CS_NATIVE_WIDTH, 1,
+				   SC820CS_HTS - SC820CS_NATIVE_WIDTH);
+	vblank = v4l2_ctrl_new_std(&sc820cs->ctrls, NULL, V4L2_CID_VBLANK,
+				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT,
+				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT, 1,
+				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT);
+	v4l2_ctrl_new_std(&sc820cs->ctrls, &sc820cs_ctrl_ops,
+			  V4L2_CID_EXPOSURE, SC820CS_EXPOSURE_MIN,
+			  SC820CS_EXPOSURE_MAX, 1, SC820CS_EXPOSURE_DEFAULT);
+	v4l2_ctrl_new_std(&sc820cs->ctrls, &sc820cs_ctrl_ops,
+			  V4L2_CID_ANALOGUE_GAIN, SC820CS_ANALOGUE_GAIN_MIN,
+			  SC820CS_ANALOGUE_GAIN_MAX, 1,
+			  SC820CS_ANALOGUE_GAIN_DEFAULT);
+	ret = v4l2_fwnode_device_parse(sc820cs->dev, &props);
+	if (ret)
+		goto free_ctrls;
+
+	ret = v4l2_ctrl_new_fwnode_properties(&sc820cs->ctrls,
+					      &sc820cs_ctrl_ops, &props);
+	if (ret)
+		goto free_ctrls;
+
+	if (sc820cs->ctrls.error) {
+		ret = sc820cs->ctrls.error;
+		goto free_ctrls;
+	}
+
+	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	sc820cs->sd.ctrl_handler = &sc820cs->ctrls;
+	return 0;
+
+free_ctrls:
+	v4l2_ctrl_handler_free(&sc820cs->ctrls);
+	return ret;
+}
+
 static void sc820cs_fill_format(struct v4l2_mbus_framefmt *fmt)
 {
 	fmt->width = SC820CS_NATIVE_WIDTH;
@@ -237,6 +387,28 @@ static int sc820cs_set_fmt(struct v4l2_subdev *sd,
 	return 0;
 }
 
+static int sc820cs_get_selection(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *state,
+				 struct v4l2_subdev_selection *sel)
+{
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = SC820CS_NATIVE_WIDTH;
+		sel->r.height = SC820CS_NATIVE_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int sc820cs_get_mbus_config(struct v4l2_subdev *sd, unsigned int pad,
 				   struct v4l2_mbus_config *config)
 {
@@ -287,6 +459,10 @@ static int sc820cs_set_stream(struct v4l2_subdev *sd, int enable)
 	if (ret)
 		goto power_off;
 
+	ret = __v4l2_ctrl_handler_setup(&sc820cs->ctrls);
+	if (ret)
+		goto power_off;
+
 	ret = cci_write(sc820cs->regmap, CCI_REG8(0x0100), 0x01, NULL);
 	if (ret)
 		goto power_off;
@@ -311,6 +487,7 @@ static const struct v4l2_subdev_pad_ops sc820cs_pad_ops = {
 	.enum_frame_size = sc820cs_enum_frame_size,
 	.get_fmt = sc820cs_get_fmt,
 	.set_fmt = sc820cs_set_fmt,
+	.get_selection = sc820cs_get_selection,
 	.get_mbus_config = sc820cs_get_mbus_config,
 };
 
@@ -420,6 +597,11 @@ static int sc820cs_probe(struct i2c_client *client)
 		dev_warn(sc820cs->dev,
 			 "registering diagnostic subdevice without a valid chip ID\n");
 
+	ret = sc820cs_init_controls(sc820cs);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to initialize front-camera controls\n");
+
 	sc820cs->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	sc820cs->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 	sc820cs->sd.entity.ops = &sc820cs_entity_ops;
@@ -427,6 +609,7 @@ static int sc820cs_probe(struct i2c_client *client)
 
 	ret = media_entity_pads_init(&sc820cs->sd.entity, 1, &sc820cs->pad);
 	if (ret) {
+		v4l2_ctrl_handler_free(&sc820cs->ctrls);
 		sc820cs_power_off(sc820cs);
 		return dev_err_probe(sc820cs->dev, ret,
 				     "failed to initialize media entity\n");
@@ -435,6 +618,7 @@ static int sc820cs_probe(struct i2c_client *client)
 	ret = v4l2_async_register_subdev_sensor(&sc820cs->sd);
 	if (ret) {
 		media_entity_cleanup(&sc820cs->sd.entity);
+		v4l2_ctrl_handler_free(&sc820cs->ctrls);
 		sc820cs_power_off(sc820cs);
 		return dev_err_probe(sc820cs->dev, ret,
 				     "failed to register V4L2 subdevice\n");
@@ -451,6 +635,7 @@ static void sc820cs_remove(struct i2c_client *client)
 	struct sc820cs *sc820cs = to_sc820cs(sd);
 
 	v4l2_async_unregister_subdev(sd);
+	v4l2_ctrl_handler_free(&sc820cs->ctrls);
 	media_entity_cleanup(&sd->entity);
 	if (sc820cs->streaming)
 		cci_write(sc820cs->regmap, CCI_REG8(0x0100), 0x00, NULL);
@@ -474,5 +659,5 @@ static struct i2c_driver sc820cs_i2c_driver = {
 };
 module_i2c_driver(sc820cs_i2c_driver);
 
-MODULE_DESCRIPTION("SmartSens SC820CS probe-only V4L2 sensor driver");
+MODULE_DESCRIPTION("SmartSens SC820CS V4L2 sensor driver for Caihong");
 MODULE_LICENSE("GPL");

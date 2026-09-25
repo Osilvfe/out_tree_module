@@ -11,12 +11,15 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
 - `camera/sc820cs.ko`: Caihong front SC820CS V4L2 driver; chip ID `0xd154`
   at Linux address `0x10` and a validated 3264x2448 RAW10 stream through
-  CSIPHY4.
+  CSIPHY4. The official SC820CS timing, exposure and analogue-gain controls
+  are implemented; libcamera capture is validated through the software ISP.
 - `camera/sc1320cs.ko`: Caihong rear SC1320CS V4L2 driver; chip ID `0xc658`
   at Linux address `0x36` and a validated 4208x3120 RAW10 stream through
   CSIPHY1. Link frequency (600 MHz), pixel rate (480 MHz), and exposure
   (1..3196 lines) controls are available. Captures at 3196 and 800 lines
   confirmed that the exposure register writes change the optical output.
+  Fixed blanking and 1x gain controls complete the libcamera sensor contract;
+  libcamera and GStreamer captures are validated through the software ISP.
 - `camera/gt9772.ko`: Caihong rear GT9772 V4L2 focus actuator; validated at
   Linux address `0x0c` with optical focus movement and park-to-40 behavior.
 - `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the

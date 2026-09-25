@@ -37,11 +37,13 @@
 #define SC1320CS_LINK_FREQ		600000000ULL
 #define SC1320CS_PIXEL_RATE		480000000ULL
 
+#define SC1320CS_HTS			5000
 #define SC1320CS_VTS			3200
 #define SC1320CS_EXPOSURE_MIN		1
 #define SC1320CS_EXPOSURE_MARGIN	4
 #define SC1320CS_EXPOSURE_MAX		(SC1320CS_VTS - SC1320CS_EXPOSURE_MARGIN)
 #define SC1320CS_EXPOSURE_DEFAULT	3196
+#define SC1320CS_ANALOGUE_GAIN_DEFAULT	1024
 
 static const unsigned short sc1320cs_probe_addresses[] = {
 	SC1320CS_CONFIRMED_ADDR, 0x10, 0x20, 0x21, 0x30, 0x31, 0x37, 0x3c,
@@ -243,11 +245,14 @@ static const struct v4l2_ctrl_ops sc1320cs_ctrl_ops = {
 
 static int sc1320cs_init_controls(struct sc1320cs *sensor)
 {
+	struct v4l2_fwnode_device_properties props;
 	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *vblank;
 	int ret;
 
-	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 3);
+	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 8);
 	if (ret)
 		return ret;
 
@@ -259,22 +264,48 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 				       V4L2_CID_PIXEL_RATE, 0,
 				       SC1320CS_PIXEL_RATE, 1,
 				       SC1320CS_PIXEL_RATE);
+	hblank = v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_HBLANK,
+				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH,
+				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH, 1,
+				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH);
+	vblank = v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_VBLANK,
+				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT,
+				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT, 1,
+				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT);
 	sensor->exposure = v4l2_ctrl_new_std(&sensor->ctrls,
 					     &sc1320cs_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
 					     SC1320CS_EXPOSURE_MIN,
 					     SC1320CS_EXPOSURE_MAX, 1,
 					     SC1320CS_EXPOSURE_DEFAULT);
+	v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_ANALOGUE_GAIN,
+			  SC1320CS_ANALOGUE_GAIN_DEFAULT,
+			  SC1320CS_ANALOGUE_GAIN_DEFAULT, 1,
+			  SC1320CS_ANALOGUE_GAIN_DEFAULT);
+	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
+	if (ret)
+		goto free_ctrls;
+
+	ret = v4l2_ctrl_new_fwnode_properties(&sensor->ctrls,
+					      &sc1320cs_ctrl_ops, &props);
+	if (ret)
+		goto free_ctrls;
+
 	if (sensor->ctrls.error) {
 		ret = sensor->ctrls.error;
-		v4l2_ctrl_handler_free(&sensor->ctrls);
-		return ret;
+		goto free_ctrls;
 	}
 
 	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	sensor->sd.ctrl_handler = &sensor->ctrls;
 	return 0;
+
+free_ctrls:
+	v4l2_ctrl_handler_free(&sensor->ctrls);
+	return ret;
 }
 
 static void sc1320cs_fill_format(struct v4l2_mbus_framefmt *fmt)
@@ -334,6 +365,28 @@ static int sc1320cs_set_fmt(struct v4l2_subdev *sd,
 		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
 
 	return 0;
+}
+
+static int sc1320cs_get_selection(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
+{
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = SC1320CS_NATIVE_WIDTH;
+		sel->r.height = SC1320CS_NATIVE_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int sc1320cs_get_mbus_config(struct v4l2_subdev *sd, unsigned int pad,
@@ -413,6 +466,7 @@ static const struct v4l2_subdev_pad_ops sc1320cs_pad_ops = {
 	.enum_frame_size = sc1320cs_enum_frame_size,
 	.get_fmt = sc1320cs_get_fmt,
 	.set_fmt = sc1320cs_set_fmt,
+	.get_selection = sc1320cs_get_selection,
 	.get_mbus_config = sc1320cs_get_mbus_config,
 };
 
