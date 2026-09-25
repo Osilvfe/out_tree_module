@@ -12,9 +12,9 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `camera/sc820cs.ko`: Caihong front SC820CS V4L2 driver; chip ID `0xd154`
   at Linux address `0x10` and a validated 3264x2448 RAW10 stream through
   CSIPHY4.
-- `camera/sc1320cs.ko`: Caihong rear SC1320CS read-only V4L2 probe; chip ID
-  `0xc658` at Linux address `0x36`, with power/reset and media-subdevice
-  registration validated. Rear CSI streaming is not enabled yet.
+- `camera/sc1320cs.ko`: Caihong rear SC1320CS V4L2 driver; chip ID `0xc658`
+  at Linux address `0x36` and a validated 4208x3120 RAW10 stream through
+  CSIPHY1.
 - `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the
   SSC-registry-derived BU52053NVX Hall input, MMC56x3x magnetometer, TCS3701
   direct-I2C IIO baseline, and the official upstream ICM42607 IMU core with

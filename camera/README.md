@@ -135,20 +135,38 @@ the default `dmic1_data` function and the sensor can remain held in reset.
 The rear sensor is now conclusively identified as SC1320CS. SmartSens documents
 it as a 13 MP, 4224x3134, 30 fps MIPI sensor.
 
-The first read-only rear probe has now been completed on Caihong. It powers the
-sensor through L4B/L16B/L2G, drives MCLK1 at 19.2 MHz, releases GPIO82, and
-reads the two 8-bit chip-ID registers without writing a sensor mode table:
+Rear identification and RAW streaming have now been completed on Caihong. The
+driver powers the sensor through L4B/L16B/L2G, drives MCLK1 at 19.2 MHz,
+releases GPIO82, and reads the two 8-bit chip-ID registers:
 
 - Linux 7-bit CCI/I2C address: **0x36**;
 - chip-ID registers: **0x3107/0x3108**;
 - chip ID: **0xc658**;
 - CCI path: **CCI0 master 1 (`cci0_i2c1`)**.
 
-The driver registers a read-only V4L2 subdevice after the probe. The DT now
-uses the confirmed `0x36` address and the probe list tries it first, while a
-small fallback list remains available for board-revision diagnostics. No
-SC1320CS initialization table, CSIPHY1 media link, RAW stream, autofocus,
-EEPROM, or flash support is enabled yet.
+The driver exposes the official Caihong 4208x3120 RAW10 mode over four CSI-2
+lanes. Its initialization table is the 143-entry `sc1320cs_setting` sequence
+from the OnePlus tree, with the final `0x0100 = 0x01` entry removed so stream
+start and stop remain under the V4L2 `s_stream` callback. The DT uses a 600 MHz
+link frequency and maps the sensor to CSIPHY1.
+
+The validated media path is:
+
+```text
+sc1320cs 9-0036 -> msm_csiphy1 -> msm_csid1 -> msm_vfe1_rdi0 -> /dev/video3
+```
+
+On hardware, a single frame and a subsequent three-frame run completed without
+CSI, VFE, overflow or timeout errors. Each packed `pBAA` frame is 4208x3120
+with a 5264-byte stride (16,423,680 bytes total), and all three frames had
+different hashes. The first decoded frame contained a coherent real scene;
+its 10-bit samples ranged from 63 to 203 with no zero or saturated pixels.
+The tested B-slot image is
+`mainline-boot-v2-stage6b-front-rear-camera-stream-v1.img`, SHA-256
+`5300bbb60f0931164f09656bfb4a324a539e32ed121c73cbd31dc1bd718eec9f`.
+
+Autofocus, EEPROM, flash, sensor exposure/gain controls and a camera userspace
+pipeline are separate follow-up stages.
 
 ## GT9772 autofocus milestone
 
@@ -200,16 +218,15 @@ on hardware.
 
 ## Next stages
 
-1. Merge the front-camera graph into the real Caihong DTS and confirm CCI0,
-   clocks, rails, reset and SC820CS ID `0xd154` on hardware.
-2. Recover the official SC1320CS mode table from the Caihong sensor-module
-   blob, then add the CSIPHY1 media link and validate a rear RAW stream.
-3. Add exposure, analogue gain, VBLANK and test-pattern controls to SC820CS.
-4. Make the media-graph setup automatic through the camera userspace stack and
+1. Enable and hardware-test the existing GT9772 V4L2 focus actuator on the
+   rear CCI bus.
+2. Add exposure, analogue gain, VBLANK and test-pattern controls to both
+   SmartSens sensor drivers.
+3. Make the media-graph setup automatic through the camera userspace stack and
    validate the path with libcamera.
-5. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
+4. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
    facilities wherever practical.
-6. Bring up the complete media graph under libcamera before considering any
+5. Bring up the complete media graph under libcamera before considering any
    downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,
