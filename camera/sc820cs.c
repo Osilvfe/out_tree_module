@@ -13,10 +13,12 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
 #include <media/media-entity.h>
 #include <media/v4l2-async.h>
+#include <media/v4l2-cci.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
@@ -35,6 +37,7 @@ struct sc820cs {
 	struct device *dev;
 	struct v4l2_subdev sd;
 	struct media_pad pad;
+	struct regmap *regmap;
 	struct clk *xvclk;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
@@ -53,29 +56,15 @@ static inline struct sc820cs *to_sc820cs(struct v4l2_subdev *sd)
 
 static int sc820cs_read8(struct sc820cs *sc820cs, u16 reg, u8 *val)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&sc820cs->sd);
-	u8 addr_buf[2] = { reg >> 8, reg & 0xff };
-	struct i2c_msg msgs[] = {
-		{
-			.addr = client->addr,
-			.len = sizeof(addr_buf),
-			.buf = addr_buf,
-		},
-		{
-			.addr = client->addr,
-			.flags = I2C_M_RD,
-			.len = 1,
-			.buf = val,
-		},
-	};
+	u64 value;
 	int ret;
 
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret < 0)
+	/* CCI needs the register width encoded in the access descriptor. */
+	ret = cci_read(sc820cs->regmap, CCI_REG8(reg), &value, NULL);
+	if (ret)
 		return ret;
-	if (ret != ARRAY_SIZE(msgs))
-		return -EIO;
 
+	*val = value;
 	return 0;
 }
 
@@ -302,6 +291,10 @@ static int sc820cs_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	sc820cs->dev = &client->dev;
+	sc820cs->regmap = devm_cci_regmap_init_i2c(client, 16);
+	if (IS_ERR(sc820cs->regmap))
+		return dev_err_probe(&client->dev, PTR_ERR(sc820cs->regmap),
+				     "failed to initialize CCI regmap\n");
 
 	ret = sc820cs_get_resources(sc820cs);
 	if (ret)
