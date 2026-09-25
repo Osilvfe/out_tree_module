@@ -15,9 +15,9 @@
 #include <dt-bindings/gpio/gpio.h>
 
 &camss {
-	/* Same CSIPHY rails used by other upstream SM8650 camera boards. */
-	vdd-csiphy35-0p9-supply = <&vreg_l2i_0p88>;
-	vdd-csiphy35-1p2-supply = <&vreg_l3i_1p2>;
+	/* SM8650 CAMSS groups CSIPHY2/4 on the shared 24 rail pair. */
+	vdd-csiphy24-0p9-supply = <&vreg_l2i_0p88>;
+	vdd-csiphy24-1p2-supply = <&vreg_l3i_1p2>;
 	status = "okay";
 
 	ports {
@@ -56,8 +56,9 @@
 		assigned-clock-rates = <19200000>;
 
 		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
-		pinctrl-0 = <&cam4_default>;
-		pinctrl-names = "default";
+		pinctrl-0 = <&cam4_default>, <&cam4_reset_active>;
+		pinctrl-1 = <&cam4_sleep>, <&cam4_reset_suspend>;
+		pinctrl-names = "default", "sleep";
 
 		dovdd-supply = <&vreg_l4b_1p8>;
 		avdd-supply = <&vreg_l16b_2p8>;

@@ -105,7 +105,12 @@ timing are confirmed.
 `caihong-front-sc820cs.dtsi` maps the front sensor onto mainline
 `cci0_i2c0 -> CAMSS CSIPHY4`. The downstream-style 8-bit SC820CS address `0x6c`
 corresponds to Linux 7-bit address `0x36`; this remains an item to verify on the
-actual Caihong bus together with the chip ID.
+actual Caihong bus together with the chip ID. On SM8650, CSIPHY4 uses the
+shared `vdd-csiphy24-*` resource group; the board fragment now names that group
+explicitly so CAMSS does not substitute dummy regulators for the active PHY.
+The board DTS also selects GPIO7 as the SC820CS reset output, matching the
+official `cam_sensor_active_rst2` state; without this pinctrl state GPIO7 keeps
+the default `dmic1_data` function and the sensor can remain held in reset.
 
 ## Rear SC1320CS milestone
 
