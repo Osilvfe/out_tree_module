@@ -23,9 +23,10 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `camera/gt9772.ko`: Caihong rear GT9772 V4L2 focus actuator; validated at
   Linux address `0x0c` with optical focus movement and park-to-40 behavior.
 - `sensors/*.ko`: Caihong sensor bring-up modules.  This port includes the
-  SSC-registry-derived BU52053NVX Hall input, MMC56x3x magnetometer, TCS3701
-  direct-I2C IIO baseline, and the official upstream ICM42607 IMU core with
-  SPI/I2C transports.
+  MMC56x3x magnetometer, TCS3701 direct-I2C IIO baseline, and the official
+  upstream ICM42607 IMU core with SPI/I2C transports. The GPIO-only
+  BU52053NVX Hall switch uses the in-tree `gpio-keys` driver through the
+  supplied DTS fragment.
 
 The touchscreen driver is written against the DTS currently used by Caihong:
 `spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
@@ -35,9 +36,10 @@ The pogo driver remains in the tree, but current work is focused on charging.
 
 Sensor work is tracked on `port/sm8650-camera-sensors`.  The camera modules
 and Caihong camera DT graph are compile- and modpost-validated against Linux
-v7.2. The remaining `sensors/*.ko` modules do not enable a device-tree node or
-take ownership from the Qualcomm SSC until the AP bus, chip identity,
-interrupt and regulator mapping have been verified on Caihong.
+v7.2. The Hall switch is runtime-validated on GPIO66 with the in-tree
+`gpio-keys` driver. The remaining `sensors/*.ko` modules do not enable a
+device-tree node or take ownership from the Qualcomm SSC until the AP bus,
+chip identity, interrupt and regulator mapping have been verified on Caihong.
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is

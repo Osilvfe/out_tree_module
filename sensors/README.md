@@ -38,7 +38,7 @@ sensor set below.
 | accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | official `inv_icm42607` modules are available; keep the AP node disabled until SSC ownership and both rails are confirmed |
 | magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | `mmc5633.ko` is an external I2C-only variant derived from the official MMC5603/MMC5633 driver; the optional `caihong-i2c2-sensors.dtsi` uses the registry's MMC5603 name |
 | ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | `tcs3701.ko` provides a direct-I2C IIO bring-up path for raw clear/R/G/B and proximity data; the optional DTS fragment omits rails and IRQ until they are mapped |
-| Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | `bu52053nvx.ko` in this tree exposes standard `EV_SW/SW_LID` |
+| Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | in-tree `gpio-keys` exposes standard `EV_SW/SW_LID`; probe and suspend/resume validated |
 | free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
 | barometer | not identified in the Caihong device-specific registry list | unknown | keep unresolved; do not guess a chip |
 
@@ -87,21 +87,26 @@ factory calibration and board-specific IRQ/power validation.
 
 ## BU52053NVX Hall bring-up
 
-`sensors/bu52053nvx.c` is intentionally small and non-Oplus-specific:
+The BU52053NVX is a GPIO-only switch, so Caihong uses the official in-tree
+`gpio-keys` driver rather than a device-specific module:
 
 - reads a GPIO only; there is no register bus for this Hall switch;
 - reports `EV_SW/SW_LID` through the Linux input subsystem;
 - handles both rising and falling edges as required by the Caihong SSC
   registry;
-- supports wakeup;
-- supports an optional `vddio-supply` regulator.
+- supports wakeup.
 
 `sensors/caihong-bu52053nvx-hall.dtsi` maps the confirmed TLMM GPIO66 and uses
 `GPIO_ACTIVE_LOW`, matching the BU52053NVX output behavior.  The downstream
 registry names its rail only as `/pmic/client/sensor_vddio`, so the DTS fragment
-leaves `vddio-supply` unset until the corresponding mainline PMIC regulator
-phandle is proven.  With the property absent the driver assumes the board or
-firmware keeps that rail powered.
+does not change its power controls.
+
+Runtime validation on Caihong with Linux v7.2 confirmed that `gpio-keys`
+claims GPIO66 with no pull, registers a dual-edge IRQ named `BU52053NVX Hall
+Switch`, exposes the `SW_LID` capability, and remains wake-enabled after a
+deep-sleep cycle.  The initial GPIO level was high and `SW_LID` was inactive,
+as expected with no magnet present.  A physical cover/magnet transition is the
+remaining event-path test.
 
 ## ICM42607 upstream driver port
 

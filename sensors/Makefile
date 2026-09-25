@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-obj-m += bu52053nvx.o
 obj-m += mmc5633.o
 obj-m += tcs3701.o
 
