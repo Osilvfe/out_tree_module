@@ -25,6 +25,10 @@ install -D -m 0755 "$bundle/lib/libhexagonrpc.so.0.5" \
 	"$target/usr/local/lib/caihong-ssc/libhexagonrpc.so.0.5"
 install -D -m 0644 "$script_dir/caihong-ssc.service" \
 	"$target/usr/lib/systemd/system/caihong-ssc.service"
+install -D -m 0644 "$script_dir/90-caihong-ssc.rules" \
+	"$target/usr/lib/udev/rules.d/90-caihong-ssc.rules"
+install -D -m 0644 "$script_dir/iio-sensor-proxy.conf" \
+	"$target/usr/lib/systemd/system/iio-sensor-proxy.service.d/caihong-ssc.conf"
 
 state=$target/var/lib/caihong-ssc/root
 if [ -e "$state" ] && [ "${FORCE:-0}" != 1 ]; then

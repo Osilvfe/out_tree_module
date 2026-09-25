@@ -150,9 +150,14 @@ write-support series and Caihong mapping are documented in
 
 Runtime testing produced stable accelerometer, gyroscope, magnetometer,
 compass and ambient-light samples through `ssccli`. The ADSP remained running,
-and its generated persistent registry files survived listener restart. This
-confirms SSC SE3 and SE2 ownership, so the AP `spi3` and `i2c2` probe fragments
-must remain opt-in and disabled in normal images.
+and its generated persistent registry files survived listener restart, cold
+boot and deep suspend/resume. The stock Caihong `sensor_config.json` declares
+TCS3701 light and RGB sensors but no Android proximity sensor, which explains
+why SSC does not publish a proximity SUID. This confirms SSC SE3 and SE2
+ownership, so the AP `spi3` and `i2c2` probe fragments must remain opt-in and
+disabled in normal images. The board udev rule enables the validated
+`ssc-accel`, `ssc-light` and `ssc-compass` backends in `iio-sensor-proxy`;
+accelerometer orientation, lux and compass heading are available over D-Bus.
 
 ## AP bus mapping and optional probe fragment
 
@@ -172,14 +177,11 @@ that IRQ remains a future buffered-sampling concern.
 
 ## Next sensor work
 
-1. integrate and reboot-test `caihong-ssc.service` from the root filesystem;
-2. test listener and sensor recovery across suspend/resume;
-3. determine why the TCS3701 proximity SUID is unavailable while lux works;
-4. expose the validated SSC streams to desktop consumers that require IIO or
-   SensorProxy interfaces;
-5. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
+1. validate automatic display rotation in all four physical orientations;
+2. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
    attributes without taking their buses from SSC;
-6. identify the barometer only from evidence, not from a generic SM8650 parts
+3. determine whether the stock RGB stream is useful to Linux applications;
+4. identify the barometer only from evidence, not from a generic SM8650 parts
    list.
 
 ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE

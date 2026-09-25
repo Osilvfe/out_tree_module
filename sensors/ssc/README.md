@@ -39,7 +39,10 @@ sudo ./install-rootfs.sh /path/to/output/bundle /mounted/rootfs
 
 This installs the program under `/usr/local`, keeps mutable registry and
 calibration data under `/var/lib/caihong-ssc`, and enables
-`caihong-ssc.service`.
+`caihong-ssc.service`. It also enables Caihong's SSC accelerometer, light and
+compass backends in `iio-sensor-proxy`, ordered after the FastRPC listener.
+The udev rule keeps the SSC-provided device coordinates unchanged with an
+identity mount matrix and marks the accelerometer as display-mounted.
 
 ## Runtime validation
 
@@ -50,8 +53,13 @@ been validated with `libssc 0.4.4` and `ssccli`:
 - gyroscope: live three-axis samples;
 - magnetometer and compass: live samples;
 - ambient light: live lux samples;
-- proximity: SUID unavailable in the current registry/runtime and still open.
+- proximity: intentionally absent from the stock Caihong sensor declaration,
+  so the SSC firmware does not publish a proximity SUID.
 
 The ADSP remains running while the listener serves and persists the registry.
 The generated `DIR`, `parsed_file_list.csv`, and `sns_reg_version` files confirm
-that the firmware completed its registry initialization.
+that the firmware completed its registry initialization. The systemd service
+and live sensor streams recover automatically after cold boot and deep
+suspend/resume. `iio-sensor-proxy 3.9` exposes accelerometer orientation,
+ambient lux and compass heading through its standard D-Bus API; `monitor-sensor
+--all` receives live updates from all three backends.

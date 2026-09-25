@@ -25,7 +25,9 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `sensors/ssc/`: the validated Qualcomm SSC runtime for the stock-owned
   ICM42607-class IMU, MMC56x3x magnetometer and TCS3701 ALS. Live
   accelerometer, gyroscope, magnetometer, compass and lux samples work through
-  upstream `hexagonrpc` and `libssc`.
+  upstream `hexagonrpc` and `libssc`; cold boot and deep suspend/resume recovery
+  are validated. A board udev rule enables the accelerometer, light and compass
+  backends in `iio-sensor-proxy`.
 - `sensors/*.ko`: optional direct-AP bring-up modules for MMC56x3x, TCS3701
   and the official upstream ICM42607 core. The GPIO-only BU52053NVX Hall
   switch uses the in-tree `gpio-keys` driver through the supplied DTS fragment.
