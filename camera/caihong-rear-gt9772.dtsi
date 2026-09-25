@@ -26,10 +26,4 @@
 	};
 };
 
-/*
- * Once the rear image sensor is identified, add this property to its node:
- *
- *     lens-focus = <&gt9772>;
- *
- * Keeping that link out for now avoids inventing a rear sensor compatible.
- */
+/* The SC1320CS sensor node links this actuator with lens-focus = <&gt9772>. */

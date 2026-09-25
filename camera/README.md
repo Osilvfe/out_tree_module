@@ -184,6 +184,19 @@ Linux's `v4l2-cci` helpers. Qualcomm's GT9772 actuator data confirms:
 `caihong-rear-gt9772.dtsi` places it on `cci0_i2c1` and uses the confirmed
 camera I/O and AF rails (L4B 1.8 V, L9B 2.8 V).
 
+The actuator is now hardware-validated in the real Caihong DTS. It registered
+at `9-000c` as `/dev/v4l-subdev30` with a `focus_absolute` range of 0..1023.
+Control writes at 40, 256 and 800 all completed without CCI errors while the
+rear sensor captured full frames. Comparing the same scene at 40 and 800
+showed a clear optical focus change, confirming physical lens movement rather
+than only successful bus writes. The final control value was restored to the
+park code 40, and runtime suspend/resume exercised the driver's park and
+restore paths during the test.
+
+The validated autofocus image is
+`mainline-boot-v2-stage6b-front-rear-camera-focus-v2.img`, SHA-256
+`38a1b98a7d552fd73087bee7e9c4c692d8361b214739d5d75d42494cf5c6869e`.
+
 ## Build and CI
 
 The camera directory can be built separately from the rest of this repository:
@@ -218,15 +231,13 @@ on hardware.
 
 ## Next stages
 
-1. Enable and hardware-test the existing GT9772 V4L2 focus actuator on the
-   rear CCI bus.
-2. Add exposure, analogue gain, VBLANK and test-pattern controls to both
+1. Add exposure, analogue gain, VBLANK and test-pattern controls to both
    SmartSens sensor drivers.
-3. Make the media-graph setup automatic through the camera userspace stack and
+2. Make the media-graph setup automatic through the camera userspace stack and
    validate the path with libcamera.
-4. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
+3. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
    facilities wherever practical.
-5. Bring up the complete media graph under libcamera before considering any
+4. Bring up the complete media graph under libcamera before considering any
    downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,
