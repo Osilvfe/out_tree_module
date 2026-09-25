@@ -47,6 +47,27 @@ Qualcomm's SSC communication-port enum confirms registry `bus_type=0` is I2C
 and `bus_type=1` is SPI.  Its interrupt enum confirms trigger type 1 is falling
 edge, 2 is dual edge and 3 is high level.
 
+### Runtime identity evidence
+
+The live SSC attribute response confirms the registry-selected physical
+drivers without handing either bus to the AP:
+
+- accelerometer and gyroscope report `icm4x607`, vendor `TDK-Invensense`,
+  driver version `0x102`, hardware ID 0, 25--400 Hz normal sample rates and an
+  800 Hz low-latency rate. Their published ranges and resolutions match the
+  official Linux ICM42607 family implementation, including up to 16 g and
+  2000 dps;
+- the magnetometer reports `mmc56x3x`, vendor `memsic`, hardware ID 0,
+  10/20/50/100 Hz sample rates, a +/-3000 range and 0.0976 resolution.
+
+The stock ADSP firmware contains both family drivers in `adsp.b22`. The IMU
+driver reads `WHO_AM_I` and rejects unknown values; the magnetometer driver
+also performs a WHO-AM-I read and reads trim registers 0x27--0x29. SSC does not
+publish either detected register value as a standard attribute. Consequently,
+the evidence confirms the driver families but does not distinguish ICM42607
+from ICM42607P or MMC5603 from MMC5633. A specific compatible must not be
+selected solely from the common range table.
+
 ## Upstream/adaptation policy
 
 Prefer reviewed upstream Linux implementations over copying Android sensor-hub
@@ -180,8 +201,8 @@ that IRQ remains a future buffered-sampling concern.
 
 ## Next sensor work
 
-1. identify the exact `icm4x607` and MMC56x3x variants from firmware/runtime
-   attributes without taking their buses from SSC;
+1. capture the exact `icm4x607` and MMC56x3x WHO-AM-I values if a safe SSC
+   diagnostic path becomes available, without taking their buses from SSC;
 2. determine whether the stock RGB stream is useful to Linux applications;
 3. identify the barometer only from evidence, not from a generic SM8650 parts
    list.
