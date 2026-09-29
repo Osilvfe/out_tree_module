@@ -13,6 +13,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/nvmem-provider.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
@@ -48,6 +49,13 @@
 #define SC820CS_ANALOGUE_GAIN_MAX	16384
 #define SC820CS_ANALOGUE_GAIN_DEFAULT	1024
 
+#define SC820CS_OTP_SIZE		0x729
+#define SC820CS_OTP_GROUPS		2
+#define SC820CS_OTP_PAGES_PER_GROUP	5
+#define SC820CS_OTP_PAGE_SIZE		390
+#define SC820CS_OTP_LAST_PAGE_SIZE	273
+#define SC820CS_OTP_READ_CHUNK		12
+
 static bool keep_power_on_on_probe_failure;
 module_param_named(keep_power_on_on_probe_failure,
 			   keep_power_on_on_probe_failure, bool, 0644);
@@ -74,7 +82,9 @@ struct sc820cs {
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
 	struct v4l2_ctrl_handler ctrls;
+	u8 *otp_data;
 	struct mutex mutex;
+	bool otp_valid;
 	bool powered;
 	bool streaming;
 };
@@ -100,6 +110,26 @@ static const struct sc820cs_gain_step sc820cs_gain_steps[] = {
 	{ 4096, 0x09 },
 	{ 8192, 0x0b },
 	{ 16384, 0x0f },
+};
+
+static const u8 sc820cs_otp_init_modes[] = {
+	0x38, 0x18, 0x58,
+};
+
+struct sc820cs_otp_section {
+	u16 flag;
+	u16 start;
+	u16 end;
+	u16 checksum;
+};
+
+/* Module data, serial, two AWB records and lens-shading calibration. */
+static const struct sc820cs_otp_section sc820cs_otp_sections[] = {
+	{ 0x0000, 0x0000, 0x0007, 0x0008 },
+	{ 0x0009, 0x0009, 0x0021, 0x0022 },
+	{ 0x0023, 0x0023, 0x002f, 0x0030 },
+	{ 0x0031, 0x0031, 0x003d, 0x003e },
+	{ 0x003f, 0x003f, 0x0727, 0x0728 },
 };
 
 static inline struct sc820cs *to_sc820cs(struct v4l2_subdev *sd)
@@ -189,6 +219,206 @@ static int sc820cs_identify(struct sc820cs *sc820cs)
 	dev_info(sc820cs->dev, "SC820CS detected, chip ID 0x%04x\n",
 		 (u16)value);
 	return 0;
+}
+
+static int sc820cs_otp_write_init(struct sc820cs *sc820cs, u8 mode)
+{
+	const struct cci_reg_sequence regs[] = {
+		{ CCI_REG8(0x36b0), 0x48 },
+		{ CCI_REG8(0x36b1), mode },
+		{ CCI_REG8(0x36b2), 0x41 },
+	};
+
+	return cci_multi_reg_write(sc820cs->regmap, regs,
+				   ARRAY_SIZE(regs), NULL);
+}
+
+static int sc820cs_otp_read_page(struct sc820cs *sc820cs,
+				 unsigned int page, u8 *data, size_t size)
+{
+	unsigned int base = 0x8200 + page * 0x200;
+	const struct cci_reg_sequence regs[] = {
+		{ CCI_REG8(0x4408), base >> 8 },
+		{ CCI_REG8(0x4409), base & 0xff },
+		{ CCI_REG8(0x440a), (base + 0x1ff) >> 8 },
+		{ CCI_REG8(0x440b), 0xff },
+		{ CCI_REG8(0x4401), 0x13 },
+		{ CCI_REG8(0x4412), 0x03 + page * 2 },
+		{ CCI_REG8(0x4407), 0x00 },
+		{ CCI_REG8(0x4400), 0x11 },
+	};
+	unsigned int offset;
+	int ret;
+
+	ret = cci_multi_reg_write(sc820cs->regmap, regs,
+				  ARRAY_SIZE(regs), NULL);
+	if (ret)
+		return ret;
+
+	usleep_range(10000, 11000);
+	for (offset = 0; offset < size; offset += SC820CS_OTP_READ_CHUNK) {
+		size_t count = min_t(size_t, size - offset,
+				     SC820CS_OTP_READ_CHUNK);
+
+		ret = regmap_bulk_read(sc820cs->regmap, base + 0x7a + offset,
+				       data + offset, count);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int sc820cs_otp_read_group(struct sc820cs *sc820cs,
+				  unsigned int group, u8 *data)
+{
+	unsigned int offset = 0;
+	unsigned int page;
+	int ret;
+
+	memset(data, 0, SC820CS_OTP_SIZE);
+	for (page = 0; page < SC820CS_OTP_PAGES_PER_GROUP; page++) {
+		size_t size = page == SC820CS_OTP_PAGES_PER_GROUP - 1 ?
+			      SC820CS_OTP_LAST_PAGE_SIZE :
+			      SC820CS_OTP_PAGE_SIZE;
+
+		ret = sc820cs_otp_read_page(sc820cs,
+					    group * SC820CS_OTP_PAGES_PER_GROUP + page,
+					    data + offset, size);
+		if (ret)
+			return ret;
+
+		offset += size;
+	}
+
+	return offset == SC820CS_OTP_SIZE ? 0 : -EIO;
+}
+
+static int sc820cs_otp_validate(const u8 *data)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(sc820cs_otp_sections); i++) {
+		const struct sc820cs_otp_section *section =
+			&sc820cs_otp_sections[i];
+		unsigned int offset;
+		unsigned int sum = 0;
+
+		if (data[section->flag] != 0x01)
+			return -EBADMSG;
+
+		for (offset = section->start; offset <= section->end; offset++)
+			sum += data[offset];
+
+		if (data[section->checksum] != sum % 255 + 1)
+			return -EBADMSG;
+	}
+
+	return 0;
+}
+
+static int sc820cs_otp_load(struct sc820cs *sc820cs)
+{
+	bool was_powered = sc820cs->powered;
+	unsigned int attempt;
+	unsigned int group;
+	int ret;
+	int last_error = -EBADMSG;
+
+	if (sc820cs->streaming)
+		return -EBUSY;
+
+	ret = sc820cs_power_on(sc820cs);
+	if (ret)
+		return ret;
+
+	ret = sc820cs_identify(sc820cs);
+	if (ret) {
+		last_error = ret;
+		goto out_power;
+	}
+
+	for (attempt = 0; attempt < ARRAY_SIZE(sc820cs_otp_init_modes);
+	     attempt++) {
+		ret = sc820cs_otp_write_init(sc820cs,
+					     sc820cs_otp_init_modes[attempt]);
+		if (ret) {
+			last_error = ret;
+			continue;
+		}
+
+		for (group = 0; group < SC820CS_OTP_GROUPS; group++) {
+			ret = sc820cs_otp_read_group(sc820cs, group,
+						     sc820cs->otp_data);
+			if (!ret)
+				ret = sc820cs_otp_validate(sc820cs->otp_data);
+			if (!ret) {
+				sc820cs->otp_valid = true;
+				dev_info(sc820cs->dev,
+					 "validated OTP calibration group %u\n",
+					 group);
+				last_error = 0;
+				goto out_power;
+			}
+
+			last_error = ret;
+		}
+	}
+
+out_power:
+	if (!was_powered)
+		sc820cs_power_off(sc820cs);
+
+	return last_error;
+}
+
+static int sc820cs_otp_nvmem_read(void *priv, unsigned int offset,
+				  void *value, size_t bytes)
+{
+	struct sc820cs *sc820cs = priv;
+	int ret = 0;
+
+	if (offset > SC820CS_OTP_SIZE || bytes > SC820CS_OTP_SIZE - offset)
+		return -EINVAL;
+
+	mutex_lock(&sc820cs->mutex);
+	if (!sc820cs->otp_valid)
+		ret = sc820cs_otp_load(sc820cs);
+	if (!ret)
+		memcpy(value, sc820cs->otp_data + offset, bytes);
+	else
+		dev_err_ratelimited(sc820cs->dev,
+				    "failed to load OTP calibration: %d\n", ret);
+	mutex_unlock(&sc820cs->mutex);
+
+	return ret;
+}
+
+static int sc820cs_register_otp_nvmem(struct sc820cs *sc820cs)
+{
+	struct nvmem_config config = {
+		.dev = sc820cs->dev,
+		.name = "sc820cs-otp",
+		.id = NVMEM_DEVID_NONE,
+		.owner = THIS_MODULE,
+		.type = NVMEM_TYPE_OTP,
+		.read_only = true,
+		.root_only = true,
+		.reg_read = sc820cs_otp_nvmem_read,
+		.size = SC820CS_OTP_SIZE,
+		.word_size = 1,
+		.stride = 1,
+		.priv = sc820cs,
+	};
+	struct nvmem_device *nvmem;
+
+	sc820cs->otp_data = devm_kmalloc(sc820cs->dev, SC820CS_OTP_SIZE,
+					 GFP_KERNEL);
+	if (!sc820cs->otp_data)
+		return -ENOMEM;
+
+	nvmem = devm_nvmem_register(sc820cs->dev, &config);
+	return PTR_ERR_OR_ZERO(nvmem);
 }
 
 static int sc820cs_write_mode(struct sc820cs *sc820cs)
@@ -561,6 +791,7 @@ static int sc820cs_get_resources(struct sc820cs *sc820cs)
 static int sc820cs_probe(struct i2c_client *client)
 {
 	struct sc820cs *sc820cs;
+	bool identified;
 	int ret;
 
 	sc820cs = devm_kzalloc(&client->dev, sizeof(*sc820cs), GFP_KERNEL);
@@ -585,6 +816,7 @@ static int sc820cs_probe(struct i2c_client *client)
 		return ret;
 
 	ret = sc820cs_identify(sc820cs);
+	identified = !ret;
 	if (ret && keep_power_on_on_probe_failure) {
 		dev_warn(sc820cs->dev,
 			 "probe failed; keeping camera power and MCLK on for diagnostics\n");
@@ -596,6 +828,12 @@ static int sc820cs_probe(struct i2c_client *client)
 	if (ret)
 		dev_warn(sc820cs->dev,
 			 "registering diagnostic subdevice without a valid chip ID\n");
+	if (identified) {
+		ret = sc820cs_register_otp_nvmem(sc820cs);
+		if (ret)
+			dev_warn(sc820cs->dev,
+				 "failed to register OTP NVMEM provider: %d\n", ret);
+	}
 
 	ret = sc820cs_init_controls(sc820cs);
 	if (ret)

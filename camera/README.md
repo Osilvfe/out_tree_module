@@ -131,6 +131,14 @@ The board DTS also selects GPIO7 as the SC820CS reset output, matching the
 official `cam_sensor_active_rst2` state; without this pinctrl state GPIO7 keeps
 the default `dmic1_data` function and the sensor can remain held in reset.
 
+The driver also exposes the front module's internal OTP as the root-only,
+read-only `sc820cs-otp` NVMEM device. The implementation follows the official
+Caihong two-group, five-page layout, reads 1833 bytes, and accepts a group only
+after all module-info, serial, AWB and lens-shading flags and checksums pass.
+Data is cached after the first successful read; an uncached read returns
+`EBUSY` while the sensor is streaming so OTP page selection cannot disturb
+live capture.
+
 ## Rear SC1320CS milestone
 
 The rear sensor is now conclusively identified as SC1320CS. SmartSens documents
@@ -261,8 +269,8 @@ on hardware.
 
 1. Validate the desktop autofocus, image controls and single-flash capture
    timing on hardware.
-2. Add calibration/EEPROM handling using existing mainline facilities where
-   practical.
+2. Validate front OTP NVMEM and identify the rear EEPROM capacity at address
+   `0x50` before binding a read-only `at24` device.
 3. Consider any required downstream CamX compatibility only after the native
    libcamera path is complete.
 
