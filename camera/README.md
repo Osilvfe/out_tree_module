@@ -167,9 +167,10 @@ The tested B-slot image is
 `5300bbb60f0931164f09656bfb4a324a539e32ed121c73cbd31dc1bd718eec9f`.
 
 The rear driver exposes link-frequency, pixel-rate, fixed horizontal/vertical
-blanking, exposure and fixed 1x analogue-gain controls, plus full-frame
-selection targets. The fixed gain is intentional until a reliable official
-SC1320CS gain mapping is available.
+blanking, exposure and 1x--16x analogue-gain controls, plus full-frame selection
+targets. The gain mapping is recovered from Caihong's official SC1320CS sensor
+library: coarse gain is written to `0x3e09`, fine gain to `0x3e07`, and the
+coarse codes are `0x00`, `0x08`, `0x09`, `0x0b` and `0x0f`.
 
 ## libcamera application milestone
 
@@ -198,7 +199,7 @@ Linux's `v4l2-cci` helpers. Qualcomm's GT9772 actuator data confirms:
 - 10-bit focus DAC;
 - focus register `0x03` with 16-bit data;
 - initialization writes `ED=AB`, `06=84`, `07=01`, `08=55`;
-- initial/park code 40;
+- safe park code 40;
 - approximately 10 ms rail settle time and 100 us after each initialization
   register write.
 
@@ -213,6 +214,12 @@ showed a clear optical focus change, confirming physical lens movement rather
 than only successful bus writes. The final control value was restored to the
 park code 40, and runtime suspend/resume exercised the driver's park and
 restore paths during the test.
+
+A 1280x720 contrast scan over the full 0--1023 range, followed by a 16-code
+fine scan, found the best focus at code 336 for the approximately 2--3 metre
+indoor validation scene. The control and initial hardware defaults therefore
+use 336, while runtime suspend still ramps the lens to the safe park code 40
+and resume restores the selected focus position.
 
 The validated autofocus image is
 `mainline-boot-v2-stage6b-front-rear-camera-focus-v2.img`, SHA-256
@@ -252,14 +259,12 @@ on hardware.
 
 ## Next stages
 
-1. Add the official SC1320CS analogue-gain mapping when a reliable source is
-   available, and tune libcamera sensor helpers/configuration.
-2. Wire PM8550 flash and calibration/EEPROM handling using existing mainline
-   facilities wherever practical.
-3. Validate autofocus and still capture from the desktop camera application.
-4. Consider any required downstream CamX compatibility only after the native
+1. Validate the desktop autofocus, image controls and single-flash capture
+   timing on hardware.
+2. Add calibration/EEPROM handling using existing mainline facilities where
+   practical.
+3. Consider any required downstream CamX compatibility only after the native
    libcamera path is complete.
-   downstream CamX compatibility layer.
 
 The downstream Spectra tree is still valuable for power sequencing, topology,
 register/resource comparison and userspace-behaviour archaeology, but it is no

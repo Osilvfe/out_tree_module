@@ -43,6 +43,8 @@
 #define SC1320CS_EXPOSURE_MARGIN	4
 #define SC1320CS_EXPOSURE_MAX		(SC1320CS_VTS - SC1320CS_EXPOSURE_MARGIN)
 #define SC1320CS_EXPOSURE_DEFAULT	3196
+#define SC1320CS_ANALOGUE_GAIN_MIN	1024
+#define SC1320CS_ANALOGUE_GAIN_MAX	16384
 #define SC1320CS_ANALOGUE_GAIN_DEFAULT	1024
 
 static const unsigned short sc1320cs_probe_addresses[] = {
@@ -76,6 +78,20 @@ static const char * const sc1320cs_supply_names[] = {
 
 static const s64 sc1320cs_link_freq_menu[] = {
 	SC1320CS_LINK_FREQ,
+};
+
+struct sc1320cs_gain_step {
+	u32 gain;
+	u8 coarse;
+};
+
+/* Recovered from the official Caihong SC1320CS sensor library. */
+static const struct sc1320cs_gain_step sc1320cs_gain_steps[] = {
+	{ 1024, 0x00 },
+	{ 2048, 0x08 },
+	{ 4096, 0x09 },
+	{ 8192, 0x0b },
+	{ 16384, 0x0f },
 };
 
 static inline struct sc1320cs *to_sc1320cs(struct v4l2_subdev *sd)
@@ -225,6 +241,28 @@ static int sc1320cs_write_exposure(struct sc1320cs *sensor,
 	return cci_multi_reg_write(sensor->regmap, regs, ARRAY_SIZE(regs), NULL);
 }
 
+static int sc1320cs_write_gain(struct sc1320cs *sensor, unsigned int gain)
+{
+	const struct sc1320cs_gain_step *step = &sc1320cs_gain_steps[0];
+	struct cci_reg_sequence regs[2];
+	unsigned int fine;
+	unsigned int i;
+
+	for (i = 1; i < ARRAY_SIZE(sc1320cs_gain_steps); i++) {
+		if (gain < sc1320cs_gain_steps[i].gain)
+			break;
+		step = &sc1320cs_gain_steps[i];
+	}
+
+	fine = (gain * 128 + step->gain / 2) / step->gain;
+	regs[0].reg = CCI_REG8(0x3e09);
+	regs[0].val = step->coarse;
+	regs[1].reg = CCI_REG8(0x3e07);
+	regs[1].val = clamp_val(fine, 0, 0xff);
+
+	return cci_multi_reg_write(sensor->regmap, regs, ARRAY_SIZE(regs), NULL);
+}
+
 static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sc1320cs *sensor = container_of(ctrl->handler,
@@ -233,10 +271,14 @@ static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
 	if (!sensor->powered)
 		return 0;
 
-	if (ctrl->id == V4L2_CID_EXPOSURE)
+	switch (ctrl->id) {
+	case V4L2_CID_EXPOSURE:
 		return sc1320cs_write_exposure(sensor, ctrl->val);
-
-	return -EINVAL;
+	case V4L2_CID_ANALOGUE_GAIN:
+		return sc1320cs_write_gain(sensor, ctrl->val);
+	default:
+		return 0;
+	}
 }
 
 static const struct v4l2_ctrl_ops sc1320cs_ctrl_ops = {
@@ -278,9 +320,10 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 					     SC1320CS_EXPOSURE_MIN,
 					     SC1320CS_EXPOSURE_MAX, 1,
 					     SC1320CS_EXPOSURE_DEFAULT);
-	v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_ANALOGUE_GAIN,
-			  SC1320CS_ANALOGUE_GAIN_DEFAULT,
-			  SC1320CS_ANALOGUE_GAIN_DEFAULT, 1,
+	v4l2_ctrl_new_std(&sensor->ctrls, &sc1320cs_ctrl_ops,
+			  V4L2_CID_ANALOGUE_GAIN,
+			  SC1320CS_ANALOGUE_GAIN_MIN,
+			  SC1320CS_ANALOGUE_GAIN_MAX, 1,
 			  SC1320CS_ANALOGUE_GAIN_DEFAULT);
 	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
 	if (ret)

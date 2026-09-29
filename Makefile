@@ -24,6 +24,9 @@ sc820cs-y := camera/sc820cs.o
 obj-m += sc1320cs.o
 sc1320cs-y := camera/sc1320cs.o
 
+obj-m += gt9772.o
+gt9772-y := camera/gt9772.o
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 .PHONY: all clean

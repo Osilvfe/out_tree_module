@@ -31,6 +31,7 @@
 #define GT9772_CFG_08_VALUE		0x55
 
 #define GT9772_MAX_FOCUS_POS		1023
+#define GT9772_DEFAULT_FOCUS_POS	336
 #define GT9772_PARK_FOCUS_POS		40
 #define GT9772_RAMP_STEP		16
 #define GT9772_RAMP_DELAY_US		7000
@@ -263,7 +264,7 @@ static int gt9772_probe(struct i2c_client *client)
 	gt9772->focus = v4l2_ctrl_new_std(&gt9772->ctrls, &gt9772_ctrl_ops,
 					  V4L2_CID_FOCUS_ABSOLUTE,
 					  0, GT9772_MAX_FOCUS_POS, 1,
-					  GT9772_PARK_FOCUS_POS);
+					  GT9772_DEFAULT_FOCUS_POS);
 	if (gt9772->ctrls.error) {
 		ret = gt9772->ctrls.error;
 		goto err_free_ctrls;
@@ -283,7 +284,7 @@ static int gt9772_probe(struct i2c_client *client)
 	if (ret)
 		goto err_cleanup_media;
 
-	ret = gt9772_write_focus(gt9772, GT9772_PARK_FOCUS_POS);
+	ret = gt9772_write_focus(gt9772, GT9772_DEFAULT_FOCUS_POS);
 	if (ret) {
 		dev_err(&client->dev, "failed initial focus write: %d\n", ret);
 		gt9772_power_off(gt9772);
