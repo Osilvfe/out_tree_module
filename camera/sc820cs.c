@@ -416,7 +416,7 @@ static int sc820cs_register_otp_nvmem(struct sc820cs *sc820cs)
 		.owner = THIS_MODULE,
 		.type = NVMEM_TYPE_OTP,
 		.read_only = true,
-		.root_only = true,
+		.root_only = false,
 		.reg_read = sc820cs_otp_nvmem_read,
 		.size = SC820CS_OTP_SIZE,
 		.word_size = 1,

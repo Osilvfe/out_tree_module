@@ -131,8 +131,9 @@ The board DTS also selects GPIO7 as the SC820CS reset output, matching the
 official `cam_sensor_active_rst2` state; without this pinctrl state GPIO7 keeps
 the default `dmic1_data` function and the sensor can remain held in reset.
 
-The driver also exposes the front module's internal OTP as the root-only,
-read-only `sc820cs-otp` NVMEM device. The implementation follows the official
+The driver also exposes the front module's internal OTP as the read-only
+`sc820cs-otp` NVMEM device, which is desktop-readable. The implementation
+follows the official
 Caihong two-group, five-page layout, reads 1833 bytes, and accepts a group only
 after all module-info, serial, AWB and lens-shading flags and checksums pass.
 Data is cached after the first successful read; an uncached read returns
@@ -190,12 +191,13 @@ coarse codes are `0x00`, `0x08`, `0x09`, `0x0b` and `0x0f`.
 
 Read-only hardware probing confirmed the rear module EEPROM at Linux address
 `0x50`. It uses 16-bit addresses, wraps exactly at 8192 bytes, and therefore
-matches the 24C64 layout. The sensor driver exposes it as the root-only,
-read-only `sc1320cs-eeprom` NVMEM device. It reads in 12-byte transactions to
-respect the Qualcomm CCI limit and caches the full EEPROM after the first
-successful read. An idle read temporarily applies the official camera power,
-clock and reset sequence and then restores the powered-off state; a read while
-streaming reuses the active rails without disturbing 24 fps capture.
+matches the 24C64 layout. The sensor driver exposes it as the read-only,
+desktop-readable `sc1320cs-eeprom` NVMEM device. It reads in 12-byte
+transactions to respect the Qualcomm CCI limit and caches the full EEPROM
+after the first successful read. An idle read temporarily applies the official
+camera power, clock and reset sequence and then restores the powered-off state;
+a read while streaming reuses the active rails without disturbing 24 fps
+capture.
 The rear device likewise holds `CAM_CC_TITAN_TOP_GDSC` through runtime PM
 before MCLK1 is enabled, matching the downstream `cam_clk` supply dependency.
 
@@ -216,6 +218,20 @@ Hardware validation as the unprivileged desktop user includes:
 - GStreamer `libcamerasrc` capture from both cameras;
 - Plasma Camera allocation of four full-resolution buffers and transition to
   `readyForCapture`.
+
+The native software ISP now reads each module's calibration directly from its
+NVMEM device. The official 17x13, four-channel LSC meshes and checksums were
+recovered from the OnePlus EEPROM descriptions. Libcamera derives the module's
+`1023 / raw` gain mesh, applies the required horizontal flip, compares it with
+the official 3 ms / 5000 K reference table and carries the per-point ratio into
+every dynamic exposure and colour-temperature table. Missing, unreadable,
+invalid or unsafe calibration falls back to the generic tables.
+
+On hardware, the unprivileged `alarm` user read both NVMEM files and captured
+12 RGB frames from each camera at about 24 fps. The applied factor ranges were
+`0.955765..1.29316` for SC820CS and `0.948306..1.19117` for SC1320CS, with no
+CCI, CSIPHY, VFE, timeout or overflow errors. The providers remain immutable;
+their sysfs files are mode `0444` so the isolated IPA process can read them.
 
 The DMA-BUF system and CMA heap modules must be loaded before camera userspace.
 Desktop users are granted access only to `/dev/dma_heap/system`: libcamera's
@@ -294,8 +310,8 @@ on hardware.
 ## Next stages
 
 1. Complete desktop single-flash photo timing and interface validation.
-2. Parse and apply the validated OTP/EEPROM calibration blocks in the native
-   libcamera tuning path.
+2. Apply the validated module AWB ratios where they improve scene testing over
+   the current dynamic tuning.
 3. Consider any required downstream CamX compatibility only after the native
    libcamera path is complete.
 
