@@ -49,7 +49,7 @@ Caihong uses camera CCI0 for both physical cameras:
 | Camera | Sensor | CCI | mainline bus | CSIPHY | MCLK | Reset | Other confirmed hardware |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | rear (`cell-index = 0`, camera id 0) | SmartSens **SC1320CS** | CCI0 master 1 | `cci0_i2c1`, **0x36** | CSIPHY1 | MCLK1, 19.2 MHz | GPIO82 | GT9772 actuator, rear EEPROM, PM8550 flash |
-| front (`cell-index = 1`, camera id 1) | SmartSens **SC820CS** | CCI0 master 0 | `cci0_i2c0` | CSIPHY4 | MCLK4, 19.2 MHz | GPIO7 | front EEPROM |
+| front (`cell-index = 1`, camera id 1) | SmartSens **SC820CS** | CCI0 master 0 | `cci0_i2c0` | CSIPHY4 | MCLK4, 19.2 MHz | GPIO7 | internal OTP |
 
 The sensor models are no longer inferred only from EEPROM names. Caihong's own
 `CameraHWConfiguration.config` explicitly lists:
@@ -137,7 +137,15 @@ Caihong two-group, five-page layout, reads 1833 bytes, and accepts a group only
 after all module-info, serial, AWB and lens-shading flags and checksums pass.
 Data is cached after the first successful read; an uncached read returns
 `EBUSY` while the sensor is streaming so OTP page selection cannot disturb
-live capture.
+live capture. The sensor device is attached to `CAM_CC_TITAN_TOP_GDSC`, and
+the driver holds that runtime power domain before enabling MCLK4. This allows
+a true cold-state OTP read after CCI has autosuspended, while still restoring
+all camera rails and the power domain after the read.
+
+Cold-state hardware validation read 1833 bytes with SHA-256
+`3b56fe008bfd38400107bb12d3f20c1e4692ab95bce0a440fcfb9729bf77b690`
+and selected valid group 0. A subsequent 120-frame stream remained at about
+24 fps while the cached NVMEM data was read with the same hash.
 
 ## Rear SC1320CS milestone
 
@@ -188,6 +196,15 @@ respect the Qualcomm CCI limit and caches the full EEPROM after the first
 successful read. An idle read temporarily applies the official camera power,
 clock and reset sequence and then restores the powered-off state; a read while
 streaming reuses the active rails without disturbing 24 fps capture.
+The rear device likewise holds `CAM_CC_TITAN_TOP_GDSC` through runtime PM
+before MCLK1 is enabled, matching the downstream `cam_clk` supply dependency.
+
+Cold-state hardware validation read 8192 bytes with SHA-256
+`937de29a0e8173d92a342e896423540517a03e6c368b9f63c9afa166e0f326d1`.
+Afterward the sensor runtime-PM state was suspended, all three camera-rail
+enable counts were zero, and address `0x50` no longer acknowledged. A
+120-frame rear stream also remained at about 24 fps while cached EEPROM data
+was read with the same hash.
 
 ## libcamera application milestone
 
@@ -276,9 +293,9 @@ on hardware.
 
 ## Next stages
 
-1. Validate the desktop autofocus, image controls and single-flash capture
-   timing on hardware.
-2. Validate the integrated rear EEPROM NVMEM provider from a cold boot.
+1. Complete desktop single-flash photo timing and interface validation.
+2. Parse and apply the validated OTP/EEPROM calibration blocks in the native
+   libcamera tuning path.
 3. Consider any required downstream CamX compatibility only after the native
    libcamera path is complete.
 

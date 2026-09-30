@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-provider.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
@@ -115,21 +116,28 @@ static int sc1320cs_power_on(struct sc1320cs *sensor)
 	if (sensor->powered)
 		return 0;
 
+	ret = pm_runtime_resume_and_get(sensor->dev);
+	if (ret < 0)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to enable camera power domain\n");
+
 	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
 	for (i = 0; i < ARRAY_SIZE(sensor->supplies); i++) {
 		ret = regulator_set_load(sensor->supplies[i].consumer,
 					 sc1320cs_supply_loads[i]);
-		if (ret)
-			return dev_err_probe(sensor->dev, ret,
-					     "failed to set %s load\n",
-					     sc1320cs_supply_names[i]);
+		if (ret) {
+			dev_err_probe(sensor->dev, ret, "failed to set %s load\n",
+				      sc1320cs_supply_names[i]);
+			goto put_power_domain;
+		}
 	}
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(sensor->supplies),
 				    sensor->supplies);
-	if (ret)
-		return dev_err_probe(sensor->dev, ret,
-				     "failed to enable supplies\n");
+	if (ret) {
+		dev_err_probe(sensor->dev, ret, "failed to enable supplies\n");
+		goto put_power_domain;
+	}
 
 	ret = clk_prepare_enable(sensor->xvclk);
 	if (ret)
@@ -143,6 +151,9 @@ static int sc1320cs_power_on(struct sc1320cs *sensor)
 
 disable_supplies:
 	regulator_bulk_disable(ARRAY_SIZE(sensor->supplies), sensor->supplies);
+
+put_power_domain:
+	pm_runtime_put_sync(sensor->dev);
 	return ret;
 }
 
@@ -154,6 +165,7 @@ static void sc1320cs_power_off(struct sc1320cs *sensor)
 	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
 	clk_disable_unprepare(sensor->xvclk);
 	regulator_bulk_disable(ARRAY_SIZE(sensor->supplies), sensor->supplies);
+	pm_runtime_put_sync(sensor->dev);
 	sensor->powered = false;
 }
 
@@ -726,6 +738,11 @@ static int sc1320cs_probe(struct i2c_client *client)
 	ret = sc1320cs_get_resources(sensor);
 	if (ret)
 		return ret;
+
+	ret = devm_pm_runtime_enable(sensor->dev);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to enable runtime PM\n");
 
 	v4l2_i2c_subdev_init(&sensor->sd, client, &sc1320cs_subdev_ops);
 	ret = sc1320cs_power_on(sensor);

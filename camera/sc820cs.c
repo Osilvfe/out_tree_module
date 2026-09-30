@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-provider.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
@@ -145,24 +146,32 @@ static int sc820cs_power_on(struct sc820cs *sc820cs)
 	if (sc820cs->powered)
 		return 0;
 
+	ret = pm_runtime_resume_and_get(sc820cs->dev);
+	if (ret < 0)
+		return dev_err_probe(sc820cs->dev, ret,
+				     "failed to enable camera power domain\n");
+
 	/* Keep the sensor in reset while rails and the input clock settle. */
 	gpiod_set_value_cansleep(sc820cs->reset_gpio, 1);
 
 	for (i = 0; i < ARRAY_SIZE(sc820cs->supplies); i++) {
 		ret = regulator_set_load(sc820cs->supplies[i].consumer,
 					 sc820cs_supply_loads[i]);
-		if (ret)
-			return dev_err_probe(sc820cs->dev, ret,
-					     "failed to set %s load to %u uA\n",
-					     sc820cs_supply_names[i],
-					     sc820cs_supply_loads[i]);
+		if (ret) {
+			dev_err_probe(sc820cs->dev, ret,
+				      "failed to set %s load to %u uA\n",
+				      sc820cs_supply_names[i],
+				      sc820cs_supply_loads[i]);
+			goto put_power_domain;
+		}
 	}
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(sc820cs->supplies),
 				    sc820cs->supplies);
-	if (ret)
-		return dev_err_probe(sc820cs->dev, ret,
-				     "failed to enable supplies\n");
+	if (ret) {
+		dev_err_probe(sc820cs->dev, ret, "failed to enable supplies\n");
+		goto put_power_domain;
+	}
 
 	ret = clk_prepare_enable(sc820cs->xvclk);
 	if (ret) {
@@ -183,6 +192,9 @@ static int sc820cs_power_on(struct sc820cs *sc820cs)
 disable_supplies:
 	regulator_bulk_disable(ARRAY_SIZE(sc820cs->supplies),
 			       sc820cs->supplies);
+
+put_power_domain:
+	pm_runtime_put_sync(sc820cs->dev);
 	return ret;
 }
 
@@ -195,6 +207,7 @@ static void sc820cs_power_off(struct sc820cs *sc820cs)
 	clk_disable_unprepare(sc820cs->xvclk);
 	regulator_bulk_disable(ARRAY_SIZE(sc820cs->supplies),
 				       sc820cs->supplies);
+	pm_runtime_put_sync(sc820cs->dev);
 	sc820cs->powered = false;
 }
 
@@ -808,6 +821,11 @@ static int sc820cs_probe(struct i2c_client *client)
 	ret = sc820cs_get_resources(sc820cs);
 	if (ret)
 		return ret;
+
+	ret = devm_pm_runtime_enable(sc820cs->dev);
+	if (ret)
+		return dev_err_probe(sc820cs->dev, ret,
+				     "failed to enable runtime PM\n");
 
 	v4l2_i2c_subdev_init(&sc820cs->sd, client, &sc820cs_subdev_ops);
 
