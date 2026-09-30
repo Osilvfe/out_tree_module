@@ -12,6 +12,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/nvmem-provider.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
@@ -47,6 +48,10 @@
 #define SC1320CS_ANALOGUE_GAIN_MAX	16384
 #define SC1320CS_ANALOGUE_GAIN_DEFAULT	1024
 
+#define SC1320CS_EEPROM_ADDR		0x50
+#define SC1320CS_EEPROM_SIZE		8192
+#define SC1320CS_EEPROM_READ_CHUNK	12
+
 static const unsigned short sc1320cs_probe_addresses[] = {
 	SC1320CS_CONFIRMED_ADDR, 0x10, 0x20, 0x21, 0x30, 0x31, 0x37, 0x3c,
 };
@@ -67,7 +72,10 @@ struct sc1320cs {
 	struct regulator_bulk_data supplies[3];
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
+	struct i2c_client *eeprom_client;
+	u8 *eeprom_data;
 	struct mutex mutex;
+	bool eeprom_valid;
 	bool powered;
 	bool streaming;
 };
@@ -186,6 +194,125 @@ static int sc1320cs_identify(struct sc1320cs *sensor)
 	}
 
 	return 0;
+}
+
+static int sc1320cs_eeprom_read_chunk(struct sc1320cs *sensor,
+				      unsigned int offset, u8 *data,
+				      unsigned int length)
+{
+	u8 address[] = { offset >> 8, offset & 0xff };
+	struct i2c_msg messages[] = {
+		{
+			.addr = sensor->eeprom_client->addr,
+			.flags = 0,
+			.len = sizeof(address),
+			.buf = address,
+		},
+		{
+			.addr = sensor->eeprom_client->addr,
+			.flags = I2C_M_RD,
+			.len = length,
+			.buf = data,
+		},
+	};
+	int ret;
+
+	ret = i2c_transfer(sensor->eeprom_client->adapter, messages,
+			   ARRAY_SIZE(messages));
+	if (ret < 0)
+		return ret;
+
+	return ret == ARRAY_SIZE(messages) ? 0 : -EIO;
+}
+
+static int sc1320cs_eeprom_load(struct sc1320cs *sensor)
+{
+	bool was_powered = sensor->powered;
+	unsigned int offset;
+	int ret;
+
+	ret = sc1320cs_power_on(sensor);
+	if (ret)
+		return ret;
+
+	for (offset = 0; offset < SC1320CS_EEPROM_SIZE;
+	     offset += SC1320CS_EEPROM_READ_CHUNK) {
+		unsigned int length = min_t(unsigned int,
+					SC1320CS_EEPROM_SIZE - offset,
+					SC1320CS_EEPROM_READ_CHUNK);
+
+		ret = sc1320cs_eeprom_read_chunk(sensor, offset,
+						 sensor->eeprom_data + offset,
+						 length);
+		if (ret)
+			goto out_power;
+	}
+
+	sensor->eeprom_valid = true;
+	dev_info(sensor->dev, "cached 8192-byte rear camera EEPROM\n");
+
+out_power:
+	if (!was_powered)
+		sc1320cs_power_off(sensor);
+
+	return ret;
+}
+
+static int sc1320cs_eeprom_nvmem_read(void *priv, unsigned int offset,
+				      void *value, size_t bytes)
+{
+	struct sc1320cs *sensor = priv;
+	int ret = 0;
+
+	if (offset > SC1320CS_EEPROM_SIZE ||
+	    bytes > SC1320CS_EEPROM_SIZE - offset)
+		return -EINVAL;
+
+	mutex_lock(&sensor->mutex);
+	if (!sensor->eeprom_valid)
+		ret = sc1320cs_eeprom_load(sensor);
+	if (!ret)
+		memcpy(value, sensor->eeprom_data + offset, bytes);
+	else
+		dev_err_ratelimited(sensor->dev,
+				    "failed to load rear camera EEPROM: %d\n", ret);
+	mutex_unlock(&sensor->mutex);
+
+	return ret;
+}
+
+static int sc1320cs_register_eeprom(struct i2c_client *client,
+				    struct sc1320cs *sensor)
+{
+	struct nvmem_config config = {
+		.dev = sensor->dev,
+		.name = "sc1320cs-eeprom",
+		.id = NVMEM_DEVID_NONE,
+		.owner = THIS_MODULE,
+		.type = NVMEM_TYPE_EEPROM,
+		.read_only = true,
+		.root_only = true,
+		.reg_read = sc1320cs_eeprom_nvmem_read,
+		.size = SC1320CS_EEPROM_SIZE,
+		.word_size = 1,
+		.stride = 1,
+		.priv = sensor,
+	};
+	struct nvmem_device *nvmem;
+
+	sensor->eeprom_data = devm_kmalloc(sensor->dev, SC1320CS_EEPROM_SIZE,
+					   GFP_KERNEL);
+	if (!sensor->eeprom_data)
+		return -ENOMEM;
+
+	sensor->eeprom_client = devm_i2c_new_dummy_device(sensor->dev,
+							  client->adapter,
+							  SC1320CS_EEPROM_ADDR);
+	if (IS_ERR(sensor->eeprom_client))
+		return PTR_ERR(sensor->eeprom_client);
+
+	nvmem = devm_nvmem_register(sensor->dev, &config);
+	return PTR_ERR_OR_ZERO(nvmem);
 }
 
 static int sc1320cs_find_address(struct i2c_client *client,
@@ -610,6 +737,12 @@ static int sc1320cs_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(&client->dev, ret,
 				     "SC1320CS was not found on CCI0 master 1\n");
+
+	ret = sc1320cs_register_eeprom(client, sensor);
+	if (ret)
+		dev_warn(sensor->dev,
+			 "failed to register rear EEPROM NVMEM provider: %d\n",
+			 ret);
 
 	ret = sc1320cs_init_controls(sensor);
 	if (ret)

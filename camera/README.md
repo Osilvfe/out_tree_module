@@ -180,6 +180,15 @@ targets. The gain mapping is recovered from Caihong's official SC1320CS sensor
 library: coarse gain is written to `0x3e09`, fine gain to `0x3e07`, and the
 coarse codes are `0x00`, `0x08`, `0x09`, `0x0b` and `0x0f`.
 
+Read-only hardware probing confirmed the rear module EEPROM at Linux address
+`0x50`. It uses 16-bit addresses, wraps exactly at 8192 bytes, and therefore
+matches the 24C64 layout. The sensor driver exposes it as the root-only,
+read-only `sc1320cs-eeprom` NVMEM device. It reads in 12-byte transactions to
+respect the Qualcomm CCI limit and caches the full EEPROM after the first
+successful read. An idle read temporarily applies the official camera power,
+clock and reset sequence and then restores the powered-off state; a read while
+streaming reuses the active rails without disturbing 24 fps capture.
+
 ## libcamera application milestone
 
 Both sensors enumerate through libcamera's simple pipeline and software ISP.
@@ -269,8 +278,7 @@ on hardware.
 
 1. Validate the desktop autofocus, image controls and single-flash capture
    timing on hardware.
-2. Validate front OTP NVMEM and identify the rear EEPROM capacity at address
-   `0x50` before binding a read-only `at24` device.
+2. Validate the integrated rear EEPROM NVMEM provider from a cold boot.
 3. Consider any required downstream CamX compatibility only after the native
    libcamera path is complete.
 
