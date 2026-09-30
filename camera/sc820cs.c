@@ -38,10 +38,12 @@
 #define SC820CS_NATIVE_HEIGHT		2448
 #define SC820CS_NUM_DATA_LANES		4
 #define SC820CS_LINK_FREQ		366000000ULL
-#define SC820CS_PIXEL_RATE		292800000ULL
+/* The 3888 x 2500 vendor mode runs at 24 fps. */
+#define SC820CS_PIXEL_RATE		233280000ULL
 
 #define SC820CS_HTS			3888
 #define SC820CS_VTS			2500
+#define SC820CS_VTS_MAX			0xffff
 #define SC820CS_EXPOSURE_MIN		1
 #define SC820CS_EXPOSURE_MARGIN		6
 #define SC820CS_EXPOSURE_MAX		(SC820CS_VTS - SC820CS_EXPOSURE_MARGIN)
@@ -83,6 +85,8 @@ struct sc820cs {
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
 	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *vblank;
 	u8 *otp_data;
 	struct mutex mutex;
 	bool otp_valid;
@@ -487,10 +491,28 @@ static int sc820cs_write_gain(struct sc820cs *sc820cs, unsigned int gain)
 	return cci_multi_reg_write(sc820cs->regmap, regs, ARRAY_SIZE(regs), NULL);
 }
 
+static int sc820cs_write_vblank(struct sc820cs *sc820cs,
+				unsigned int vblank)
+{
+	return cci_write(sc820cs->regmap, CCI_REG16(0x320e),
+			 SC820CS_NATIVE_HEIGHT + vblank, NULL);
+}
+
 static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sc820cs *sc820cs = container_of(ctrl->handler,
 					       struct sc820cs, ctrls);
+	unsigned int exposure_max;
+
+	if (ctrl->id == V4L2_CID_VBLANK) {
+		exposure_max = SC820CS_NATIVE_HEIGHT + ctrl->val -
+			       SC820CS_EXPOSURE_MARGIN;
+		__v4l2_ctrl_modify_range(sc820cs->exposure,
+					 SC820CS_EXPOSURE_MIN,
+					 exposure_max, 1,
+					 min(SC820CS_EXPOSURE_DEFAULT,
+					     exposure_max));
+	}
 
 	if (!sc820cs->powered)
 		return 0;
@@ -500,6 +522,8 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 		return sc820cs_write_exposure(sc820cs, ctrl->val);
 	case V4L2_CID_ANALOGUE_GAIN:
 		return sc820cs_write_gain(sc820cs, ctrl->val);
+	case V4L2_CID_VBLANK:
+		return sc820cs_write_vblank(sc820cs, ctrl->val);
 	default:
 		return 0;
 	}
@@ -515,7 +539,6 @@ static int sc820cs_init_controls(struct sc820cs *sc820cs)
 	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *hblank;
-	struct v4l2_ctrl *vblank;
 	int ret;
 
 	ret = v4l2_ctrl_handler_init(&sc820cs->ctrls, 8);
@@ -534,13 +557,18 @@ static int sc820cs_init_controls(struct sc820cs *sc820cs)
 				   SC820CS_HTS - SC820CS_NATIVE_WIDTH,
 				   SC820CS_HTS - SC820CS_NATIVE_WIDTH, 1,
 				   SC820CS_HTS - SC820CS_NATIVE_WIDTH);
-	vblank = v4l2_ctrl_new_std(&sc820cs->ctrls, NULL, V4L2_CID_VBLANK,
-				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT,
-				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT, 1,
-				   SC820CS_VTS - SC820CS_NATIVE_HEIGHT);
-	v4l2_ctrl_new_std(&sc820cs->ctrls, &sc820cs_ctrl_ops,
-			  V4L2_CID_EXPOSURE, SC820CS_EXPOSURE_MIN,
-			  SC820CS_EXPOSURE_MAX, 1, SC820CS_EXPOSURE_DEFAULT);
+	sc820cs->vblank =
+		v4l2_ctrl_new_std(&sc820cs->ctrls, &sc820cs_ctrl_ops,
+				  V4L2_CID_VBLANK,
+		SC820CS_VTS - SC820CS_NATIVE_HEIGHT,
+		SC820CS_VTS_MAX - SC820CS_NATIVE_HEIGHT, 1,
+		SC820CS_VTS - SC820CS_NATIVE_HEIGHT);
+	sc820cs->exposure = v4l2_ctrl_new_std(&sc820cs->ctrls,
+					      &sc820cs_ctrl_ops,
+					      V4L2_CID_EXPOSURE,
+					      SC820CS_EXPOSURE_MIN,
+					      SC820CS_EXPOSURE_MAX, 1,
+					      SC820CS_EXPOSURE_DEFAULT);
 	v4l2_ctrl_new_std(&sc820cs->ctrls, &sc820cs_ctrl_ops,
 			  V4L2_CID_ANALOGUE_GAIN, SC820CS_ANALOGUE_GAIN_MIN,
 			  SC820CS_ANALOGUE_GAIN_MAX, 1,
@@ -562,7 +590,6 @@ static int sc820cs_init_controls(struct sc820cs *sc820cs)
 	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
-	vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	sc820cs->sd.ctrl_handler = &sc820cs->ctrls;
 	return 0;
 
@@ -620,12 +647,18 @@ static int sc820cs_set_fmt(struct v4l2_subdev *sd,
 			   struct v4l2_subdev_state *state,
 			   struct v4l2_subdev_format *fmt)
 {
+	struct sc820cs *sc820cs = to_sc820cs(sd);
+
 	if (fmt->pad)
 		return -EINVAL;
 
 	sc820cs_fill_format(&fmt->format);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
 		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
+	else
+		return __v4l2_ctrl_s_ctrl(sc820cs->vblank,
+					    SC820CS_VTS -
+					    SC820CS_NATIVE_HEIGHT);
 
 	return 0;
 }

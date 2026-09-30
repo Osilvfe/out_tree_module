@@ -37,10 +37,12 @@
 #define SC1320CS_NATIVE_HEIGHT		3120
 #define SC1320CS_NUM_DATA_LANES		4
 #define SC1320CS_LINK_FREQ		600000000ULL
-#define SC1320CS_PIXEL_RATE		480000000ULL
+/* The 5000 x 3200 vendor mode runs at 24 fps. */
+#define SC1320CS_PIXEL_RATE		384000000ULL
 
 #define SC1320CS_HTS			5000
 #define SC1320CS_VTS			3200
+#define SC1320CS_VTS_MAX		0xffff
 #define SC1320CS_EXPOSURE_MIN		1
 #define SC1320CS_EXPOSURE_MARGIN	4
 #define SC1320CS_EXPOSURE_MAX		(SC1320CS_VTS - SC1320CS_EXPOSURE_MARGIN)
@@ -73,6 +75,7 @@ struct sc1320cs {
 	struct regulator_bulk_data supplies[3];
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *vblank;
 	struct i2c_client *eeprom_client;
 	u8 *eeprom_data;
 	struct mutex mutex;
@@ -402,10 +405,28 @@ static int sc1320cs_write_gain(struct sc1320cs *sensor, unsigned int gain)
 	return cci_multi_reg_write(sensor->regmap, regs, ARRAY_SIZE(regs), NULL);
 }
 
+static int sc1320cs_write_vblank(struct sc1320cs *sensor,
+				 unsigned int vblank)
+{
+	return cci_write(sensor->regmap, CCI_REG16(0x320e),
+			 SC1320CS_NATIVE_HEIGHT + vblank, NULL);
+}
+
 static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sc1320cs *sensor = container_of(ctrl->handler,
 					       struct sc1320cs, ctrls);
+	unsigned int exposure_max;
+
+	if (ctrl->id == V4L2_CID_VBLANK) {
+		exposure_max = SC1320CS_NATIVE_HEIGHT + ctrl->val -
+			       SC1320CS_EXPOSURE_MARGIN;
+		__v4l2_ctrl_modify_range(sensor->exposure,
+					 SC1320CS_EXPOSURE_MIN,
+					 exposure_max, 1,
+					 min(SC1320CS_EXPOSURE_DEFAULT,
+					     exposure_max));
+	}
 
 	if (!sensor->powered)
 		return 0;
@@ -415,6 +436,8 @@ static int sc1320cs_set_ctrl(struct v4l2_ctrl *ctrl)
 		return sc1320cs_write_exposure(sensor, ctrl->val);
 	case V4L2_CID_ANALOGUE_GAIN:
 		return sc1320cs_write_gain(sensor, ctrl->val);
+	case V4L2_CID_VBLANK:
+		return sc1320cs_write_vblank(sensor, ctrl->val);
 	default:
 		return 0;
 	}
@@ -430,7 +453,6 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *hblank;
-	struct v4l2_ctrl *vblank;
 	int ret;
 
 	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 8);
@@ -442,17 +464,19 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 					   V4L2_CID_LINK_FREQ, 0, 0,
 					   sc1320cs_link_freq_menu);
 	pixel_rate = v4l2_ctrl_new_std(&sensor->ctrls, NULL,
-				       V4L2_CID_PIXEL_RATE, 0,
+				       V4L2_CID_PIXEL_RATE, SC1320CS_PIXEL_RATE,
 				       SC1320CS_PIXEL_RATE, 1,
 				       SC1320CS_PIXEL_RATE);
 	hblank = v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_HBLANK,
 				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH,
 				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH, 1,
 				   SC1320CS_HTS - SC1320CS_NATIVE_WIDTH);
-	vblank = v4l2_ctrl_new_std(&sensor->ctrls, NULL, V4L2_CID_VBLANK,
-				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT,
-				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT, 1,
-				   SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT);
+	sensor->vblank =
+		v4l2_ctrl_new_std(&sensor->ctrls, &sc1320cs_ctrl_ops,
+				  V4L2_CID_VBLANK,
+		SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT,
+		SC1320CS_VTS_MAX - SC1320CS_NATIVE_HEIGHT, 1,
+		SC1320CS_VTS - SC1320CS_NATIVE_HEIGHT);
 	sensor->exposure = v4l2_ctrl_new_std(&sensor->ctrls,
 					     &sc1320cs_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
@@ -481,7 +505,6 @@ static int sc1320cs_init_controls(struct sc1320cs *sensor)
 	link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
-	vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	sensor->sd.ctrl_handler = &sensor->ctrls;
 	return 0;
 
@@ -539,12 +562,18 @@ static int sc1320cs_set_fmt(struct v4l2_subdev *sd,
 			    struct v4l2_subdev_state *state,
 			    struct v4l2_subdev_format *fmt)
 {
+	struct sc1320cs *sensor = to_sc1320cs(sd);
+
 	if (fmt->pad)
 		return -EINVAL;
 
 	sc1320cs_fill_format(&fmt->format);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
 		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
+	else
+		return __v4l2_ctrl_s_ctrl(sensor->vblank,
+					    SC1320CS_VTS -
+					    SC1320CS_NATIVE_HEIGHT);
 
 	return 0;
 }
