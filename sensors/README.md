@@ -1,7 +1,7 @@
 # Caihong non-camera sensors
 
-This directory tracks ordinary sensor bring-up separately from the Qualcomm
-camera stack.
+This directory contains the non-camera sensor integration separately from the
+Qualcomm camera stack.
 
 ## Architecture: the physical sensors are SSC-owned downstream
 
@@ -111,7 +111,7 @@ implementation, but this tree does not guess whether Caihong's `icm4x607` is
 ICM42607 (`WHO_AM_I=0x67`) or ICM42607P (`WHO_AM_I=0x60`).  The exact variant
 must come from runtime or firmware evidence.
 
-## TCS3701 direct-I2C baseline
+## TCS3701 direct-I2C fallback
 
 Linux v7.2 has no TCS3701-specific IIO driver and the OnePlus kernel source does
 not contain a physical TCS3701 AP driver; downstream ownership lives in the
@@ -128,7 +128,7 @@ The baseline intentionally stays conservative:
 - starts ALS at the documented 256x reset gain and allows the standard IIO
   calibration-scale control to select the documented 0.5x..1024x gain range;
 - uses the datasheet characterization proximity setup (4 mA LED drive, 4x
-  proximity gain, 8 us pulses, 8 pulses) as a low-power bring-up baseline;
+  proximity gain, 8 us pulses, 8 pulses) as a conservative fallback;
 - enables each measurement engine only for a direct read, so the first version
   does not depend on IRQ routing or runtime-PM state machines.
 
@@ -136,7 +136,7 @@ It does **not** yet claim production lux/CCT output or a calibrated near/far
 threshold.  Those require the Caihong optical stack, panel/glass compensation,
 factory calibration and board-specific IRQ/power validation.
 
-## BU52053NVX Hall bring-up
+## BU52053NVX Hall switch
 
 The BU52053NVX is a GPIO-only switch, so Caihong uses the official in-tree
 `gpio-keys` driver rather than a device-specific module:

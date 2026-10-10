@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * SmartSens SC820CS bring-up driver for OnePlus Pad Pro (caihong).
+ * SmartSens SC820CS driver for OnePlus Pad Pro (caihong).
  *
  * The default probe path only powers the sensor long enough to identify it.
  * Streaming is enabled through the normal V4L2 s_stream callback using the
@@ -58,17 +58,6 @@
 #define SC820CS_OTP_PAGE_SIZE		390
 #define SC820CS_OTP_LAST_PAGE_SIZE	273
 #define SC820CS_OTP_READ_CHUNK		12
-
-static bool keep_power_on_on_probe_failure;
-module_param_named(keep_power_on_on_probe_failure,
-			   keep_power_on_on_probe_failure, bool, 0644);
-MODULE_PARM_DESC(keep_power_on_on_probe_failure,
-		 "Keep SC820CS rails, MCLK and reset released after a failed ID read");
-
-static bool allow_probe_failure;
-module_param_named(allow_probe_failure, allow_probe_failure, bool, 0644);
-MODULE_PARM_DESC(allow_probe_failure,
-		 "Register the diagnostic subdevice even when chip ID probing fails");
 
 static const unsigned int sc820cs_supply_loads[] = {
 	300000, /* DOVDD / L4B */
@@ -837,7 +826,6 @@ static int sc820cs_get_resources(struct sc820cs *sc820cs)
 static int sc820cs_probe(struct i2c_client *client)
 {
 	struct sc820cs *sc820cs;
-	bool identified;
 	int ret;
 
 	sc820cs = devm_kzalloc(&client->dev, sizeof(*sc820cs), GFP_KERNEL);
@@ -867,24 +855,14 @@ static int sc820cs_probe(struct i2c_client *client)
 		return ret;
 
 	ret = sc820cs_identify(sc820cs);
-	identified = !ret;
-	if (ret && keep_power_on_on_probe_failure) {
-		dev_warn(sc820cs->dev,
-			 "probe failed; keeping camera power and MCLK on for diagnostics\n");
-	} else {
-		sc820cs_power_off(sc820cs);
-	}
-	if (ret && !allow_probe_failure)
+	sc820cs_power_off(sc820cs);
+	if (ret)
 		return ret;
+
+	ret = sc820cs_register_otp_nvmem(sc820cs);
 	if (ret)
 		dev_warn(sc820cs->dev,
-			 "registering diagnostic subdevice without a valid chip ID\n");
-	if (identified) {
-		ret = sc820cs_register_otp_nvmem(sc820cs);
-		if (ret)
-			dev_warn(sc820cs->dev,
-				 "failed to register OTP NVMEM provider: %d\n", ret);
-	}
+			 "failed to register OTP NVMEM provider: %d\n", ret);
 
 	ret = sc820cs_init_controls(sc820cs);
 	if (ret)

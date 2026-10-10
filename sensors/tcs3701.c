@@ -2,7 +2,7 @@
 /*
  * ams OSRAM TCS3701 ALS/color and proximity sensor
  *
- * Minimal direct-I2C IIO driver for Linux v7.2 bring-up on Caihong.
+ * Optional direct-I2C IIO driver for Linux v7.2 on Caihong.
  * The downstream Qualcomm sensor stack owns this device through SSC; this
  * driver intentionally exposes the physical chip directly through standard
  * Linux IIO instead of importing the vendor sensor framework.
@@ -24,15 +24,12 @@
 #define TCS3701_REG_ENABLE		0x80
 #define TCS3701_REG_ATIME		0x81
 #define TCS3701_REG_PTIME		0x82
-#define TCS3701_REG_AUXID		0x90
-#define TCS3701_REG_REVID		0x91
 #define TCS3701_REG_ID			0x92
 #define TCS3701_REG_ASTATUS		0x94
 #define TCS3701_REG_ADATA0_L		0x95
 #define TCS3701_REG_ADATA1_L		0x97
 #define TCS3701_REG_ADATA2_L		0x99
 #define TCS3701_REG_ADATA3_L		0x9b
-#define TCS3701_REG_ADATA4_L		0x9d
 #define TCS3701_REG_PDATA_L		0xa1
 #define TCS3701_REG_STATUS2		0xa3
 #define TCS3701_REG_STATUS6		0xa7

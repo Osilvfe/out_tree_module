@@ -7,7 +7,11 @@ output=${2:-}
 hexagonrpc_commit=40e50412812adce9dddc2be9a4510ebce05eef89
 hexagonrpc_url=${HEXAGONRPC_URL:-https://github.com/linux-msm/hexagonrpc.git}
 erofs_fsck=${EROFS_FSCK:-fsck.erofs}
-jobs=${JOBS:-$(nproc)}
+cores=$(nproc)
+if [ "$cores" -gt 1 ]; then
+	cores=$((cores - 1))
+fi
+jobs=${JOBS:-$cores}
 
 if [ -z "$firmware_dir" ] || [ -z "$output" ]; then
 	echo "usage: $0 EXTRACTED_FIRMWARE_DIR OUTPUT_DIR" >&2
@@ -20,7 +24,14 @@ case "$output" in
 	*) output=$(pwd)/$output ;;
 esac
 
-for tool in git meson ninja aarch64-linux-gnu-gcc pkg-config jq; do
+case "$jobs" in
+	''|*[!0-9]*|0)
+		echo "JOBS must be a positive integer" >&2
+		exit 2
+		;;
+esac
+
+for tool in git meson ninja aarch64-linux-gnu-gcc pkg-config jq sha256sum; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "missing host tool: $tool" >&2
 		exit 1
@@ -133,6 +144,9 @@ install -m 0755 "$source_dir/build-aarch64/libhexagonrpc/libhexagonrpc.so.0.5" \
 
 find "$root/sensors/registry" -maxdepth 1 -type f -exec jq empty {} +
 printf 'hexagonrpc %s\n' "$hexagonrpc_commit" > "$bundle/VERSION"
+(CDPATH= cd -- "$bundle" &&
+	find VERSION bin lib root -type f -print0 |
+	LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS)
 printf 'registry files: '
 find "$root/sensors/registry" -maxdepth 1 -type f | wc -l
 echo "bundle ready: $bundle"
