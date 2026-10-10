@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /* Bounded CPS8601 pen charging controller for OnePlus Pad Pro (caihong). */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 

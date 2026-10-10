@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /*
  * Novatek NT36532E no-flash SPI touchscreen/pen driver.
  * Standalone mainline-style port; no Oplus touchpanel framework dependency.

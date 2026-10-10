@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /*
  * SmartSens SC1320CS driver for the OnePlus Pad Pro (caihong).
  *

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Copyright (c) 2015 Intel Corporation.
+ * Copyright (c) 2025 NXP.
+ * Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
+ *
  * MEMSIC MMC5603/MMC5633 I2C magnetometer external driver for Linux v7.2.
  *
  * Derived from drivers/iio/magnetometer/mmc5633.c in Linux v7.2

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /*
  * OnePlus/Oplus Caihong pogo keyboard and touchpad
  *

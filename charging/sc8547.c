@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Osilvfe <osilvfe@gmail.com>
 /*
  * Southchip SC8547/SC8547A charge-pump driver for OnePlus Pad Pro (caihong).
  *

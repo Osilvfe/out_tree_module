@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (c) 2026 Osilvfe <osilvfe@gmail.com> */
 /*
  * SC820CS 3264x2448 baseline from Caihong's downstream camera tree.
  *
