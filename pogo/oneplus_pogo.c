@@ -3,7 +3,10 @@
  * OnePlus/Oplus Caihong pogo keyboard and touchpad
  *
  * The accessory uses an Oplus one-wire framing protocol over a half-duplex
- * UART.  Keyboard LEDs are controlled using the vendor parameter-set packet.
+ * UART.  This keyboard has no keyboard backlight.  It does expose the
+ * CapsLock indicator as an EV_LED so the input layer can keep that status
+ * lamp usable; the desktop keyboard-backlight action is removed from the
+ * image separately.
  */
 
 #include <linux/gpio/consumer.h>
@@ -38,8 +41,8 @@
 #define POGO_PARAM_LED			0x0d
 #define POGO_GENERAL_HOST_SLEEP		0x02
 #define POGO_GENERAL_TOUCHPAD_DISABLE	0x11
-#define POGO_TOUCHPAD_RESTORE_TRIES	3
-#define POGO_TOUCHPAD_RESTORE_DELAY_MS	20
+#define POGO_TOUCHPAD_RESTORE_TRIES	1
+#define POGO_TOUCHPAD_RESTORE_DELAY_MS	5
 #define POGO_TX_SYNC_COUNT		8
 #define POGO_TX_FRAME_MAX		32
 
@@ -131,8 +134,10 @@ struct oneplus_pogo {
 	struct work_struct led_work;
 	struct delayed_work setup_work;
 	struct delayed_work touchpad_work;
-	/* Serializes receive parsing with diagnostic status reads. */
+	/* Serializes receive parsing with touchpad state changes. */
 	struct mutex lock;
+	/* Serializes half-duplex UART transmissions without blocking RX parsing. */
+	struct mutex tx_lock;
 
 	u32 baud;
 	u32 x_max;
@@ -153,23 +158,10 @@ struct oneplus_pogo {
 	u8 sync_count;
 	bool receiving;
 	bool baud_locked;
-	u64 rx_bytes;
-	u64 frame_candidates;
-	u64 valid_frames;
-	u64 crc_errors;
-	u64 framing_errors;
-	u64 tx_frames;
-	u64 tx_errors;
-	u64 touch_frames;
-	u64 touch_contacts;
-	u8 last_rx[32];
-	size_t last_rx_len;
-	bool capslock_led;
 	int touchpad_disabled;
+	bool capslock_led;
 	bool touchpad_target_enabled;
 	u8 touchpad_restore_left;
-	int touchpad_restore_error;
-	int wake_before_power;
 };
 
 static u16 oneplus_pogo_crc(u16 crc, const u8 *data, size_t len)
@@ -242,9 +234,7 @@ static int oneplus_pogo_send_locked(struct oneplus_pogo *pogo, u8 command,
 	if (written == frame_len) {
 		serdev_device_wait_until_sent(pogo->serdev,
 					      msecs_to_jiffies(20));
-		pogo->tx_frames++;
 	} else {
-		pogo->tx_errors++;
 		ret = written < 0 ? written : -EIO;
 	}
 	usleep_range(300, 400);
@@ -254,13 +244,13 @@ static int oneplus_pogo_send_locked(struct oneplus_pogo *pogo, u8 command,
 }
 
 static int oneplus_pogo_send(struct oneplus_pogo *pogo, u8 command,
-			     const u8 *payload, size_t payload_len)
+				     const u8 *payload, size_t payload_len)
 {
 	int ret;
 
-	mutex_lock(&pogo->lock);
+	mutex_lock(&pogo->tx_lock);
 	ret = oneplus_pogo_send_locked(pogo, command, payload, payload_len);
-	mutex_unlock(&pogo->lock);
+	mutex_unlock(&pogo->tx_lock);
 	return ret;
 }
 
@@ -272,16 +262,29 @@ static int oneplus_pogo_set_host_awake(struct oneplus_pogo *pogo)
 				 sizeof(payload));
 }
 
-/* Caller holds pogo->lock, including across target selection and TX. */
-static int oneplus_pogo_set_touchpad_enabled_locked(struct oneplus_pogo *pogo,
-						     bool enabled)
+/* Caller holds pogo->tx_lock. */
+static int oneplus_pogo_set_touchpad_enabled_tx_locked(
+							struct oneplus_pogo *pogo,
+							bool enabled)
 {
 	u8 payload[] = {
 		POGO_GENERAL_TOUCHPAD_DISABLE, 0x01, enabled ? 0x00 : 0x01,
 	};
 
 	return oneplus_pogo_send_locked(pogo, POGO_CMD_USER_GENERAL, payload,
-					sizeof(payload));
+					 sizeof(payload));
+}
+
+static int oneplus_pogo_set_touchpad_enabled(struct oneplus_pogo *pogo,
+						      bool enabled)
+{
+	int ret;
+
+	mutex_lock(&pogo->tx_lock);
+	ret = oneplus_pogo_set_touchpad_enabled_tx_locked(pogo, enabled);
+	mutex_unlock(&pogo->tx_lock);
+
+	return ret;
 }
 
 static void oneplus_pogo_queue_touchpad_restore(struct oneplus_pogo *pogo)
@@ -296,17 +299,27 @@ static void oneplus_pogo_touchpad_work(struct work_struct *work)
 {
 	struct oneplus_pogo *pogo = container_of(to_delayed_work(work),
 						  struct oneplus_pogo, touchpad_work);
+	bool enabled;
+	int ret;
 
 	mutex_lock(&pogo->lock);
-	if (pogo->touchpad_restore_left) {
-		pogo->touchpad_restore_left--;
-		pogo->touchpad_restore_error =
-			oneplus_pogo_set_touchpad_enabled_locked(pogo,
-							pogo->touchpad_target_enabled);
-		if (pogo->touchpad_restore_left)
-			mod_delayed_work(system_wq, &pogo->touchpad_work,
-					 msecs_to_jiffies(POGO_TOUCHPAD_RESTORE_DELAY_MS));
+	if (!pogo->touchpad_restore_left) {
+		mutex_unlock(&pogo->lock);
+		return;
 	}
+	pogo->touchpad_restore_left--;
+	enabled = pogo->touchpad_target_enabled;
+	mutex_unlock(&pogo->lock);
+
+	/* TX has its own lock so incoming touch frames continue to be parsed. */
+	ret = oneplus_pogo_set_touchpad_enabled(pogo, enabled);
+	mutex_lock(&pogo->lock);
+	if (ret)
+		dev_dbg_ratelimited(&pogo->serdev->dev,
+				    "failed to restore touchpad state: %d\n", ret);
+	if (pogo->touchpad_restore_left)
+		mod_delayed_work(system_wq, &pogo->touchpad_work,
+				 msecs_to_jiffies(POGO_TOUCHPAD_RESTORE_DELAY_MS));
 	mutex_unlock(&pogo->lock);
 }
 
@@ -336,10 +349,12 @@ static void oneplus_pogo_setup_work(struct work_struct *work)
 
 	msleep(30);
 	for (i = 0; i < 3; i++) {
+		bool enabled;
+
 		mutex_lock(&pogo->lock);
-		ret = oneplus_pogo_set_touchpad_enabled_locked(pogo,
-							pogo->touchpad_target_enabled);
+		enabled = pogo->touchpad_target_enabled;
 		mutex_unlock(&pogo->lock);
+		ret = oneplus_pogo_set_touchpad_enabled(pogo, enabled);
 		if (ret)
 			dev_dbg(&pogo->serdev->dev,
 				"failed to set touchpad state: %d\n", ret);
@@ -349,25 +364,25 @@ static void oneplus_pogo_setup_work(struct work_struct *work)
 
 static void oneplus_pogo_led_work(struct work_struct *work)
 {
-	struct oneplus_pogo *pogo =
-		container_of(work, struct oneplus_pogo, led_work);
+	struct oneplus_pogo *pogo = container_of(work, struct oneplus_pogo,
+							led_work);
 	u8 payload[] = {
 		POGO_PARAM_LED, 0x04, READ_ONCE(pogo->capslock_led), 0, 0, 0,
 	};
 	int ret;
 
-	/* Match the delay used by the vendor driver to avoid a heartbeat. */
+	/* Keep the LED command away from the MCU heartbeat transaction. */
 	usleep_range(15000, 16000);
 	ret = oneplus_pogo_send(pogo, POGO_CMD_PARAM_SET, payload,
-				sizeof(payload));
+					sizeof(payload));
 	if (ret)
-		dev_dbg(&pogo->serdev->dev, "failed to set keyboard LED: %d\n",
+		dev_dbg(&pogo->serdev->dev, "failed to set CapsLock LED: %d\n",
 			ret);
 }
 
 static int oneplus_pogo_input_event(struct input_dev *input,
-				    unsigned int type, unsigned int code,
-				    int value)
+					unsigned int type, unsigned int code,
+					int value)
 {
 	struct oneplus_pogo *pogo = input_get_drvdata(input);
 
@@ -409,24 +424,29 @@ static void oneplus_pogo_report_keyboard(struct oneplus_pogo *pogo,
 {
 	u8 report[8];
 	u16 keycodes[6] = { 0 };
+	bool report_changed;
 	int i, j;
 
 	if (len < sizeof(report))
 		return;
 
 	memcpy(report, payload, sizeof(report));
+	report_changed = memcmp(report, pogo->old_keys, sizeof(report)) != 0;
 	/* Compute Fn before translating any slot, including a simultaneous key. */
 	pogo->fn_down = oneplus_pogo_key_present(report, POGO_SEARCH_USAGE);
-	/* The MCU toggles touchpad state independently of our Linux keycode.
-	 * Restore the host target for plain F4 and Fn+F4 alike; the desktop
-	 * handles KEY_TOUCHPAD_TOGGLE, so it must not also fight an MCU toggle.
-	 * Check both edges because the firmware may switch after key release.
+	/* The MCU toggles its touchpad state for this usage.  Plain F4 is kept as
+	 * an F4 key, while Fn+F4 intentionally toggles the target state.  Restore
+	 * that target once after the report; repeated synchronous writes here used
+	 * to hold the UART receive lock long enough to pause pointer events.
 	 */
 	if (oneplus_pogo_key_present(report, 0x6b) !=
-	    oneplus_pogo_key_present(pogo->old_keys, 0x6b) ||
+		oneplus_pogo_key_present(pogo->old_keys, 0x6b) ||
 	    oneplus_pogo_key_present(report, 0x6c) !=
-	    oneplus_pogo_key_present(pogo->old_keys, 0x6c))
-		oneplus_pogo_queue_touchpad_restore(pogo);
+		oneplus_pogo_key_present(pogo->old_keys, 0x6c)) {
+		if (pogo->fn_down)
+			pogo->touchpad_target_enabled =
+				!pogo->touchpad_target_enabled;
+	}
 
 	for (i = 0; i < 8; i++)
 		input_report_key(pogo->keyboard, oneplus_pogo_keycode[224 + i],
@@ -458,13 +478,14 @@ static void oneplus_pogo_report_keyboard(struct oneplus_pogo *pogo,
 			continue;
 		}
 		keycodes[i - 2] = oneplus_pogo_keyboard_key(usage, pogo->fn_down);
-		input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x070000 | usage);
 		if (keycodes[i - 2])
 			input_report_key(pogo->keyboard, keycodes[i - 2], 1);
 	}
 
 	memcpy(pogo->old_keys, report, sizeof(report));
 	memcpy(pogo->old_keycodes, keycodes, sizeof(keycodes));
+	if (report_changed)
+		oneplus_pogo_queue_touchpad_restore(pogo);
 	input_sync(pogo->keyboard);
 }
 
@@ -498,19 +519,20 @@ static void oneplus_pogo_report_media(struct oneplus_pogo *pogo,
 {
 	u8 report[4];
 	u16 keycodes[2] = { 0 };
+	bool report_changed;
 	int i, j;
 
 	if (len < sizeof(report))
 		return;
 
 	memcpy(report, payload, sizeof(report));
+	report_changed = memcmp(report, pogo->old_media, sizeof(report)) != 0;
 
 	for (i = 0; i < 2; i++) {
 		u16 old = get_unaligned_le16(pogo->old_media + i * 2);
 
 		if (old && (i == 0 || old != get_unaligned_le16(pogo->old_media)) &&
 		    !oneplus_pogo_media_present(report, old)) {
-			input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x0c0000 | old);
 			if (pogo->old_media_keycodes[i] != KEY_RESERVED)
 				input_report_key(pogo->keyboard, pogo->old_media_keycodes[i], 0);
 		}
@@ -529,13 +551,14 @@ static void oneplus_pogo_report_media(struct oneplus_pogo *pogo,
 			continue;
 		}
 		keycodes[i] = oneplus_pogo_media_key(usage, pogo->fn_down);
-		input_event(pogo->keyboard, EV_MSC, MSC_SCAN, 0x0c0000 | usage);
 		if (keycodes[i] != KEY_RESERVED)
 			input_report_key(pogo->keyboard, keycodes[i], 1);
 	}
 
 	memcpy(pogo->old_media, report, sizeof(report));
 	memcpy(pogo->old_media_keycodes, keycodes, sizeof(keycodes));
+	if (report_changed)
+		oneplus_pogo_queue_touchpad_restore(pogo);
 	input_sync(pogo->keyboard);
 }
 
@@ -554,8 +577,6 @@ static void oneplus_pogo_report_touchpad(struct oneplus_pogo *pogo,
 	buttons = payload[len - 1];
 	if (fingers > POGO_MAX_TOUCHES || fingers * 5 > len - 2)
 		return;
-	pogo->touch_frames++;
-
 	for (i = 0; i < fingers; i++) {
 		const u8 *contact = payload + i * 5;
 		u8 id = (contact[0] >> 4) & 0x0f;
@@ -582,10 +603,9 @@ static void oneplus_pogo_report_touchpad(struct oneplus_pogo *pogo,
 	input_report_key(pogo->touchpad, BTN_RIGHT, buttons & BIT(1));
 	input_mt_sync_frame(pogo->touchpad);
 	input_sync(pogo->touchpad);
-	pogo->touch_contacts += active;
 }
 
-static bool oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
+static void oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 {
 	const u8 *payload;
 	u8 *frame = pogo->frame;
@@ -596,22 +616,19 @@ static bool oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 	    (frame[0] != POGO_START && frame[0] != POGO_REPEAT) ||
 	    frame[1] != POGO_KEYBOARD_ADDRESS ||
 	    frame[2] != POGO_TABLET_ADDRESS) {
-		pogo->framing_errors++;
-		return false;
+		return;
 	}
 
 	command = frame[3];
 	payload_len = frame[4];
 	if (pogo->frame_len != payload_len + 12) {
-		pogo->framing_errors++;
-		return false;
+		return;
 	}
 
 	received_crc = get_unaligned_be16(frame + 5 + payload_len);
 	expected_crc = oneplus_pogo_crc(pogo->crc_init, frame, payload_len + 5);
 	if (received_crc != expected_crc) {
-		pogo->crc_errors++;
-		return false;
+		return;
 	}
 
 	if (frame[7 + payload_len] != POGO_END ||
@@ -619,11 +636,8 @@ static bool oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 	    frame[9 + payload_len] != POGO_TAIL ||
 	    frame[10 + payload_len] != POGO_TAIL ||
 	    frame[11 + payload_len] != POGO_TAIL) {
-		pogo->framing_errors++;
-		return false;
+		return;
 	}
-
-	pogo->valid_frames++;
 
 	if (!pogo->baud_locked) {
 		pogo->baud_locked = true;
@@ -667,7 +681,6 @@ static bool oneplus_pogo_handle_frame(struct oneplus_pogo *pogo)
 		break;
 	}
 
-	return true;
 }
 
 static void oneplus_pogo_reset_receiver(struct oneplus_pogo *pogo)
@@ -688,7 +701,6 @@ static void oneplus_pogo_receive_byte(struct oneplus_pogo *pogo, u8 byte)
 
 		if ((byte == POGO_START || byte == POGO_REPEAT) &&
 		    pogo->sync_count >= 4) {
-			pogo->frame_candidates++;
 			pogo->receiving = true;
 			pogo->frame_len = 1;
 			pogo->frame[0] = byte;
@@ -723,24 +735,9 @@ static size_t oneplus_pogo_receive(struct serdev_device *serdev,
 				   const u8 *data, size_t count)
 {
 	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
-	size_t keep;
 	size_t i;
 
 	mutex_lock(&pogo->lock);
-	pogo->rx_bytes += count;
-	keep = min(count, sizeof(pogo->last_rx));
-	if (keep < sizeof(pogo->last_rx)) {
-		size_t retained = min(pogo->last_rx_len,
-				      sizeof(pogo->last_rx) - keep);
-
-		memmove(pogo->last_rx, pogo->last_rx + pogo->last_rx_len - retained,
-			retained);
-		memcpy(pogo->last_rx + retained, data + count - keep, keep);
-		pogo->last_rx_len = retained + keep;
-	} else {
-		memcpy(pogo->last_rx, data + count - keep, keep);
-		pogo->last_rx_len = keep;
-	}
 	for (i = 0; i < count; i++)
 		oneplus_pogo_receive_byte(pogo, data[i]);
 	mutex_unlock(&pogo->lock);
@@ -757,63 +754,6 @@ static const struct serdev_device_ops oneplus_pogo_serdev_ops = {
 	.receive_buf = oneplus_pogo_receive,
 	.write_wakeup = oneplus_pogo_write_wakeup,
 };
-
-static ssize_t status_show(struct device *dev, struct device_attribute *attr,
-			   char *buf)
-{
-	struct serdev_device *serdev = to_serdev_device(dev);
-	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
-	ssize_t len;
-	int attached = -1, power = -1, tx_enable = -1;
-	int wake_raw = -1, power_raw = -1, tx_enable_raw = -1;
-	size_t i;
-
-	if (!pogo)
-		return -ENODEV;
-
-	mutex_lock(&pogo->lock);
-	if (pogo->wake_gpio) {
-		attached = gpiod_get_value_cansleep(pogo->wake_gpio);
-		wake_raw = gpiod_get_raw_value_cansleep(pogo->wake_gpio);
-	}
-	if (pogo->power_gpio) {
-		power = gpiod_get_value_cansleep(pogo->power_gpio);
-		power_raw = gpiod_get_raw_value_cansleep(pogo->power_gpio);
-	}
-	if (pogo->tx_enable_gpio) {
-		tx_enable = gpiod_get_value_cansleep(pogo->tx_enable_gpio);
-		tx_enable_raw = gpiod_get_raw_value_cansleep(pogo->tx_enable_gpio);
-	}
-
-	len = sysfs_emit(buf,
-		"attached=%d wake_raw=%d wake_before_power=%d "
-		"power=%d power_raw=%d tx_enable=%d tx_enable_raw=%d "
-		"baud=%u locked=%u "
-		"rx_bytes=%llu candidates=%llu valid_frames=%llu "
-		"crc_errors=%llu framing_errors=%llu "
-		"capslock_led=%u tx_frames=%llu tx_errors=%llu "
-		"touchpad_disabled=%d touchpad_target_enabled=%u "
-		"touchpad_restore_left=%u touchpad_restore_error=%d "
-		"touch_frames=%llu touch_contacts=%llu\n"
-		"last_rx=",
-		attached, wake_raw, pogo->wake_before_power,
-		power, power_raw, tx_enable, tx_enable_raw,
-		pogo->baud, pogo->baud_locked,
-		pogo->rx_bytes, pogo->frame_candidates, pogo->valid_frames,
-		pogo->crc_errors, pogo->framing_errors,
-		pogo->capslock_led, pogo->tx_frames, pogo->tx_errors,
-		pogo->touchpad_disabled, pogo->touchpad_target_enabled,
-		pogo->touchpad_restore_left, pogo->touchpad_restore_error, pogo->touch_frames,
-		pogo->touch_contacts);
-	for (i = 0; i < pogo->last_rx_len; i++)
-		len += sysfs_emit_at(buf, len, "%02x%s", pogo->last_rx[i],
-				     i + 1 == pogo->last_rx_len ? "" : " ");
-	len += sysfs_emit_at(buf, len, "\n");
-	mutex_unlock(&pogo->lock);
-
-	return len;
-}
-static DEVICE_ATTR_RO(status);
 
 static ssize_t touchpad_enabled_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
@@ -848,13 +788,13 @@ static ssize_t touchpad_enabled_store(struct device *dev,
 	if (ret)
 		return ret;
 
-	mutex_lock(&pogo->lock);
-	ret = oneplus_pogo_set_touchpad_enabled_locked(pogo, enabled);
+	ret = oneplus_pogo_set_touchpad_enabled(pogo, enabled);
 	if (!ret) {
+		mutex_lock(&pogo->lock);
 		pogo->touchpad_target_enabled = enabled;
 		pogo->touchpad_restore_left = 0;
+		mutex_unlock(&pogo->lock);
 	}
-	mutex_unlock(&pogo->lock);
 	if (ret)
 		return ret;
 
@@ -863,7 +803,6 @@ static ssize_t touchpad_enabled_store(struct device *dev,
 static DEVICE_ATTR_RW(touchpad_enabled);
 
 static struct attribute *oneplus_pogo_attrs[] = {
-	&dev_attr_status.attr,
 	&dev_attr_touchpad_enabled.attr,
 	NULL,
 };
@@ -887,8 +826,6 @@ static int oneplus_pogo_register_inputs(struct oneplus_pogo *pogo)
 	pogo->keyboard->event = oneplus_pogo_input_event;
 	input_set_drvdata(pogo->keyboard, pogo);
 	input_set_capability(pogo->keyboard, EV_LED, LED_CAPSL);
-	input_set_capability(pogo->keyboard, EV_MSC, MSC_SCAN);
-
 	for (i = 0; i < ARRAY_SIZE(oneplus_pogo_keycode); i++)
 		if (oneplus_pogo_keycode[i])
 			input_set_capability(pogo->keyboard, EV_KEY,
@@ -948,6 +885,7 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 	struct device *dev = &serdev->dev;
 	struct oneplus_pogo *pogo;
 	u32 value;
+	int wake_before_power = -1;
 	int ret;
 
 	pogo = devm_kzalloc(dev, sizeof(*pogo), GFP_KERNEL);
@@ -961,10 +899,10 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 	pogo->y_res = 23;
 	pogo->crc_init = POGO_CRC_INIT;
 	pogo->baud = 921600;
-	pogo->wake_before_power = -1;
 	pogo->touchpad_disabled = -1;
 	pogo->touchpad_target_enabled = true;
 	mutex_init(&pogo->lock);
+	mutex_init(&pogo->tx_lock);
 	INIT_WORK(&pogo->led_work, oneplus_pogo_led_work);
 	INIT_DELAYED_WORK(&pogo->setup_work, oneplus_pogo_setup_work);
 	INIT_DELAYED_WORK(&pogo->touchpad_work, oneplus_pogo_touchpad_work);
@@ -1015,15 +953,14 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 	 * The stock Caihong driver first selects pogo_power_disable and only
 	 * enables the keyboard after sampling the active-low wake line.  Keep
 	 * the rail low long enough to reset an MCU that survived a warm reboot,
-	 * and retain the pre-power wake sample for hardware diagnostics.
+	 * and retain the pre-power wake sample for the probe result.
 	 */
 	if (pogo->power_gpio) {
 		gpiod_set_value_cansleep(pogo->power_gpio, 0);
 		msleep(100);
 	}
 	if (pogo->wake_gpio)
-		pogo->wake_before_power =
-			gpiod_get_value_cansleep(pogo->wake_gpio);
+		wake_before_power = gpiod_get_value_cansleep(pogo->wake_gpio);
 
 	ret = oneplus_pogo_register_inputs(pogo);
 	if (ret)
@@ -1050,7 +987,7 @@ static int oneplus_pogo_probe(struct serdev_device *serdev)
 	dev_info(dev,
 		 "receiver ready at %u baud, pre-power keyboard %s, now %s\n",
 		 pogo->baud,
-		 pogo->wake_before_power > 0 ? "attached" : "not detected",
+		 wake_before_power > 0 ? "attached" : "not detected",
 		 pogo->wake_gpio && gpiod_get_value_cansleep(pogo->wake_gpio) ?
 		 "attached" : "not detected");
 	schedule_delayed_work(&pogo->setup_work, msecs_to_jiffies(500));
@@ -1067,9 +1004,9 @@ static void oneplus_pogo_remove(struct serdev_device *serdev)
 {
 	struct oneplus_pogo *pogo = serdev_device_get_drvdata(serdev);
 
+	cancel_work_sync(&pogo->led_work);
 	devm_release_action(&serdev->dev, oneplus_pogo_stop_touchpad_work, pogo);
 	cancel_delayed_work_sync(&pogo->setup_work);
-	cancel_work_sync(&pogo->led_work);
 	if (pogo->power_gpio)
 		gpiod_set_value_cansleep(pogo->power_gpio, 0);
 	if (pogo->vcc)

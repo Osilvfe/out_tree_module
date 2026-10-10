@@ -1,0 +1,9 @@
+# Kbuild output. Keep the repository limited to source and integration files.
+*.ko
+*.mod
+*.mod.c
+*.o
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/

@@ -387,10 +387,6 @@ static int nvt_read_event(struct nt36532e *ts)
 	}
 
 	ts->event_reads++;
-	if (ts->event_reads <= 3)
-		dev_info(&ts->spi->dev, "event %llu: %8ph ... checksum=%02x\n",
-			 ts->event_reads, ts->last_event + 1,
-			 ts->last_event[NVT_POINT_CSUM_INDEX]);
 	return 0;
 }
 
@@ -655,22 +651,6 @@ static ssize_t touch_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(touch_stats);
 
-static ssize_t last_event_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
-{
-	struct nt36532e *ts = dev_get_drvdata(dev);
-	ssize_t len = 0;
-	int i;
-
-	mutex_lock(&ts->lock);
-	for (i = 0; i < sizeof(ts->last_event); i++)
-		len += sysfs_emit_at(buf, len, "%02x%c", ts->last_event[i],
-				    i == sizeof(ts->last_event) - 1 ? '\n' : ' ');
-	mutex_unlock(&ts->lock);
-	return len;
-}
-static DEVICE_ATTR_RO(last_event);
-
 static ssize_t pen_scan_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
@@ -736,7 +716,6 @@ static DEVICE_ATTR_RO(pen_stats);
 
 static struct attribute *nvt_attrs[] = {
 	&dev_attr_touch_stats.attr,
-	&dev_attr_last_event.attr,
 	&dev_attr_pen_scan.attr,
 	&dev_attr_pen_stats.attr,
 	NULL,

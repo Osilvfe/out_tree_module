@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Southchip SC8547/SC8547A charge-pump bring-up driver.
+ * Southchip SC8547/SC8547A charge-pump driver for OnePlus Pad Pro (caihong).
  *
- * Standalone mainline-style port for OnePlus Pad Pro (caihong).
- *
- * Normal device nodes are telemetry-only apart from ADC enable.  Development
- * write controls are hidden behind explicit DT opt-ins.  Stage 4 provides
- * manual or policy-owned charge-pump control.  A narrow cancellation hook lets
- * an external policy stop an active run, but this physical driver still owns no
- * PD/PPS policy, dual-pump coordination or VOOC/UFCS handling.
+ * The driver exposes standard power-supply telemetry, coordinates wired PPS
+ * with qcom_battmgr, and runs the board's dual-pump SVOOC protocol and stock
+ * charging curves.  All register profiles and safety limits are fixed board
+ * data; there are no raw-register or manual pump controls in userspace.
  */
 
 #include <linux/atomic.h>
@@ -16,25 +13,23 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/random.h>
 #include <linux/regmap.h>
-#include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
-#include "sc8547_api.h"
+#include "caihong_kernel_api.h"
 
 #define SC8547_REG_BAT_OVP		0x00
 #define SC8547_BAT_OVP_DIS		BIT(7)
 #define SC8547_BAT_OVP_MASK		GENMASK(5, 0)
-#define SC8547_BAT_OVP_BASE_MV		3500
-#define SC8547_BAT_OVP_STEP_MV		25
 
 #define SC8547_REG_BAT_OCP		0x01
-#define SC8547_BAT_OCP_MASK		GENMASK(5, 0)
-#define SC8547_BAT_OCP_BASE_MA		2000
-#define SC8547_BAT_OCP_STEP_MA		100
 
 #define SC8547_REG_AC_OVP		0x02
 #define SC8547_AC_OVP_STAT		BIT(5)
@@ -42,23 +37,11 @@
 #define SC8547_AC_OVP_MASK		GENMASK(2, 0)
 #define SC8547_AC_OVP_CONFIG_MASK	(SC8547_AC_OVP_INT_MASK | \
 					 SC8547_AC_OVP_MASK)
-#define SC8547_AC_OVP_BASE_MV		11000
-#define SC8547_AC_OVP_STEP_MV		1000
 
 #define SC8547_REG_VBUS_OVP		0x04
-#define SC8547_VBUS_OVP_DIS		BIT(7)
-#define SC8547_VBUS_OVP_MASK		GENMASK(6, 0)
-#define SC8547_VBUS_OVP_BASE_MV	6000
-#define SC8547_VBUS_OVP_STEP_MV	50
 
 #define SC8547_REG_IBUS_PROT		0x05
 #define SC8547_IBUS_UCP_DIS		BIT(7)
-#define SC8547_IBUS_OCP_DIS		BIT(6)
-#define SC8547_IBUS_OCP_MASK		GENMASK(3, 0)
-#define SC8547_IBUS_OCP_BASE_MA	1200
-#define SC8547_IBUS_OCP_STEP_MA	300
-#define SC8547_UCP_DEGLITCH_SC8547	BIT(5)
-#define SC8547A_UCP_DEGLITCH_MASK	GENMASK(5, 4)
 
 #define SC8547_REG_STATUS_06		0x06
 #define SC8547_TSHUT_STAT		BIT(6)
@@ -82,9 +65,7 @@
 
 #define SC8547_REG_MODE_CTRL		0x09
 #define SC8547_CHARGE_MODE		BIT(7)
-#define SC8547_IBUS_UCP_RISE_FLAG	BIT(5)
 #define SC8547_IBUS_UCP_RISE_MASK	BIT(4)
-#define SC8547_WD_TIMEOUT2_FLAG		BIT(3)
 #define SC8547_WATCHDOG_MASK		GENMASK(2, 0)
 
 #define SC8547_REG_IBUS_CTRL		0x0c
@@ -114,9 +95,6 @@
 					 SC8547_VBUS_OVP_STAT | \
 					 SC8547_IBUS_OCP_STAT)
 
-#define SC8547_REG_FAULT_0F		0x0f
-#define SC8547_IBUS_UCP_FALL_FLAG	BIT(2)
-
 #define SC8547_REG_INT_MASK		0x10
 
 #define SC8547_REG_ADC_CTRL		0x11
@@ -138,9 +116,124 @@
 #define SC8547_REG_LOOSE_DET		0x33
 #define SC8547_REG_VOOCPHY_TIMING	0x3a
 #define SC8547_REG_VOOCPHY_CTRL		0x2b
+#define SC8547_REG_VOOC_TX_DATA_H	0x2c
+#define SC8547_REG_VOOC_RX_DATA		0x2e
+#define SC8547_REG_VOOC_INT_STATUS	0x2f
+#define SC8547_REG_VOOC_INT_MASK		0x30
+#define SC8547_REG_VOOC_PRE_DATA_H	0x31
+#define SC8547_REG_VOOC_DPDM_CTRL	0x21
+#define SC8547_REG_VOOC_DPDM_CFG		0x22
 #define SC8547_REG_SLAVE_CTRL		0x30
 #define SC8547A_REG_OTG_CTRL		0x3b
 #define SC8547_REG_VBUS_RANGE_CTRL	0x3c
+
+#define SC8547_VOOC_CTRL_ENABLE		0x80
+#define SC8547_VOOC_CTRL_SEND_SEQ	0x01
+#define SC8547_VOOC_CTRL_HANDSHAKE	(SC8547_VOOC_CTRL_ENABLE | \
+					 SC8547_VOOC_CTRL_SEND_SEQ)
+#define SC8547_VOOC_DPDM_ACTIVE		0x21
+#define SC8547_VOOC_DPDM_HIZ		0xc0
+#define SC8547_VOOC_INT_ACTIVE		0x05
+#define SC8547_VOOC_INT_MASKED		0x7f
+#define SC8547_VOOC_LOOSE_DET		0xd1
+#define SC8547_VOOC_TIMING_ACTIVE	0x60
+#define SC8547_VOOC_HANDSHAKE_TIMEOUT_MS	9000
+#define SC8547_VOOC_AUTO_RETRY_MAX	3
+#define SC8547_VOOC_AUTO_RETRY_DELAY_MS	2000
+#define SC8547_VOOC_USB_SUSPEND_MS	1500
+#define SC8547_VOOC_USB_SETTLE_MS	700
+#define SC8547_VOOC_REACTIVE_SETTLE_MS	350
+#define SC8547_VOOC_CABLE_DEBOUNCE_MS	300
+#define SC8547_VOOC_CABLE_RECHECK_MS	2500
+#define SC8547_VOOC_CABLE_REMOVE_SAMPLES	2
+#define SC8547_VOOC_CABLE_PRESENT_UV	3000000
+#define SC8547_VOOC_BOOT_SETTLE_MS	30000
+#define SC8547_VOOC_SESSION_MS		120000
+#define SC8547_VOOC_CP_START_GRACE_MS	500
+#define SC8547_VOOC_CP_START_SETTLE_MS	500
+#define SC8547_VOOC_SESSION_END_GRACE_MS	750
+#define SC8547_VOOC_CP_GATE_RETRY_MS	250
+#define SC8547_VOOC_CP_START_MAX_VBUS_UV	9500000
+#define SC8547_VOOC_VBUS_LOW_DELTA_UV	100000
+#define SC8547_VOOC_VBUS_HIGH_DELTA_UV	200000
+/* The SC8547 ADC is quantized at 3.75 mV and the gauge sample can lag the
+ * adapter step by one protocol frame.  Allow a near-window CP start so a
+ * source that jumps past the 100 mV lower edge is loaded before it can
+ * overshoot the 10.5-V software ceiling. */
+#define SC8547_VOOC_CP_START_LOW_DELTA_UV	50000
+#define SC8547_VOOC_CP_MIN_VBUS_UV	6500000
+#define SC8547_VOOC_CP_MAX_IBUS_UA	3500000
+#define SC8547_VOOC_TOTAL_MAX_IBUS_UA	6500000
+/* Values from the stock oplus,sc8547a@6f DT node are expressed in mA. */
+#define SC8547_VOOC_SECONDARY_ENABLE_MIN_IBUS_UA	1400000
+#define SC8547_VOOC_SECONDARY_DISABLE_MIN_IBUS_UA	1100000
+#define SC8547_VOOC_SECONDARY_SAMPLE_MS	25
+#define SC8547_VOOC_SECONDARY_START_SETTLE_MS	500
+#define SC8547_VOOC_SECONDARY_ENABLE_RETRY_MS	100
+#define SC8547_VOOC_SECONDARY_ENABLE_TIMEOUT_MS	5000
+#define SC8547_VOOC_SECONDARY_DISABLE_SAMPLES	20
+#define SC8547_VOOC_POLL_MIN_US	100
+#define SC8547_VOOC_POLL_MAX_US	200
+#define SC8547_VOOC_ADC_SAMPLE_US	5000
+#define SC8547_VOOC_BATTERY_SAMPLE_US	1000000
+#define SC8547_VOOC_BATTERY_MAX_TEMP_DECIC	450
+#define SC8547_VOOC_BATTERY_MIN_TEMP_DECIC	0
+#define SC8547_VOOC_BATTERY_MAX_VOLTAGE_UV	4480000 /* stock one-/n-time full threshold */
+#define SC8547_VOOC_BATTERY_FULL_CAPACITY	100
+#define SC8547_VOOC_MAX_VBUS_UV	10500000 /* official VOOC ceiling */
+#define SC8547_VOOC_CLEANUP_VBUS_WAIT_MS	2000
+#define SC8547_VOOC_CLEANUP_VBUS_POLL_MS	50
+#define SC8547_VOOC_MAX_VBUS_ADJUST	80
+#define SC8547_VOOC_SESSION_ROUNDS	128
+#define SC8547_VOOC_RXDATA_DONE		BIT(1)
+#define SC8547_VOOC_RX_START		BIT(2)
+#define SC8547_VOOC_TXDATA_WR_FAIL	BIT(3)
+#define SC8547_VOOC_TXDATA_DONE	BIT(0)
+#define SC8547_VOOC_ERR_TRANS		BIT(4)
+#define SC8547_VOOC_NINTH_CLK_ERR	BIT(6)
+
+/* Protocol data before the SC8547's 10-bit wire bit reversal. */
+/*
+ * The board has two parallel charge pumps.  The vendor SVOOC profile writes
+ * NO_VOOC2_CIRCUIT_PARALLEL_R_L_DEF (0x16) to TX0 bits 3..7 and
+ * NO_VOOC2_CIRCUIT_PARALLEL_R_H_DEF (0x01) to TX1 bits 0..1.  The local
+ * seven-bit representation stores those fields as data[4:0] and data[6:5],
+ * respectively, so the complete value is 0x16 | (0x01 << 5).
+ */
+#define SC8547_VOOC_SAFE_R_BITS		0x36
+/* Official project-23926 SVOOC input ceiling: 6.1 A. */
+#define SC8547_VOOC_DEFAULT_CURRENT_CODE	61
+#define SC8547_VOOC_MIN_CURRENT_CODE	10 /* official 1.0-A terminal curve point */
+#define SC8547_VOOC_MAX_CURRENT_CODE	61 /* official project-23926 default */
+#define SC8547_VOOC_CURVE_CONFIRM_SAMPLES	4
+#define SC8547_VOOC_CURVE_IBUS_MARGIN_UA	1000000
+#define SC8547_VOOC_TEMP_LITTLE_COLD_DECIC	50
+#define SC8547_VOOC_TEMP_COOL_DECIC	120
+#define SC8547_VOOC_TEMP_LITTLE_COOL_DECIC	160
+#define SC8547_VOOC_TEMP_NORMAL_LOW_DECIC	350
+#define SC8547_VOOC_TEMP_NORMAL_HIGH_DECIC	440
+#define SC8547_VOOC_PRE_SVOOC		0x2002
+
+#define SC8547_VOOC_HEAD_VOOC20		0x05
+#define SC8547_VOOC_HEAD_VOOC30		0x03
+#define SC8547_VOOC_HEAD_SVOOC		0x04
+#define SC8547_VOOC_INVERT_VOOC20		0x05
+#define SC8547_VOOC_INVERT_VOOC30		0x06
+#define SC8547_VOOC_INVERT_SVOOC		0x01
+#define SC8547_VOOC_CMD_GET_BATT_VOL	0x01
+#define SC8547_VOOC_CMD_IS_VBUS_OK	0x02
+#define SC8547_VOOC_CMD_ASK_CURRENT	0x03
+#define SC8547_VOOC_CMD_ASK_FAST		0x04
+#define SC8547_VOOC_CMD_TELL_MODEL	0x05
+#define SC8547_VOOC_CMD_IDENTIFICATION	0x0c
+#define SC8547_VOOC_CMD_ASK_BAT_MODEL	0x0d
+#define SC8547_VOOC_CMD_ASK_POWER_BANK	0x06
+#define SC8547_VOOC_CMD_TELL_USB_BAD	0x09
+#define SC8547_VOOC_CMD_ASK_AP_STATUS	0x0a
+#define SC8547_VOOC_CMD_ADAPTER_CHECK	0xf1
+#define SC8547_VOOC_CMD_TELL_MODEL_PROC	0xf2
+#define SC8547_VOOC_CMD_BAT_MODEL_PROC	0xf3
+#define SC8547_VOOC_BAT_SYS_COUNT	6
 
 /*
  * OnePlus' wired PPS startup selects the 2:1 work mode, raises PPS VBUS, then
@@ -154,18 +247,23 @@
 #define SC8547A_VENDOR_PPS_MODE_2TO1	SC8547_IBUS_UCP_RISE_MASK
 #define SC8547A_VENDOR_PPS_WATCHDOG	4
 #define SC8547A_VENDOR_PPS_PMID2OUT	0x70
+#define SC8547A_VENDOR_BAT_OVP		0x36 /* official 4.65-V protection profile */
+#define SC8547A_VENDOR_BAT_OCP		0xbf
 #define SC8547A_VENDOR_PPS_LOOSE_DET	0xd1
 #define SC8547A_VENDOR_PPS_TIMING	0x60
 #define SC8547A_VENDOR_VOOCPHY_DISABLE	0x00
 #define SC8547A_VENDOR_INSERT_IRQ_MASK	0x02
 #define SC8547A_VENDOR_OTG_CTRL		0x04
-#define SC8547A_VENDOR_RESET_SS_TIMEOUT	0xe0
 #define SC8547A_VENDOR_LOW_CURRENT_SS_TIMEOUT	0x00
+#define SC8547A_VENDOR_CP_ENABLE_VBUS_OVP	0x71
+#define SC8547A_VENDOR_CP_ENABLE_IBUS_PROT	0xcf
+#define SC8547A_VENDOR_CP_ENABLE_MODE	0x10
+#define SC8547A_VENDOR_CP_ENABLE_SS_TIMEOUT	0x00
+#define SC8547A_VENDOR_CP_RUNTIME_SS_TIMEOUT	0xe0
 #define SC8547_VENDOR_SECONDARY_CTRL	0x7f
 #define SC8547_VENDOR_SECONDARY_VBUS_RANGE	0x40
-
-#define SC8547_EXPERIMENT_REVISION	"stage7d13-bounded-emergency-recovery"
-#define SC8547_EXPERIMENT_SEQUENCE	"vendor-pps-2to1"
+#define SC8547A_VENDOR_SECONDARY_IBUS_PROT	0x1c
+#define SC8547_VENDOR_SECONDARY_IBUS_PROT	0x2c
 
 /* oplus_pps_charge_start(): one initial start plus three 500-ms retries. */
 #define SC8547_VENDOR_START_RETRY_MAX	3
@@ -186,10 +284,6 @@
 #define SC8547_PREP_MISMATCH_REG3B		BIT(11)
 #define SC8547_PREP_MISMATCH_REG30		BIT(12)
 #define SC8547_PREP_MISMATCH_REG3C		BIT(13)
-
-#define SC8547_DIAG_FIRST_REG		0x00
-#define SC8547_DIAG_LAST_REG		0x11
-#define SC8547_DIAG_REG_COUNT		(SC8547_DIAG_LAST_REG + 1)
 
 #define SC8547_REG_IBUS_ADC_H		0x13
 #define SC8547_REG_VBUS_ADC_H		0x15
@@ -212,26 +306,6 @@
 #define SC8547_VBAT_UV_PER_LSB		1250
 #define SC8547_TDIE_MC_PER_LSB		500
 
-#define SC8547_POST_ENABLE_MS		500
-#define SC8547_TEST_PULSE_MS		500
-#define SC8547_SHORT_RUN_MS		2000
-#define SC8547_DUAL_RUN_MS		4000
-#define SC8547_DUAL_EXTENDED_PRIMARY_RUN_MS	6000
-#define SC8547_DUAL_CLOSED_LOOP_SECONDARY_RUN_MS	5000
-#define SC8547_DUAL_CLOSED_LOOP_PRIMARY_RUN_MS	7000
-#define SC8547_DUAL_BOOST_SECONDARY_RUN_MS	8000
-#define SC8547_DUAL_BOOST_PRIMARY_RUN_MS	10000
-#define SC8547_DUAL_SUSTAIN_SECONDARY_RUN_MS	16000
-#define SC8547_DUAL_SUSTAIN_PRIMARY_RUN_MS	18000
-#define SC8547_DUAL_LONG_SUSTAIN_SECONDARY_RUN_MS	66000
-#define SC8547_DUAL_LONG_SUSTAIN_PRIMARY_RUN_MS	68000
-#define SC8547_DUAL_SOAK_SECONDARY_RUN_MS	325000
-#define SC8547_DUAL_SOAK_PRIMARY_RUN_MS	330000
-#define SC8547_DUAL_ENDURANCE_SECONDARY_RUN_MS	625000
-#define SC8547_DUAL_ENDURANCE_PRIMARY_RUN_MS	630000
-#define SC8547_STABILITY_RUN_MS		10000
-#define SC8547_LONG_RUN_MS		60000
-#define SC8547_SOAK_RUN_MS		300000
 #define SC8547_POLICY_RUN_MS		900000
 #define SC8547_POLICY_CANCEL_CMD		2
 #define SC8547_POLICY_CONTINUOUS_CMD	3
@@ -240,21 +314,15 @@
 #define SC8547_RUNTIME_RANGE_RECHECK_MIN_US	10000
 #define SC8547_RUNTIME_RANGE_RECHECK_MAX_US	20000
 #define SC8547_POST_PREPARE_RANGE_RECHECKS	2
-#define SC8547_RUNTIME_RECORDS		8
-#define SC8547_SHORT_REPORT_INTERVAL	5
-#define SC8547_LONG_REPORT_INTERVAL	20
-#define SC8547_SOAK_REPORT_INTERVAL	100
-#define SC8547_TEST_IBUS_MAX_UA		1200000
-#define SC8547_VENDOR_CURRENT_IBUS_MAX_UA	1250000
+#define SC8547_PPS_FIXED_IBUS_MAX_UA		1200000
+#define SC8547_VENDOR_CURRENT_IBUS_MAX_UA	1650000
 #define SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA	\
 	(((SC8547_VENDOR_CURRENT_IBUS_MAX_UA + SC8547_IBUS_UA_PER_LSB - 1) / \
 	  SC8547_IBUS_UA_PER_LSB) * SC8547_IBUS_UA_PER_LSB)
-#define SC8547_TEST_EARLY_SAMPLE_MS	10
 #define SC8547_RESET_SETTLE_MS		10
 #define SC8547_ADC_READY_POLL_MS		10
 #define SC8547_ADC_READY_TIMEOUT_MS	500
 #define SC8547_ADC_READY_STABLE_SAMPLES	1
-#define SC8547_TEST_RATIO_ERROR_MAX_UV	500000
 
 enum sc8547_variant {
 	SC8547_VARIANT_UNKNOWN,
@@ -293,8 +361,8 @@ struct sc8547_raw_profile {
 struct sc8547_enable_window {
 	u32 vbus_min_uv;
 	u32 vbus_max_uv;
-	u32 pulse_vbus_min_uv;
-	u32 pulse_ratio_error_max_uv;
+	u32 active_vbus_min_uv;
+	u32 ratio_error_max_uv;
 	u32 start_delta_uv;
 	u32 start_overshoot_max_uv;
 	u32 start_reference_max_uv;
@@ -303,166 +371,23 @@ struct sc8547_enable_window {
 	bool complete;
 };
 
-struct sc8547_profile_check {
-	bool attempted;
-	bool actual_valid;
-	bool mismatch;
-	int result;
-	u8 reg;
-	u8 mask;
-	u8 expected;
-	u8 actual;
-};
-
 struct sc8547_active_sample {
-	bool valid;
-	u16 ordinal;
-	u8 reg06;
-	u8 reg07;
-	u8 reg0e;
-	u8 reg33;
-	u8 reg3a;
-	u8 reg3b;
-	u8 reg3c;
 	int vac_uv;
 	int vbus_uv;
 	int vout_uv;
 	int vbat_uv;
 	int output_reference_uv;
-	int headroom_uv;
 	int ratio_error_uv;
 	int ibus_ua;
 	int tdie_mc;
 };
 
-struct sc8547_pulse_result {
-	bool valid;
-	bool preflight_snapshot_valid;
-	bool control_snapshot_valid;
-	bool prep_snapshot_valid;
-	bool ready_snapshot_valid;
-	bool first_adc_snapshot_valid;
-	bool post_prepare_adc_snapshot_valid;
-	bool ready_extended_snapshot_valid;
-	bool enable_snapshot_valid;
-	bool early_snapshot_valid;
-	bool on_snapshot_valid;
-	bool on_extended_snapshot_valid;
-	bool final_snapshot_valid;
-	bool reject_dump_valid;
-	bool reject_extended_snapshot_valid;
-	bool restore_attempted;
-	bool rearm_attempted;
-	bool rearm_snapshot_valid;
-	bool policy_target_valid;
-	bool runtime_observed;
-	struct sc8547_profile_check restore_check;
-	int result;
-	int disable_result;
-	int restore_result;
-	int first_vbus_uv;
-	int first_vbat_uv;
-	int first_output_reference_uv;
-	int pre_vbus_uv;
-	int pre_vbat_uv;
-	int pre_output_reference_uv;
+struct sc8547_pps_run_state {
 	int target_vbus_uv;
-	int adc_wait_ms;
-	int post_prepare_vbus_uv;
-	int post_prepare_vbat_uv;
-	int post_prepare_output_reference_uv;
-	int ready_vac_uv;
-	int ready_vout_uv;
-	int on_vac_uv;
-	int on_vout_uv;
-	int reject_vac_uv;
-	int reject_vbus_uv;
-	int reject_vout_uv;
-	int reject_vbat_uv;
-	int vbus_uv;
-	int vbat_uv;
-	int output_reference_uv;
-	int headroom_uv;
-	int active_target_vbus_uv;
-	int ratio_error_uv;
-	int ibus_ua;
-	int tdie_mc;
-	int runtime_vac_min_uv;
-	int runtime_vac_max_uv;
-	int runtime_vbus_min_uv;
-	int runtime_vbus_max_uv;
-	int runtime_ratio_min_uv;
-	int runtime_ratio_max_uv;
-	int runtime_ibus_min_ua;
-	int runtime_ibus_max_ua;
-	int runtime_tdie_min_mc;
-	int runtime_tdie_max_mc;
-	u32 requested_run_ms;
 	bool vendor_current_control;
-	u32 runtime_samples;
-	u32 runtime_range_rechecks;
-	u32 runtime_range_recoveries;
-	u32 post_prepare_range_rechecks;
-	u32 post_prepare_range_recoveries;
-	u8 runtime_recorded;
-	u8 start_attempts;
-	u8 start_checks;
-	u32 prep_mismatch;
-	u8 pre_reg05;
-	u8 pre_reg08;
-	u8 pre_reg09;
-	u8 pre_reg0c;
-	u8 rearm_entry_reg09;
-	u8 rearm_entry_reg11;
-	u8 rearm_final_reg09;
-	u8 rearm_final_reg11;
-	u8 prep_reg02;
-	u8 prep_reg04;
-	u8 prep_reg05;
-	u8 prep_reg08;
-	u8 prep_reg09;
-	u8 prep_reg0c;
-	u8 prep_reg0d;
-	u8 prep_reg10;
-	u8 prep_reg11;
-	u8 prep_reg2b;
-	u8 prep_reg30;
-	u8 prep_reg3a;
-	u8 prep_reg3b;
-	u8 prep_reg3c;
-	u8 ready_reg06;
-	u8 ready_reg07;
-	u8 ready_reg0e;
-	u8 ready_reg11;
-	u8 ready_reg12;
-	u8 ready_reg33;
-	u8 ready_reg3a;
-	u8 ready_reg3b;
-	u8 ready_reg3c;
-	u8 enable_reg07;
-	u8 early_reg06;
-	u8 early_reg07;
-	u8 early_reg0e;
-	u8 on_reg06;
-	u8 on_reg07;
-	u8 on_reg0e;
-	u8 on_reg33;
-	u8 on_reg3a;
-	u8 on_reg3b;
-	u8 on_reg3c;
-	u8 final_reg06;
-	u8 final_reg07;
-	u8 reject_reg33;
-	u8 reject_reg3a;
-	u8 reject_reg3b;
-	u8 reject_reg3c;
-	u8 start_immediate_reg07[SC8547_VENDOR_START_ATTEMPTS];
-	u8 start_check_reg06[SC8547_VENDOR_START_ATTEMPTS];
-	u8 start_check_reg07[SC8547_VENDOR_START_ATTEMPTS];
-	u8 start_check_reg0e[SC8547_VENDOR_START_ATTEMPTS];
-	struct sc8547_active_sample runtime[SC8547_RUNTIME_RECORDS];
-	u8 reject_regs[SC8547_DIAG_REG_COUNT];
 };
+
+struct sc8547_vooc_curve;
 
 struct sc8547_device {
 	struct device *dev;
@@ -475,19 +400,184 @@ struct sc8547_device {
 	struct mutex lock;
 	struct sc8547_raw_profile profile;
 	struct sc8547_enable_window window;
-	struct sc8547_pulse_result pulse;
-	struct sc8547_profile_check profile_check;
 	atomic_t policy_cancel;
-	atomic_t pulse_running;
-	bool allow_experimental_control;
-	bool allow_experimental_cp_enable;
-	bool allow_experimental_cp_pulse;
+	atomic_t pps_running;
+	bool pps_capable;
+	bool vooc_capable;
+	bool vooc_auto_retry;
+	bool vooc_cable_online;
+	bool vooc_cable_state_known;
+	u8 vooc_cable_absent_count;
+	u8 vooc_active_current_code;
+	const struct sc8547_vooc_curve *vooc_curve;
+	u8 vooc_curve_index;
+	u8 vooc_curve_confirm_count;
+	u32 vooc_curve_elapsed_s;
+	bool vooc_curve_initialized;
+	int vooc_policy_capacity;
+	int vooc_policy_vbat_uv;
+	int vooc_policy_temp_decic;
+	bool vooc_policy_full;
+	bool vooc_policy_clamped;
 	bool init_done;
 	bool pps_prepared;
+	bool vooc_initialized;
 	u32 pps_target_vbus_uv;
-	u32 pulse_tdie_max_mc;
+	u32 tdie_max_mc;
 	u8 device_id;
+	int vooc_last_vbus_uv;
+	int vooc_last_ibus_ua;
+	bool vooc_last_cp_started;
+	/* Per-session protocol context.  These fields are reset for every session. */
+	u8 vooc_tx_head;
+	u8 vooc_adapter_model_detect_remaining;
+	u8 vooc_commu_remaining;
+	u8 vooc_model_remaining;
+	u8 vooc_batt_remaining;
+	u8 vooc_ident_next_l;
+	u8 vooc_ident_next_h;
+	u16 vooc_ident_local;
+	u16 vooc_ident_far;
+	u8 vooc_adapter_model;
+	bool vooc_adapter_check_ok;
+	bool vooc_model_done;
+	bool vooc_batt_model_done;
+	unsigned int vooc_auto_retry_count;
+	int vooc_last_total_ibus_ua;
+	atomic_t vooc_retry_running;
+	struct workqueue_struct *vooc_wq;
+	struct delayed_work vooc_retry_work;
+	struct delayed_work vooc_cable_work;
+	struct notifier_block vooc_psy_nb;
 };
+
+struct sc8547_vooc_battery_state {
+	int capacity;
+	int voltage_uv;
+	int temp_decic;
+	int status;
+};
+
+struct sc8547_vooc_curve_point {
+	u32 target_vbat_uv;
+	u8 target_ibus_code;
+	bool exit;
+	u16 target_time_s;
+};
+
+struct sc8547_vooc_curve {
+	const struct sc8547_vooc_curve_point *points;
+	u8 count;
+	const char *name;
+};
+
+#define SC8547_CURVE_POINT(_mv, _code, _exit, _time) \
+	{ .target_vbat_uv = (_mv) * 1000U, .target_ibus_code = (_code), \
+	  .exit = (_exit), .target_time_s = (_time) }
+#define SC8547_CURVE(_array) \
+	{ .points = (_array), .count = ARRAY_SIZE(_array), .name = #_array }
+
+/* Project 23926's exact SVOOC curves from oplus-chg-23926.dtsi. */
+static const struct sc8547_vooc_curve_point svooc_0_50_little_cold[] = {
+	SC8547_CURVE_POINT(4200, 25, 0, 0), SC8547_CURVE_POINT(4455, 20, 0, 0),
+	SC8547_CURVE_POINT(4455, 15, 0, 0), SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_0_50_cool[] = {
+	SC8547_CURVE_POINT(4180, 40, 0, 0), SC8547_CURVE_POINT(4455, 25, 0, 0),
+	SC8547_CURVE_POINT(4455, 20, 0, 0), SC8547_CURVE_POINT(4455, 15, 0, 0),
+	SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_0_50_little_cool[] = {
+	SC8547_CURVE_POINT(4200, 50, 0, 1440), SC8547_CURVE_POINT(4400, 30, 0, 0),
+	SC8547_CURVE_POINT(4400, 25, 0, 0), SC8547_CURVE_POINT(4470, 20, 0, 0),
+	SC8547_CURVE_POINT(4470, 15, 0, 0), SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_0_50_normal_low[] = {
+	SC8547_CURVE_POINT(4250, 61, 0, 840), SC8547_CURVE_POINT(4250, 50, 0, 1440),
+	SC8547_CURVE_POINT(4400, 40, 0, 0), SC8547_CURVE_POINT(4470, 30, 0, 0),
+	SC8547_CURVE_POINT(4470, 25, 0, 0), SC8547_CURVE_POINT(4470, 20, 0, 0),
+	SC8547_CURVE_POINT(4470, 15, 0, 0), SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_0_50_normal_high[] = {
+	SC8547_CURVE_POINT(4250, 50, 0, 1440), SC8547_CURVE_POINT(4400, 40, 0, 0),
+	SC8547_CURVE_POINT(4470, 30, 0, 0), SC8547_CURVE_POINT(4470, 25, 0, 0),
+	SC8547_CURVE_POINT(4470, 20, 0, 0), SC8547_CURVE_POINT(4470, 15, 0, 0),
+	SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_warm[] = {
+	SC8547_CURVE_POINT(4130, 20, 1, 0),
+};
+
+/* 50-75% is identical to 0-50% except for the little-cold first point. */
+static const struct sc8547_vooc_curve_point svooc_50_75_little_cold[] = {
+	SC8547_CURVE_POINT(4455, 20, 0, 0), SC8547_CURVE_POINT(4455, 15, 0, 0),
+	SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_75_85_little_cold[] = {
+	SC8547_CURVE_POINT(4455, 20, 0, 0), SC8547_CURVE_POINT(4455, 15, 0, 0),
+	SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_75_85_cool[] = {
+	SC8547_CURVE_POINT(4455, 25, 0, 0), SC8547_CURVE_POINT(4455, 20, 0, 0),
+	SC8547_CURVE_POINT(4455, 15, 0, 0), SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_75_85_little_cool[] = {
+	SC8547_CURVE_POINT(4400, 30, 0, 0), SC8547_CURVE_POINT(4400, 25, 0, 0),
+	SC8547_CURVE_POINT(4470, 20, 0, 0), SC8547_CURVE_POINT(4470, 15, 0, 0),
+	SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_75_85_normal[] = {
+	SC8547_CURVE_POINT(4400, 40, 0, 0), SC8547_CURVE_POINT(4470, 30, 0, 0),
+	SC8547_CURVE_POINT(4470, 25, 0, 0), SC8547_CURVE_POINT(4470, 20, 0, 0),
+	SC8547_CURVE_POINT(4470, 15, 0, 0), SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_85_90_little_cold[] = {
+	SC8547_CURVE_POINT(4455, 20, 0, 0), SC8547_CURVE_POINT(4455, 15, 0, 0),
+	SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_85_90_cool[] = {
+	SC8547_CURVE_POINT(4455, 25, 0, 0), SC8547_CURVE_POINT(4455, 20, 0, 0),
+	SC8547_CURVE_POINT(4455, 15, 0, 0), SC8547_CURVE_POINT(4465, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_85_90_little_cool[] = {
+	SC8547_CURVE_POINT(4470, 20, 0, 0), SC8547_CURVE_POINT(4470, 15, 0, 0),
+	SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+static const struct sc8547_vooc_curve_point svooc_85_90_normal[] = {
+	SC8547_CURVE_POINT(4470, 30, 0, 0), SC8547_CURVE_POINT(4470, 25, 0, 0),
+	SC8547_CURVE_POINT(4470, 20, 0, 0), SC8547_CURVE_POINT(4470, 15, 0, 0),
+	SC8547_CURVE_POINT(4480, 10, 1, 0),
+};
+
+static const struct sc8547_vooc_curve curve_0_50_little_cold =
+	SC8547_CURVE(svooc_0_50_little_cold);
+static const struct sc8547_vooc_curve curve_0_50_cool =
+	SC8547_CURVE(svooc_0_50_cool);
+static const struct sc8547_vooc_curve curve_0_50_little_cool =
+	SC8547_CURVE(svooc_0_50_little_cool);
+static const struct sc8547_vooc_curve curve_0_50_normal_low =
+	SC8547_CURVE(svooc_0_50_normal_low);
+static const struct sc8547_vooc_curve curve_0_50_normal_high =
+	SC8547_CURVE(svooc_0_50_normal_high);
+static const struct sc8547_vooc_curve curve_warm = SC8547_CURVE(svooc_warm);
+static const struct sc8547_vooc_curve curve_50_75_little_cold =
+	SC8547_CURVE(svooc_50_75_little_cold);
+static const struct sc8547_vooc_curve curve_75_85_little_cold =
+	SC8547_CURVE(svooc_75_85_little_cold);
+static const struct sc8547_vooc_curve curve_75_85_cool =
+	SC8547_CURVE(svooc_75_85_cool);
+static const struct sc8547_vooc_curve curve_75_85_little_cool =
+	SC8547_CURVE(svooc_75_85_little_cool);
+static const struct sc8547_vooc_curve curve_75_85_normal =
+	SC8547_CURVE(svooc_75_85_normal);
+static const struct sc8547_vooc_curve curve_85_90_little_cold =
+	SC8547_CURVE(svooc_85_90_little_cold);
+static const struct sc8547_vooc_curve curve_85_90_cool =
+	SC8547_CURVE(svooc_85_90_cool);
+static const struct sc8547_vooc_curve curve_85_90_little_cool =
+	SC8547_CURVE(svooc_85_90_little_cool);
+static const struct sc8547_vooc_curve curve_85_90_normal =
+	SC8547_CURVE(svooc_85_90_normal);
 
 static const struct regmap_config sc8547_regmap_config = {
 	.reg_bits = 8,
@@ -539,26 +629,30 @@ sc8547_detect_variant(struct sc8547_device *sc, u8 device_id)
 	return SC8547_VARIANT_UNKNOWN;
 }
 
-static int sc8547_apply_experimental_init(struct sc8547_device *sc);
+static int sc8547_restore_idle_profile(struct sc8547_device *sc);
 static int sc8547_prepare_vendor_pps_startup(
-	struct sc8547_device *sc, struct sc8547_pulse_result *p, bool *touched);
-static int sc8547_bounded_pps_pulse(struct sc8547_device *sc,
+	struct sc8547_device *sc, bool *touched);
+static int sc8547_run_pps_bounded(struct sc8547_device *sc,
 				    unsigned int run_ms,
 				    bool vendor_current_control);
-static int sc8547_continuous_pps_run(struct sc8547_device *sc);
+static int sc8547_run_pps_continuous(struct sc8547_device *sc);
 
 /*
- * Match the downstream role/variant-specific whole-register writes.  In
- * particular, an SC8547A primary uses 0x80/0x00 rather than inheriting the
- * non-A 0x04 reset value.  Secondary devices carry the downstream bit-0 role
- * setting. Bounded control is separately gated per physical pump role.
+ * Match the downstream whole-register charge commands.  The original
+ * SC8547 uses bit 2 as a persistent role/configuration bit, while the
+ * SC8547A vendor driver uses the plain enable bit (0x80/0x00). Secondary
+ * devices carry the downstream bit-0 role setting. Bounded control is
+ * separately gated per physical pump role.
  */
 static u8 sc8547_charge_command(const struct sc8547_device *sc, bool enable)
 {
-	u8 value = enable ? SC8547_CHG_EN : 0;
+	u8 value;
 
-	if (sc->variant == SC8547_VARIANT_SC8547)
-		value |= BIT(2);
+	if (sc->variant == SC8547_VARIANT_SC8547A)
+		value = enable ? SC8547_CHG_EN : 0;
+	else
+		value = BIT(2) | (enable ? SC8547_CHG_EN : 0);
+
 	if (!strcmp(sc->role, "secondary"))
 		value |= BIT(0);
 
@@ -569,13 +663,6 @@ static int sc8547_set_charge_enabled(struct sc8547_device *sc, bool enable)
 {
 	return regmap_write(sc->regmap, SC8547_REG_CHG_CTRL,
 			    sc8547_charge_command(sc, enable));
-}
-
-static int sc8547_set_work_mode(struct sc8547_device *sc, bool bypass)
-{
-	return regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
-				 SC8547_CHARGE_MODE,
-				 bypass ? SC8547_CHARGE_MODE : 0);
 }
 
 static int sc8547_set_adc_enabled(struct sc8547_device *sc, bool enable)
@@ -597,33 +684,6 @@ static int sc8547_set_watchdog_code(struct sc8547_device *sc, unsigned int code)
 
 	return regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
 				 SC8547_WATCHDOG_MASK, code);
-}
-
-static int sc8547_watchdog_code_from_ms(unsigned int timeout_ms,
-					unsigned int *code)
-{
-	switch (timeout_ms) {
-	case 0:
-		*code = 0;
-		return 0;
-	case 200:
-		*code = 1;
-		return 0;
-	case 500:
-		*code = 2;
-		return 0;
-	case 1000:
-		*code = 3;
-		return 0;
-	case 5000:
-		*code = 4;
-		return 0;
-	case 30000:
-		*code = 5;
-		return 0;
-	default:
-		return -EINVAL;
-	}
 }
 
 static int sc8547_read_adc(struct sc8547_device *sc, unsigned int reg,
@@ -663,6 +723,315 @@ static int sc8547_get_vbat_uv(struct sc8547_device *sc)
 			       SC8547_ADC_12BIT_H_MASK, SC8547_VBAT_UV_PER_LSB);
 }
 
+/* VOOC normally compares VBUS with the system-gauge battery voltage.  During
+ * the hand-off from the USB buck to the charge pump the gauge can briefly
+ * sag while the SC8547A local VBAT protection ADC still sees the cell's real
+ * voltage.  Use the higher valid reading for the start decision so the pump
+ * cannot be enabled below the hardware's own 2:1 VBUS threshold. */
+static int sc8547_get_vooc_bat_uv(struct sc8547_device *sc)
+{
+	struct power_supply *psy;
+	union power_supply_propval val = { };
+	int ret;
+	int gauge_uv = -ENODATA;
+	int local_uv;
+
+	psy = power_supply_get_by_name("qcom-battmgr-bat");
+	if (psy) {
+		ret = power_supply_get_property(psy,
+				POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+		power_supply_put(psy);
+		if (!ret && val.intval > 0)
+			gauge_uv = val.intval;
+	}
+
+	local_uv = sc8547_get_vbat_uv(sc);
+	if (local_uv < 0)
+		return gauge_uv;
+	if (gauge_uv < 0)
+		return local_uv;
+
+	return max(gauge_uv, local_uv);
+}
+
+/*
+ * Read the system-gauge values used by the vendor current strategy.  The
+ * charge-pump ADC is useful for the 2:1 gate, but it cannot tell us whether
+ * the battery has entered the terminal taper region.  Fast charge is refused
+ * when the two safety-critical gauge values (cell voltage and temperature)
+ * are unavailable.
+ */
+static int sc8547_get_vooc_battery_state(struct sc8547_vooc_battery_state *state)
+{
+	struct power_supply *psy;
+	union power_supply_propval val = { };
+	int ret;
+
+	if (!state)
+		return -EINVAL;
+
+	state->capacity = -ENODATA;
+	state->voltage_uv = -ENODATA;
+	state->temp_decic = -ENODATA;
+	state->status = -ENODATA;
+	psy = power_supply_get_by_name("qcom-battmgr-bat");
+	if (!psy)
+		return -ENODEV;
+
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+					       &val);
+	if (ret)
+		goto out_put;
+	state->voltage_uv = val.intval;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val);
+	if (ret)
+		goto out_put;
+	state->temp_decic = val.intval;
+	ret = qcom_battmgr_caihong_get_raw_capacity(psy);
+	if (ret >= 0)
+		state->capacity = ret;
+	else if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY,
+					    &val))
+		state->capacity = val.intval;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val))
+		state->status = val.intval;
+	ret = 0;
+
+out_put:
+	power_supply_put(psy);
+	return ret;
+}
+
+static void sc8547_queue_vooc_retry(struct sc8547_device *sc,
+				    unsigned long delay)
+{
+	/* The continuous protocol exchange can remain active for the whole cable
+	 * session.  Keep it off system_wq so early boot power-supply notifications,
+	 * display setup and networking always retain their workers. */
+	mod_delayed_work(sc->vooc_wq, &sc->vooc_retry_work, delay);
+}
+
+static void sc8547_destroy_vooc_workqueue(void *data)
+{
+	destroy_workqueue(data);
+}
+
+static const struct sc8547_vooc_curve *
+sc8547_vooc_select_curve(const struct sc8547_vooc_battery_state *state)
+{
+	bool little_cold, cool, little_cool, normal_low, normal_high;
+
+	little_cold = state->temp_decic < SC8547_VOOC_TEMP_LITTLE_COLD_DECIC;
+	cool = state->temp_decic >= SC8547_VOOC_TEMP_LITTLE_COLD_DECIC &&
+		state->temp_decic < SC8547_VOOC_TEMP_COOL_DECIC;
+	little_cool = state->temp_decic >= SC8547_VOOC_TEMP_COOL_DECIC &&
+		state->temp_decic < SC8547_VOOC_TEMP_LITTLE_COOL_DECIC;
+	normal_low = state->temp_decic >= SC8547_VOOC_TEMP_LITTLE_COOL_DECIC &&
+		state->temp_decic < SC8547_VOOC_TEMP_NORMAL_LOW_DECIC;
+	normal_high = state->temp_decic >= SC8547_VOOC_TEMP_NORMAL_LOW_DECIC &&
+		state->temp_decic < SC8547_VOOC_TEMP_NORMAL_HIGH_DECIC;
+
+	if (!little_cold && !cool && !little_cool && !normal_low && !normal_high)
+		return &curve_warm;
+
+	if (state->capacity <= 50) {
+		if (little_cold)
+			return &curve_0_50_little_cold;
+		if (cool)
+			return &curve_0_50_cool;
+		if (little_cool)
+			return &curve_0_50_little_cool;
+		if (normal_low)
+			return &curve_0_50_normal_low;
+		return &curve_0_50_normal_high;
+	}
+
+	if (state->capacity <= 75) {
+		if (little_cold)
+			return &curve_50_75_little_cold;
+		if (cool)
+			return &curve_0_50_cool;
+		if (little_cool)
+			return &curve_0_50_little_cool;
+		if (normal_low)
+			return &curve_0_50_normal_low;
+		return &curve_0_50_normal_high;
+	}
+
+	if (state->capacity <= 85) {
+		if (little_cold)
+			return &curve_75_85_little_cold;
+		if (cool)
+			return &curve_75_85_cool;
+		if (little_cool)
+			return &curve_75_85_little_cool;
+		return &curve_75_85_normal;
+	}
+
+	if (little_cold)
+		return &curve_85_90_little_cold;
+	if (cool)
+		return &curve_85_90_cool;
+	if (little_cool)
+		return &curve_85_90_little_cool;
+	return &curve_85_90_normal;
+}
+
+static void sc8547_vooc_reset_curve(struct sc8547_device *sc)
+{
+	sc->vooc_curve = NULL;
+	sc->vooc_curve_index = 0;
+	sc->vooc_curve_confirm_count = 0;
+	sc->vooc_curve_elapsed_s = 0;
+	sc->vooc_curve_initialized = false;
+}
+
+static int sc8547_vooc_initialize_curve(
+		struct sc8547_device *sc,
+		const struct sc8547_vooc_battery_state *state)
+{
+	const struct sc8547_vooc_curve_point *point;
+	const struct sc8547_vooc_curve *curve;
+	u8 i;
+
+	if (state->capacity > 90)
+		return -EALREADY;
+	curve = sc8547_vooc_select_curve(state);
+	if (!curve || !curve->count)
+		return -EINVAL;
+
+	sc->vooc_curve = curve;
+	sc->vooc_curve_index = 0;
+	/* The stock implementation enters at the first non-exit point whose
+	 * target is not below the plug-in battery voltage. */
+	for (i = 0; i < curve->count; i++) {
+		point = &curve->points[i];
+		if (!point->exit && state->voltage_uv <= point->target_vbat_uv) {
+			sc->vooc_curve_index = i;
+			break;
+		}
+	}
+	sc->vooc_curve_confirm_count = 0;
+	sc->vooc_curve_elapsed_s = 0;
+	sc->vooc_curve_initialized = true;
+	point = &curve->points[sc->vooc_curve_index];
+	dev_info(sc->dev,
+		 "VOOC selected stock curve=%s plugin_capacity=%d plugin_temp=%d index=%u target_vbat=%u target_code=%u time=%u exit=%u\n",
+		 curve->name, state->capacity, state->temp_decic,
+		 sc->vooc_curve_index, point->target_vbat_uv,
+		 point->target_ibus_code, point->target_time_s, point->exit);
+	return 0;
+}
+
+static int sc8547_update_vooc_current_policy(struct sc8547_device *sc)
+{
+	struct sc8547_vooc_battery_state state;
+	const struct sc8547_vooc_curve_point *point;
+	u8 requested, active;
+	bool full;
+	bool reduce_active;
+	bool advance = false;
+	int ret;
+
+	ret = sc8547_get_vooc_battery_state(&state);
+	if (ret)
+		return ret;
+	if (state.voltage_uv <= 0 || state.temp_decic < -1000)
+		return -ENODATA;
+
+	sc->vooc_policy_capacity = state.capacity;
+	sc->vooc_policy_vbat_uv = state.voltage_uv;
+	sc->vooc_policy_temp_decic = state.temp_decic;
+	full = state.status == POWER_SUPPLY_STATUS_FULL ||
+		(state.capacity >= SC8547_VOOC_BATTERY_FULL_CAPACITY) ||
+		(state.voltage_uv >= SC8547_VOOC_BATTERY_MAX_VOLTAGE_UV);
+	sc->vooc_policy_full = full;
+	if (state.temp_decic < SC8547_VOOC_BATTERY_MIN_TEMP_DECIC ||
+	    state.temp_decic > SC8547_VOOC_BATTERY_MAX_TEMP_DECIC)
+		return -ERANGE;
+	if (full) {
+		dev_info(sc->dev,
+			 "VOOC terminal condition status=%d raw_capacity=%d vbat=%d\n",
+			 state.status, state.capacity, state.voltage_uv);
+		return -EALREADY;
+	}
+	if (!sc->vooc_curve_initialized) {
+		ret = sc8547_vooc_initialize_curve(sc, &state);
+		if (ret)
+			return ret;
+	}
+	if (!sc->vooc_curve || sc->vooc_curve_index >= sc->vooc_curve->count)
+		return -EINVAL;
+
+	point = &sc->vooc_curve->points[sc->vooc_curve_index];
+	/* Match oplus_voocphy_request_fastchg_curv(): inspect the real terminal
+	 * voltage once per second, require four consecutive qualifying samples,
+	 * and retain the curve across the lower-current re-handshake.  target_time
+	 * is a maximum dwell, not a minimum charge duration. */
+	if (sc->vooc_initialized && sc->vooc_last_cp_started &&
+	    sc->vooc_last_total_ibus_ua > 0 && !point->exit) {
+		if (sc->vooc_curve_elapsed_s < U32_MAX)
+			sc->vooc_curve_elapsed_s++;
+		if (state.voltage_uv > point->target_vbat_uv &&
+		    sc->vooc_last_total_ibus_ua <
+			(point->target_ibus_code * 100000U +
+			 SC8547_VOOC_CURVE_IBUS_MARGIN_UA)) {
+			if (sc->vooc_curve_confirm_count < U8_MAX)
+				sc->vooc_curve_confirm_count++;
+		} else {
+			sc->vooc_curve_confirm_count = 0;
+		}
+		advance = sc->vooc_curve_confirm_count >=
+			SC8547_VOOC_CURVE_CONFIRM_SAMPLES ||
+			(point->target_time_s &&
+			 sc->vooc_curve_elapsed_s >= point->target_time_s);
+		if (advance && sc->vooc_curve_index + 1 < sc->vooc_curve->count) {
+			u8 old_index = sc->vooc_curve_index;
+
+			sc->vooc_curve_index++;
+			sc->vooc_curve_confirm_count = 0;
+			sc->vooc_curve_elapsed_s = 0;
+			point = &sc->vooc_curve->points[sc->vooc_curve_index];
+			dev_info(sc->dev,
+				 "VOOC stock curve advanced %u->%u vbat=%d total_ibus=%d next_code=%u next_vbat=%u exit=%u\n",
+				 old_index, sc->vooc_curve_index, state.voltage_uv,
+				 sc->vooc_last_total_ibus_ua,
+				 point->target_ibus_code, point->target_vbat_uv,
+				 point->exit);
+		}
+	}
+
+	requested = clamp_t(u8, SC8547_VOOC_DEFAULT_CURRENT_CODE,
+				SC8547_VOOC_MIN_CURRENT_CODE,
+				SC8547_VOOC_MAX_CURRENT_CODE);
+	active = min_t(u8, requested, point->target_ibus_code);
+	if (active < SC8547_VOOC_MIN_CURRENT_CODE)
+		active = SC8547_VOOC_MIN_CURRENT_CODE;
+	reduce_active = sc->vooc_initialized &&
+		active < sc->vooc_active_current_code;
+
+	if (sc->vooc_active_current_code != active ||
+	    sc->vooc_policy_clamped != (active < requested))
+		dev_info(sc->dev,
+			 "VOOC battery policy capacity=%d vbat=%d temp=%d code=%u requested=%u curve=%s index=%u elapsed=%u confirm=%u\n",
+			 state.capacity, state.voltage_uv, state.temp_decic,
+			 active, requested, sc->vooc_curve->name,
+			 sc->vooc_curve_index, sc->vooc_curve_elapsed_s,
+			 sc->vooc_curve_confirm_count);
+	sc->vooc_active_current_code = active;
+	sc->vooc_policy_clamped = active < requested;
+	if (reduce_active) {
+		/* The adapter may not issue another ASK_CURRENT frame promptly.
+		 * End this exchange and let the bounded retry re-handshake with the
+		 * lower official curve point instead of carrying the old current. */
+		dev_warn(sc->dev,
+			 "VOOC battery policy reduced current %u -> %u; restarting handshake\n",
+			 requested, active);
+		return -EAGAIN;
+	}
+	return 0;
+}
+
 static int sc8547_get_vout_uv(struct sc8547_device *sc)
 {
 	return sc8547_read_adc(sc, SC8547_REG_VOUT_ADC_H,
@@ -679,12 +1048,6 @@ static int sc8547_get_vout_uv(struct sc8547_device *sc)
 static bool sc8547_uses_vout_reference(const struct sc8547_device *sc)
 {
 	return !strcmp(sc->role, "secondary");
-}
-
-static const char *
-sc8547_output_reference_source(const struct sc8547_device *sc)
-{
-	return sc8547_uses_vout_reference(sc) ? "vout" : "vbat";
 }
 
 static int sc8547_get_output_reference_uv(struct sc8547_device *sc)
@@ -707,41 +1070,6 @@ static int sc8547_get_vac_uv(struct sc8547_device *sc)
 			       SC8547_ADC_12BIT_H_MASK, SC8547_VAC_UV_PER_LSB);
 }
 
-static int sc8547_capture_path_snapshot(struct sc8547_device *sc,
-					 int *vac_uv, int *vout_uv,
-					 u8 *reg33, u8 *reg3a,
-					 u8 *reg3b, u8 *reg3c)
-{
-	unsigned int val;
-	int ret;
-
-	*vac_uv = sc8547_get_vac_uv(sc);
-	if (*vac_uv < 0)
-		return *vac_uv;
-	*vout_uv = sc8547_get_vout_uv(sc);
-	if (*vout_uv < 0)
-		return *vout_uv;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_LOOSE_DET, &val);
-	if (ret)
-		return ret;
-	*reg33 = val;
-	ret = regmap_read(sc->regmap, SC8547_REG_VOOCPHY_TIMING, &val);
-	if (ret)
-		return ret;
-	*reg3a = val;
-	ret = regmap_read(sc->regmap, SC8547A_REG_OTG_CTRL, &val);
-	if (ret)
-		return ret;
-	*reg3b = val;
-	ret = regmap_read(sc->regmap, SC8547_REG_VBUS_RANGE_CTRL, &val);
-	if (ret)
-		return ret;
-	*reg3c = val;
-
-	return 0;
-}
-
 static int sc8547_get_tdie_mc(struct sc8547_device *sc)
 {
 	return sc8547_read_adc(sc, SC8547_REG_TDIE_ADC_H,
@@ -749,7 +1077,7 @@ static int sc8547_get_tdie_mc(struct sc8547_device *sc)
 }
 
 static int sc8547_read_status(struct sc8547_device *sc,
-			       unsigned int *reg06, unsigned int *reg0e)
+				       unsigned int *reg06, unsigned int *reg0e)
 {
 	int ret;
 
@@ -771,84 +1099,6 @@ static bool sc8547_has_fatal_fault(unsigned int reg06, unsigned int reg0e)
 	return !!((reg06 & SC8547_FATAL_06) ||
 		  (reg0e & SC8547_FATAL_0E));
 }
-
-
-static enum sc8547_api_variant
-sc8547_to_api_variant(enum sc8547_variant variant)
-{
-	switch (variant) {
-	case SC8547_VARIANT_SC8547:
-		return SC8547_API_VARIANT_SC8547;
-	case SC8547_VARIANT_SC8547A:
-		return SC8547_API_VARIANT_SC8547A;
-	case SC8547_VARIANT_SC8547D:
-		return SC8547_API_VARIANT_SC8547D;
-	default:
-		return SC8547_API_VARIANT_UNKNOWN;
-	}
-}
-
-static struct sc8547_device *sc8547_from_client(struct i2c_client *client)
-{
-	if (!client || !client->dev.driver ||
-	    strcmp(client->dev.driver->name, "sc8547"))
-		return NULL;
-
-	return i2c_get_clientdata(client);
-}
-
-int sc8547_get_state(struct i2c_client *client, struct sc8547_state *state)
-{
-	struct sc8547_device *sc = sc8547_from_client(client);
-	unsigned int reg06, reg07, reg09, reg0e;
-	int ret;
-
-	if (!sc || !state)
-		return -ENODEV;
-
-	mutex_lock(&sc->lock);
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
-	if (ret)
-		goto out;
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg09);
-	if (ret)
-		goto out;
-	ret = sc8547_read_status(sc, &reg06, &reg0e);
-	if (ret)
-		goto out;
-
-	state->variant = sc8547_to_api_variant(sc->variant);
-	state->device_id = sc->device_id;
-	state->initialized = sc->init_done;
-	state->stage4_authorized = sc->allow_experimental_cp_enable &&
-				   sc->window.complete &&
-				   sc8547_variant_control_supported(sc->variant);
-	state->enabled = !!(reg07 & SC8547_CHG_EN);
-	state->switching = !!(reg06 & SC8547_CP_SWITCHING_STAT);
-	state->bypass = !!(reg09 & SC8547_CHARGE_MODE);
-	state->blocking_fault = sc8547_has_blocking_fault(reg06, reg0e);
-
-	state->vbus_uv = sc8547_get_vbus_uv(sc);
-	if (state->vbus_uv < 0) {
-		ret = state->vbus_uv;
-		goto out;
-	}
-	state->vbat_uv = sc8547_get_vbat_uv(sc);
-	if (state->vbat_uv < 0) {
-		ret = state->vbat_uv;
-		goto out;
-	}
-	state->ibus_ua = sc8547_get_ibus_ua(sc);
-	if (state->ibus_ua < 0) {
-		ret = state->ibus_ua;
-		goto out;
-	}
-	ret = 0;
-out:
-	mutex_unlock(&sc->lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sc8547_get_state);
 
 static enum power_supply_property sc8547_psy_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
@@ -935,16 +1185,15 @@ static int sc8547_psy_get_property(struct power_supply *psy,
 }
 
 /*
- * Development-only coordination hook used by qcom_battmgr's explicitly
- * opted-in PPS test.  Preparing before the source ramp reproduces the vendor
- * order; clearing the property restores the bounded, pump-off raw profile.
+ * qcom_battmgr coordinates source voltage and charge-pump startup through
+ * these standard power-supply properties.  Keep this interface deliberately
+ * small: target voltage, prepare, run, cancel and restore.
  */
 static int sc8547_psy_set_property(struct power_supply *psy,
 				   enum power_supply_property psp,
 				   const union power_supply_propval *val)
 {
 	struct sc8547_device *sc = power_supply_get_drvdata(psy);
-	struct sc8547_pulse_result prep = { };
 	bool touched = false;
 	int ret;
 
@@ -970,7 +1219,7 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 			ret = 0;
 			goto out;
 		}
-		if (val->intval < 0 || !sc->allow_experimental_cp_pulse ||
+		if (val->intval < 0 || !sc->pps_capable ||
 		    !sc->window.complete ||
 		    !sc8547_bounded_role_supported(sc)) {
 			ret = -EPERM;
@@ -988,7 +1237,7 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 		 * fail-closed profile previously reached through apply_init.
 		 */
 		if (!sc->init_done) {
-			ret = sc8547_apply_experimental_init(sc);
+			ret = sc8547_restore_idle_profile(sc);
 			if (ret)
 				goto out;
 		}
@@ -996,113 +1245,15 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 		ret = 0;
 		goto out;
 	}
-	if (val->intval == SC8547_TEST_PULSE_MS ||
-	    val->intval == SC8547_SHORT_RUN_MS ||
-	    val->intval == SC8547_DUAL_RUN_MS ||
-	    val->intval == SC8547_DUAL_EXTENDED_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_CLOSED_LOOP_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_CLOSED_LOOP_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_BOOST_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_BOOST_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_SUSTAIN_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_SUSTAIN_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_LONG_SUSTAIN_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_LONG_SUSTAIN_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_SOAK_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_SOAK_PRIMARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_ENDURANCE_SECONDARY_RUN_MS ||
-	    val->intval == SC8547_DUAL_ENDURANCE_PRIMARY_RUN_MS) {
-		if (val->intval == SC8547_DUAL_EXTENDED_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_CLOSED_LOOP_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_CLOSED_LOOP_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_BOOST_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_BOOST_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_SUSTAIN_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_SUSTAIN_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_LONG_SUSTAIN_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_LONG_SUSTAIN_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_SOAK_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_SOAK_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_ENDURANCE_SECONDARY_RUN_MS &&
-		    strcmp(sc->role, "secondary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		if (val->intval == SC8547_DUAL_ENDURANCE_PRIMARY_RUN_MS &&
-		    strcmp(sc->role, "primary")) {
-			ret = -EPERM;
-			goto out;
-		}
-		ret = sc8547_bounded_pps_pulse(
-			sc, val->intval,
-			val->intval == SC8547_DUAL_BOOST_SECONDARY_RUN_MS ||
-			val->intval == SC8547_DUAL_BOOST_PRIMARY_RUN_MS ||
-			val->intval == SC8547_DUAL_SUSTAIN_SECONDARY_RUN_MS ||
-			val->intval == SC8547_DUAL_SUSTAIN_PRIMARY_RUN_MS ||
-			val->intval ==
-				SC8547_DUAL_LONG_SUSTAIN_SECONDARY_RUN_MS ||
-			val->intval == SC8547_DUAL_LONG_SUSTAIN_PRIMARY_RUN_MS ||
-			val->intval == SC8547_DUAL_SOAK_SECONDARY_RUN_MS ||
-			val->intval == SC8547_DUAL_SOAK_PRIMARY_RUN_MS ||
-			val->intval ==
-				SC8547_DUAL_ENDURANCE_SECONDARY_RUN_MS ||
-			val->intval == SC8547_DUAL_ENDURANCE_PRIMARY_RUN_MS);
-		goto out;
-	}
 	if (val->intval == SC8547_POLICY_CONTINUOUS_CMD) {
-		ret = sc8547_continuous_pps_run(sc);
+		ret = sc8547_run_pps_continuous(sc);
 		goto out;
 	}
-	if (val->intval == SC8547_SOAK_RUN_MS ||
-	    val->intval == SC8547_POLICY_RUN_MS) {
+	if (val->intval == SC8547_POLICY_RUN_MS) {
 		if (strcmp(sc->role, "primary"))
 			ret = -EPERM;
 		else
-			ret = sc8547_bounded_pps_pulse(sc, val->intval, false);
+			ret = sc8547_run_pps_bounded(sc, val->intval, false);
 		goto out;
 	}
 	if (val->intval != 0 && val->intval != 1) {
@@ -1110,27 +1261,27 @@ static int sc8547_psy_set_property(struct power_supply *psy,
 		goto out;
 	}
 	if (!val->intval) {
-		ret = sc8547_apply_experimental_init(sc);
+		ret = sc8547_restore_idle_profile(sc);
 		goto out;
 	}
 
-	if (!sc->allow_experimental_cp_pulse || !sc->window.complete ||
+	if (!sc->pps_capable || !sc->window.complete ||
 	    !sc8547_bounded_role_supported(sc)) {
 		ret = -EPERM;
 		goto out;
 	}
 	if (!sc->init_done) {
-		ret = sc8547_apply_experimental_init(sc);
+		ret = sc8547_restore_idle_profile(sc);
 		if (ret)
 			goto out;
 	}
 	atomic_set(&sc->policy_cancel, 0);
 
-	ret = sc8547_prepare_vendor_pps_startup(sc, &prep, &touched);
+	ret = sc8547_prepare_vendor_pps_startup(sc, &touched);
 	if (!ret)
 		sc->pps_prepared = true;
 	else if (touched)
-		sc8547_apply_experimental_init(sc);
+		sc8547_restore_idle_profile(sc);
 out:
 	mutex_unlock(&sc->lock);
 	return ret;
@@ -1143,571 +1294,45 @@ static int sc8547_psy_property_is_writeable(struct power_supply *psy,
 	       psp == POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT;
 }
 
-static ssize_t device_id_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
+static void sc8547_init_board_config(struct sc8547_device *sc)
 {
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "0x%02x\n", sc->device_id);
-}
-static DEVICE_ATTR_RO(device_id);
-
-static ssize_t variant_show(struct device *dev,
-			    struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%s\n", sc8547_variant_name(sc->variant));
-}
-static DEVICE_ATTR_RO(variant);
-
-static ssize_t role_show(struct device *dev,
-			 struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%s\n", sc->role);
-}
-static DEVICE_ATTR_RO(role);
-
-static ssize_t charge_enabled_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", !!(val & SC8547_CHG_EN));
-}
-static DEVICE_ATTR_RO(charge_enabled);
-
-static ssize_t charge_mode_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%s\n",
-			  val & SC8547_CHARGE_MODE ? "bypass" : "2:1");
-}
-static DEVICE_ATTR_RO(charge_mode);
-
-static ssize_t switching_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_06, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", !!(val & SC8547_CP_SWITCHING_STAT));
-}
-static DEVICE_ATTR_RO(switching);
-
-static ssize_t adapter_present_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", !!(val & SC8547_ADAPTER_INSERT_STAT));
-}
-static DEVICE_ATTR_RO(adapter_present);
-
-static ssize_t battery_present_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_STATUS_0E, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", !!(val & SC8547_VBAT_INSERT_STAT));
-}
-static DEVICE_ATTR_RO(battery_present);
-
-#define SC8547_ADC_ATTR(_name, _fn) \
-static ssize_t _name##_show(struct device *dev, \
-			    struct device_attribute *attr, char *buf) \
-{ \
-	struct sc8547_device *sc = dev_get_drvdata(dev); \
-	int ret = _fn(sc); \
-	if (ret < 0) \
-		return ret; \
-	return sysfs_emit(buf, "%d\n", ret); \
-} \
-static DEVICE_ATTR_RO(_name)
-
-SC8547_ADC_ATTR(vbus_uv, sc8547_get_vbus_uv);
-SC8547_ADC_ATTR(ibus_ua, sc8547_get_ibus_ua);
-SC8547_ADC_ATTR(vbat_uv, sc8547_get_vbat_uv);
-SC8547_ADC_ATTR(vout_uv, sc8547_get_vout_uv);
-SC8547_ADC_ATTR(vac_uv, sc8547_get_vac_uv);
-SC8547_ADC_ATTR(tdie_mc, sc8547_get_tdie_mc);
-
-static ssize_t status_regs_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int reg06, reg0e;
-	int ret;
-
-	ret = sc8547_read_status(sc, &reg06, &reg0e);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "06=0x%02x 0e=0x%02x\n", reg06, reg0e);
-}
-static DEVICE_ATTR_RO(status_regs);
-
-static ssize_t faults_show(struct device *dev,
-			   struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int reg06, reg0e;
-	size_t len = 0;
-	int ret;
-
-	ret = sc8547_read_status(sc, &reg06, &reg0e);
-	if (ret)
-		return ret;
-
-	if (reg06 & SC8547_TSHUT_STAT)
-		len += sysfs_emit_at(buf, len, "thermal_shutdown ");
-	if (reg06 & SC8547_VBUS_ERRORLO_STAT)
-		len += sysfs_emit_at(buf, len, "vbus_low ");
-	if (reg06 & SC8547_VBUS_ERRORHI_STAT)
-		len += sysfs_emit_at(buf, len, "vbus_high ");
-	if (reg06 & SC8547_SS_TIMEOUT_FLAG)
-		len += sysfs_emit_at(buf, len, "ss_timeout ");
-	if (reg0e & SC8547_VOUT_OVP_STAT)
-		len += sysfs_emit_at(buf, len, "vout_ovp ");
-	if (reg0e & SC8547_VBAT_OVP_STAT)
-		len += sysfs_emit_at(buf, len, "vbat_ovp ");
-	if (reg0e & SC8547_IBAT_OCP_STAT)
-		len += sysfs_emit_at(buf, len, "ibat_ocp ");
-	if (reg0e & SC8547_VBUS_OVP_STAT)
-		len += sysfs_emit_at(buf, len, "vbus_ovp ");
-	if (reg0e & SC8547_IBUS_OCP_STAT)
-		len += sysfs_emit_at(buf, len, "ibus_ocp ");
-	if (reg0e & SC8547_IBUS_UCP_FALL_STAT)
-		len += sysfs_emit_at(buf, len, "ibus_ucp_fall ");
-
-	if (!len)
-		return sysfs_emit(buf, "none\n");
-
-	buf[len - 1] = '\n';
-	return len;
-}
-static DEVICE_ATTR_RO(faults);
-
-static int sc8547_dump_range(struct sc8547_device *sc, char *buf, size_t *len,
-			     unsigned int first, unsigned int last)
-{
-	unsigned int reg, val;
-	int ret;
-
-	for (reg = first; reg <= last; reg++) {
-		ret = regmap_read(sc->regmap, reg, &val);
-		if (ret)
-			return ret;
-		*len += sysfs_emit_at(buf, *len, "%02x:%02x\n", reg, val);
-	}
-
-	return 0;
-}
-
-static ssize_t register_dump_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	size_t len = 0;
-	unsigned int val;
-	int ret;
-
-	ret = sc8547_dump_range(sc, buf, &len, 0x00, 0x23);
-	if (ret)
-		return ret;
-	ret = sc8547_dump_range(sc, buf, &len, 0x2b, 0x33);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, 0x36, &val);
-	if (ret)
-		return ret;
-	len += sysfs_emit_at(buf, len, "36:%02x\n", val);
-	ret = sc8547_dump_range(sc, buf, &len, 0x3a, 0x3c);
-	if (ret)
-		return ret;
-
-	return len;
-}
-static DEVICE_ATTR_RO(register_dump);
-
-static int sc8547_ucp_deglitch_us(struct sc8547_device *sc, unsigned int reg05)
-{
-	unsigned int code;
-
-	if (sc->variant == SC8547_VARIANT_SC8547)
-		return reg05 & SC8547_UCP_DEGLITCH_SC8547 ? 5000 : 10;
-
-	if (sc->variant != SC8547_VARIANT_SC8547A)
-		return -EINVAL;
-
-	code = FIELD_GET(SC8547A_UCP_DEGLITCH_MASK, reg05);
-	switch (code) {
-	case 0:
-		return 10;
-	case 1:
-		return 5000;
-	case 2:
-		return 50000;
-	case 3:
-		return 100000;
-	default:
-		return -EINVAL;
-	}
-}
-
-static int sc8547_watchdog_ms(unsigned int reg09)
-{
-	switch (FIELD_GET(SC8547_WATCHDOG_MASK, reg09)) {
-	case 0:
-		return 0;
-	case 1:
-		return 200;
-	case 2:
-		return 500;
-	case 3:
-		return 1000;
-	case 4:
-		return 5000;
-	case 5:
-		return 30000;
-	default:
-		return -EINVAL;
-	}
-}
-
-static ssize_t protection_state_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int r00, r01, r02, r04, r05, r08, r09, r0d;
-	unsigned int bat_ovp_code, bat_ocp_code, ac_ovp_code;
-	unsigned int vbus_ovp_code, ibus_ocp_code;
-	int deglitch_us, watchdog_ms;
-	size_t len = 0;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_BAT_OVP, &r00);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_BAT_OCP, &r01);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_AC_OVP, &r02);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_VBUS_OVP, &r04);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_PROT, &r05);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_SS_CTRL, &r08);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &r09);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_PMID2OUT, &r0d);
-	if (ret)
-		return ret;
-
-	bat_ovp_code = FIELD_GET(SC8547_BAT_OVP_MASK, r00);
-	bat_ocp_code = FIELD_GET(SC8547_BAT_OCP_MASK, r01);
-	ac_ovp_code = FIELD_GET(SC8547_AC_OVP_MASK, r02);
-	vbus_ovp_code = FIELD_GET(SC8547_VBUS_OVP_MASK, r04);
-	ibus_ocp_code = FIELD_GET(SC8547_IBUS_OCP_MASK, r05);
-	deglitch_us = sc8547_ucp_deglitch_us(sc, r05);
-	watchdog_ms = sc8547_watchdog_ms(r09);
-
-	len += sysfs_emit_at(buf, len,
-		"raw 00=%02x 01=%02x 02=%02x 04=%02x 05=%02x 08=%02x 09=%02x 0d=%02x\n",
-		r00, r01, r02, r04, r05, r08, r09, r0d);
-	len += sysfs_emit_at(buf, len,
-		"bat_ovp enabled=%u code=%u header_mv=%u\n",
-		!(r00 & SC8547_BAT_OVP_DIS), bat_ovp_code,
-		SC8547_BAT_OVP_BASE_MV + bat_ovp_code * SC8547_BAT_OVP_STEP_MV);
-	len += sysfs_emit_at(buf, len,
-		"bat_ocp code=%u header_ma=%u\n", bat_ocp_code,
-		SC8547_BAT_OCP_BASE_MA + bat_ocp_code * SC8547_BAT_OCP_STEP_MA);
-	len += sysfs_emit_at(buf, len,
-		"ac_ovp code=%u header_formula_mv=%u\n", ac_ovp_code,
-		SC8547_AC_OVP_BASE_MV + ac_ovp_code * SC8547_AC_OVP_STEP_MV);
-	len += sysfs_emit_at(buf, len,
-		"vbus_ovp enabled=%u code=%u header_mv=%u\n",
-		!(r04 & SC8547_VBUS_OVP_DIS), vbus_ovp_code,
-		SC8547_VBUS_OVP_BASE_MV + vbus_ovp_code * SC8547_VBUS_OVP_STEP_MV);
-	len += sysfs_emit_at(buf, len,
-		"ibus_ucp enabled=%u ibus_ocp enabled=%u code=%u header_ma=%u\n",
-		!(r05 & SC8547_IBUS_UCP_DIS), !(r05 & SC8547_IBUS_OCP_DIS),
-		ibus_ocp_code,
-		SC8547_IBUS_OCP_BASE_MA + ibus_ocp_code * SC8547_IBUS_OCP_STEP_MA);
-	if (deglitch_us >= 0)
-		len += sysfs_emit_at(buf, len, "ibus_ucp_deglitch_us=%d\n",
-				     deglitch_us);
-	else
-		len += sysfs_emit_at(buf, len,
-				     "ibus_ucp_deglitch_us=unknown_for_variant\n");
-	len += sysfs_emit_at(buf, len,
-		"ss_timeout_code=%u pmid2out_uvp_code=%u pmid2out_ovp_code=%u\n",
-		(unsigned int)FIELD_GET(SC8547_SS_TIMEOUT_MASK, r08),
-		(unsigned int)FIELD_GET(SC8547_PMID2OUT_UVP_MASK, r0d),
-		(unsigned int)FIELD_GET(SC8547_PMID2OUT_OVP_MASK, r0d));
-	if (watchdog_ms >= 0)
-		len += sysfs_emit_at(buf, len, "watchdog_ms=%d\n", watchdog_ms);
-	else
-		len += sysfs_emit_at(buf, len, "watchdog_ms=reserved_code_%u\n",
-				     (unsigned int)FIELD_GET(SC8547_WATCHDOG_MASK, r09));
-	len += sysfs_emit_at(buf, len,
-		"note=header_* values are vendor-header decodes, not yet hardware-validated thresholds\n");
-
-	return len;
-}
-static DEVICE_ATTR_RO(protection_state);
-
-static struct attribute *sc8547_attrs[] = {
-	&dev_attr_device_id.attr,
-	&dev_attr_variant.attr,
-	&dev_attr_role.attr,
-	&dev_attr_charge_enabled.attr,
-	&dev_attr_charge_mode.attr,
-	&dev_attr_switching.attr,
-	&dev_attr_adapter_present.attr,
-	&dev_attr_battery_present.attr,
-	&dev_attr_vbus_uv.attr,
-	&dev_attr_ibus_ua.attr,
-	&dev_attr_vbat_uv.attr,
-	&dev_attr_vout_uv.attr,
-	&dev_attr_vac_uv.attr,
-	&dev_attr_tdie_mc.attr,
-	&dev_attr_status_regs.attr,
-	&dev_attr_faults.attr,
-	&dev_attr_register_dump.attr,
-	&dev_attr_protection_state.attr,
-	NULL,
-};
-
-static const struct attribute_group sc8547_attr_group = {
-	.name = "sc8547",
-	.attrs = sc8547_attrs,
-};
-
-static int sc8547_read_u8_property(struct device *dev, const char *name, u8 *val)
-{
-	u32 tmp;
-	int ret;
-
-	ret = device_property_read_u32(dev, name, &tmp);
-	if (ret)
-		return ret;
-	if (tmp > 0xff)
-		return -ERANGE;
-
-	*val = tmp;
-	return 0;
-}
-
-static int sc8547_read_optional_u8_property(struct device *dev,
-					    const char *name, u8 *val,
-					    bool *present)
-{
-	u32 tmp;
-	int ret;
-
-	if (!device_property_present(dev, name)) {
-		*present = false;
-		return 0;
-	}
-
-	ret = device_property_read_u32(dev, name, &tmp);
-	if (ret)
-		return ret;
-	if (tmp > 0xff)
-		return -ERANGE;
-
-	*present = true;
-	*val = tmp;
-	return 0;
-}
-
-static void sc8547_parse_experimental_profile(struct sc8547_device *sc)
-{
-	struct device *dev = sc->dev;
-	bool complete = true;
-
-	sc->allow_experimental_control =
-		device_property_read_bool(dev, "southchip,allow-experimental-control");
-	if (!sc->allow_experimental_control)
-		return;
-
-	if (sc8547_read_u8_property(dev, "southchip,experimental-reg00",
-				    &sc->profile.reg00))
-		complete = false;
-	if (sc8547_read_u8_property(dev, "southchip,experimental-reg02",
-				    &sc->profile.reg02))
-		complete = false;
-	if (sc8547_read_u8_property(dev, "southchip,experimental-reg04",
-				    &sc->profile.reg04))
-		complete = false;
-	if (sc8547_read_u8_property(dev, "southchip,experimental-reg05",
-				    &sc->profile.reg05))
-		complete = false;
-	if (sc8547_read_optional_u8_property(dev, "southchip,experimental-reg01",
-					     &sc->profile.reg01,
-					     &sc->profile.has_reg01))
-		complete = false;
-	if (sc8547_read_optional_u8_property(dev, "southchip,experimental-reg0d",
-					     &sc->profile.reg0d,
-					     &sc->profile.has_reg0d))
-		complete = false;
-
-	sc->profile.complete = complete;
-	if (!complete)
-		dev_warn(dev,
-			 "experimental controls enabled but raw protection profile is incomplete/invalid\n");
-}
-
-static void sc8547_parse_enable_window(struct sc8547_device *sc)
-{
-	struct device *dev = sc->dev;
+	struct sc8547_raw_profile *p = &sc->profile;
 	struct sc8547_enable_window *w = &sc->window;
-	u64 max_target_uv;
-	u64 min_target_uv;
-	bool enable_requested;
-	bool pulse_requested;
-	int ret;
+	bool primary = !strcmp(sc->role, "primary");
 
-	enable_requested = device_property_read_bool(
-		dev, "southchip,allow-experimental-cp-enable");
-	pulse_requested = device_property_read_bool(
-		dev, "southchip,allow-experimental-cp-pulse");
-	if (!enable_requested && !pulse_requested)
-		return;
-
-	if (!sc->allow_experimental_control) {
-		dev_warn(dev,
-			 "CP control opt-in ignored without southchip,allow-experimental-control\n");
-		return;
+	/* Fixed values from the stock project-23926 SC8547A nodes. */
+	p->reg00 = 0x36;
+	p->reg02 = 0x01;
+	p->reg04 = 0x50;
+	p->reg05 = 0x1b;
+	p->complete = true;
+	if (primary) {
+		p->reg01 = 0xbf;
+		p->reg0d = 0x50;
+		p->has_reg01 = true;
+		p->has_reg0d = true;
 	}
 
-	ret = device_property_read_u32(dev, "southchip,experimental-vbus-min-uv",
-				       &w->vbus_min_uv);
-	ret |= device_property_read_u32(dev, "southchip,experimental-vbus-max-uv",
-					&w->vbus_max_uv);
-	ret |= device_property_read_u32(dev, "southchip,experimental-vbat-min-uv",
-					&w->vbat_min_uv);
-	ret |= device_property_read_u32(dev, "southchip,experimental-vbat-max-uv",
-					&w->vbat_max_uv);
-	if (ret || !w->vbus_min_uv || !w->vbus_max_uv ||
-	    !w->vbat_min_uv || !w->vbat_max_uv ||
-	    w->vbus_min_uv >= w->vbus_max_uv ||
-	    w->vbat_min_uv >= w->vbat_max_uv) {
-		dev_warn(dev,
-			 "experimental CP-enable requested with incomplete/invalid voltage window\n");
-		return;
-	}
-
+	w->vbus_min_uv = 7650000;
+	w->vbus_max_uv = 9400000;
+	w->active_vbus_min_uv = 7300000;
+	w->ratio_error_max_uv = 250000;
+	w->start_delta_uv = 450000;
+	w->start_overshoot_max_uv = 200000;
+	w->vbat_min_uv = 3600000;
+	w->vbat_max_uv = primary ? 4450000 : 4500000;
+	w->start_reference_max_uv = primary ? 4399999 : 4350000;
 	w->complete = true;
-	sc->allow_experimental_cp_enable = enable_requested;
-	if (!pulse_requested)
-		return;
 
-	if (!sc8547_bounded_role_supported(sc)) {
-		dev_warn(dev,
-			 "bounded CP pulse ignored for unsupported %s/%s pairing\n",
-			 sc8547_variant_name(sc->variant), sc->role);
-		return;
-	}
-
-	ret = device_property_read_u32(dev,
-				       "southchip,experimental-tdie-max-mc",
-				       &sc->pulse_tdie_max_mc);
-	if (ret || !sc->pulse_tdie_max_mc) {
-		dev_warn(dev,
-			 "bounded CP pulse ignored without a die-temperature limit\n");
-		return;
-	}
-
-	ret = device_property_read_u32(
-		dev, "southchip,experimental-pulse-vbus-min-uv",
-		&w->pulse_vbus_min_uv);
-	if (ret || !w->pulse_vbus_min_uv ||
-	    w->pulse_vbus_min_uv > w->vbus_min_uv ||
-	    w->pulse_vbus_min_uv >= w->vbus_max_uv) {
-		dev_warn(dev,
-			 "bounded CP pulse ignored without a valid active VBUS lower limit\n");
-		return;
-	}
-
-	ret = device_property_read_u32(
-		dev, "southchip,experimental-start-delta-uv",
-		&w->start_delta_uv);
-	ret |= device_property_read_u32(
-		dev, "southchip,experimental-start-overshoot-max-uv",
-		&w->start_overshoot_max_uv);
-	if (device_property_read_u32(
-		dev, "southchip,experimental-start-reference-max-uv",
-		&w->start_reference_max_uv))
-		w->start_reference_max_uv = w->vbat_max_uv;
-	ret |= device_property_read_u32(
-		dev, "southchip,experimental-pulse-ratio-error-max-uv",
-		&w->pulse_ratio_error_max_uv);
-	if (ret || !w->start_delta_uv || !w->start_overshoot_max_uv ||
-	    w->start_reference_max_uv < w->vbat_min_uv ||
-	    w->start_reference_max_uv > w->vbat_max_uv ||
-	    !w->pulse_ratio_error_max_uv ||
-	    w->pulse_ratio_error_max_uv > SC8547_TEST_RATIO_ERROR_MAX_UV) {
-		dev_warn(dev,
-			 "bounded CP pulse ignored without valid startup/2:1 ratio limits\n");
-		return;
-	}
-
-	/* Match the vendor 2:1 startup target: floor(2 * VBAT, 100 mV) + delta. */
-	min_target_uv = ((u64)w->vbat_min_uv * 2 / 100000) * 100000;
-	min_target_uv += w->start_delta_uv;
-	max_target_uv = ((u64)w->start_reference_max_uv * 2 / 100000) *
-		100000;
-	max_target_uv += w->start_delta_uv;
-	if (min_target_uv < w->vbus_min_uv ||
-	    max_target_uv + w->start_overshoot_max_uv > w->vbus_max_uv) {
-		dev_warn(dev,
-			 "bounded CP pulse startup target does not fit the VBUS window\n");
-		return;
-	}
-
-	sc->allow_experimental_cp_pulse = true;
+	sc->tdie_max_mc = 70000;
+	sc->pps_capable = sc8547_bounded_role_supported(sc);
+	sc->vooc_capable = primary &&
+		sc->variant == SC8547_VARIANT_SC8547A;
+	sc->vooc_active_current_code = SC8547_VOOC_DEFAULT_CURRENT_CODE;
+	sc->vooc_policy_capacity = -ENODATA;
+	sc->vooc_policy_vbat_uv = -ENODATA;
+	sc->vooc_policy_temp_decic = -ENODATA;
+	sc8547_vooc_reset_curve(sc);
 }
 
 static int sc8547_fail_closed(struct sc8547_device *sc)
@@ -1728,54 +1353,35 @@ static int sc8547_fail_closed(struct sc8547_device *sc)
 static int sc8547_verify_reg(struct sc8547_device *sc, unsigned int reg,
 			     u8 expected, u8 mask)
 {
-	struct sc8547_profile_check *check = &sc->profile_check;
 	unsigned int val;
 	int ret;
 
-	check->attempted = true;
-	check->actual_valid = false;
-	check->reg = reg;
-	check->mask = mask;
-	check->expected = expected;
-	check->actual = 0;
 	ret = regmap_read(sc->regmap, reg, &val);
-	if (ret) {
-		check->result = ret;
+	if (ret)
 		return ret;
-	}
-
-	check->actual = val;
-	check->actual_valid = true;
-	if ((val & mask) != (expected & mask)) {
-		check->mismatch = true;
-		check->result = -EIO;
+	if ((val & mask) != (expected & mask))
 		return -EIO;
-	}
 
-	check->result = 0;
 	return 0;
 }
 
 static int sc8547_profile_readback(struct sc8547_device *sc)
 {
 	const struct sc8547_raw_profile *p = &sc->profile;
+	unsigned int val;
 	int ret;
 
-	memset(&sc->profile_check, 0, sizeof(sc->profile_check));
 	ret = sc8547_verify_reg(sc, SC8547_REG_BAT_OVP, p->reg00,
 				SC8547_BAT_OVP_DIS | SC8547_BAT_OVP_MASK);
 	if (ret)
 		return ret;
-	ret = sc8547_verify_reg(sc, SC8547_REG_AC_OVP, p->reg02,
-				SC8547_AC_OVP_CONFIG_MASK);
+	ret = regmap_read(sc->regmap, SC8547_REG_AC_OVP, &val);
 	if (ret)
 		return ret;
-	/* A latched flag is diagnostic; an active AC overvoltage is blocking. */
-	if (sc->profile_check.actual & SC8547_AC_OVP_STAT) {
-		sc->profile_check.mismatch = true;
-		sc->profile_check.result = -EIO;
+	if ((val & SC8547_AC_OVP_CONFIG_MASK) !=
+	    (p->reg02 & SC8547_AC_OVP_CONFIG_MASK) ||
+	    (val & SC8547_AC_OVP_STAT))
 		return -EIO;
-	}
 	ret = sc8547_verify_reg(sc, SC8547_REG_VBUS_OVP, p->reg04, 0xff);
 	if (ret)
 		return ret;
@@ -1813,7 +1419,7 @@ static int sc8547_profile_readback(struct sc8547_device *sc)
 	return 0;
 }
 
-static int sc8547_apply_experimental_init(struct sc8547_device *sc)
+static int sc8547_restore_idle_profile(struct sc8547_device *sc)
 {
 	const struct sc8547_raw_profile *p = &sc->profile;
 	int ret;
@@ -1823,7 +1429,6 @@ static int sc8547_apply_experimental_init(struct sc8547_device *sc)
 	if (!p->complete)
 		return -EINVAL;
 
-	memset(&sc->profile_check, 0, sizeof(sc->profile_check));
 	sc->init_done = false;
 	sc->pps_prepared = false;
 	sc->pps_target_vbus_uv = 0;
@@ -1903,262 +1508,2266 @@ fail:
 	return ret;
 }
 
-static ssize_t profile_raw_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+static int sc8547_vooc_write_word(struct sc8547_device *sc,
+				   unsigned int reg, u16 value)
 {
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	const struct sc8547_raw_profile *p = &sc->profile;
-	size_t len = 0;
+	u8 data[2] = {
+		value & 0xff,
+		value >> 8,
+	};
 
-	if (!p->complete)
-		return sysfs_emit(buf, "incomplete\n");
-
-	len += sysfs_emit_at(buf, len,
-			     "required 00=%02x 02=%02x 04=%02x 05=%02x\n",
-			     p->reg00, p->reg02, p->reg04, p->reg05);
-	if (p->has_reg01)
-		len += sysfs_emit_at(buf, len, "optional 01=%02x ", p->reg01);
-	else
-		len += sysfs_emit_at(buf, len, "optional 01=absent ");
-	if (p->has_reg0d)
-		len += sysfs_emit_at(buf, len, "0d=%02x\n", p->reg0d);
-	else
-		len += sysfs_emit_at(buf, len, "0d=absent\n");
-
-	return len;
+	/*
+	 * Match the vendor i2c_smbus_write_word_data() transaction.  The SC8547
+	 * expects the low byte at the named high-byte register followed by the
+	 * upper byte; keep both bytes in one I2C transfer so a fast adapter cannot
+	 * observe an incomplete TX word between separate register writes.
+	 */
+	return regmap_raw_write(sc->regmap, reg, data, sizeof(data));
 }
-static DEVICE_ATTR_RO(profile_raw);
 
-static ssize_t init_state_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
+/*
+ * The vendor VOOC entry initializes the downstream pump before arming the
+ * primary PHY. Keep that setup local to the VOOC session and restore every
+ * register afterwards so a failed handshake cannot alter normal charging.
+ */
+struct sc8547_vooc_secondary_state {
+	struct sc8547_device *sc;
+	u8 reg00;
+	u8 reg02;
+	u8 reg04;
+	u8 reg05;
+	u8 reg08;
+	u8 reg09;
+	u8 reg0c;
+	u8 reg0d;
+	u8 reg07;
+	u8 reg11;
+	u8 reg2b;
+	u8 reg30;
+	u8 reg3c;
+	u8 last_reg06;
+	u8 last_reg07;
+	u8 last_reg0e;
+	int last_vbus_uv;
+	int last_ibus_ua;
+	int last_vout_uv;
+	int last_tdie_mc;
+	unsigned int low_current_samples;
+	bool enabled;
+	bool switching_confirmed;
+	bool reenable_needed;
+	bool held_off_logged;
+	bool ever_enabled;
+	bool locked;
+	bool valid;
+};
+
+struct sc8547_secondary_find_context {
+	struct sc8547_device *primary;
+	struct sc8547_device *secondary;
+};
+
+static int sc8547_find_secondary_device(struct device *dev, void *data)
 {
-	struct sc8547_device *sc = dev_get_drvdata(dev);
+	struct sc8547_secondary_find_context *ctx = data;
+	struct i2c_client *client = to_i2c_client(dev);
+	struct sc8547_device *candidate;
 
-	return sysfs_emit(buf, "%s\n",
-			  sc->init_done ? "initialized" : "not_initialized");
+	if (!client || client == to_i2c_client(ctx->primary->dev))
+		return 0;
+	if (!client->dev.driver || strcmp(client->dev.driver->name, "sc8547"))
+		return 0;
+
+	candidate = i2c_get_clientdata(client);
+	if (!candidate || !candidate->role ||
+	    strcmp(candidate->role, "secondary"))
+		return 0;
+	if (candidate->variant != SC8547_VARIANT_SC8547A &&
+	    candidate->variant != SC8547_VARIANT_SC8547)
+		return 0;
+
+	ctx->secondary = candidate;
+	return 1;
 }
-static DEVICE_ATTR_RO(init_state);
 
-static ssize_t apply_init_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
+static int sc8547_vooc_secondary_disable(
+	struct sc8547_vooc_secondary_state *state)
 {
-	struct sc8547_device *sc = dev_get_drvdata(dev);
+	struct sc8547_device *sec = state->sc;
 	int ret;
 
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
+	if (!state->locked || !state->enabled)
+		return 0;
 
-	mutex_lock(&sc->lock);
-	ret = sc8547_apply_experimental_init(sc);
-	mutex_unlock(&sc->lock);
+	ret = sc8547_set_charge_enabled(sec, false);
+	if (!ret)
+		usleep_range(10000, 20000);
+	state->enabled = false;
+	state->switching_confirmed = false;
 	if (ret)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_WO(apply_init);
-
-static ssize_t watchdog_ms_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int reg;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
-	if (ret)
-		return ret;
-
-	ret = sc8547_watchdog_ms(reg);
-	if (ret < 0)
-		return sysfs_emit(buf, "reserved_code_%u\n",
-				  (unsigned int)FIELD_GET(SC8547_WATCHDOG_MASK, reg));
-
-	return sysfs_emit(buf, "%d\n", ret);
-}
-
-static ssize_t watchdog_ms_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int timeout_ms, code;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &timeout_ms);
-	if (ret)
-		return ret;
-	ret = sc8547_watchdog_code_from_ms(timeout_ms, &code);
-	if (ret)
-		return ret;
-
-	mutex_lock(&sc->lock);
-	if (!sc->init_done) {
-		ret = -EPERM;
-		goto out;
-	}
-	ret = sc8547_set_watchdog_code(sc, code);
-out:
-	mutex_unlock(&sc->lock);
-	if (ret)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(watchdog_ms);
-
-static ssize_t enable_window_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	const struct sc8547_enable_window *w = &sc->window;
-
-	if (!w->complete)
-		return sysfs_emit(buf, "incomplete\n");
-
-	if (sc->allow_experimental_cp_pulse)
-		return sysfs_emit(buf,
-			"preflight_vbus_uv=%u..%u start_delta_uv=%u start_overshoot_max_uv=%u start_reference_max_uv=%u pulse_vbus_min_uv=%u pulse_ratio_error_max_uv=%u output_uv=%u..%u\n",
-			w->vbus_min_uv, w->vbus_max_uv,
-			w->start_delta_uv, w->start_overshoot_max_uv,
-			w->start_reference_max_uv,
-			w->pulse_vbus_min_uv, w->pulse_ratio_error_max_uv,
-			w->vbat_min_uv, w->vbat_max_uv);
-
-	return sysfs_emit(buf, "vbus_uv=%u..%u vbat_uv=%u..%u\n",
-			  w->vbus_min_uv, w->vbus_max_uv,
-			  w->vbat_min_uv, w->vbat_max_uv);
-}
-static DEVICE_ATTR_RO(enable_window);
-
-static ssize_t work_mode_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int reg;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%s\n",
-			  reg & SC8547_CHARGE_MODE ? "bypass" : "2:1");
-}
-
-int sc8547_set_manual_mode(struct i2c_client *client, bool bypass)
-{
-	struct sc8547_device *sc = sc8547_from_client(client);
-	unsigned int reg;
-	int ret;
-
-	if (!sc)
-		return -ENODEV;
-
-	mutex_lock(&sc->lock);
-	if (!sc->allow_experimental_cp_enable || !sc->init_done ||
-	    !sc->window.complete ||
-	    !sc8547_variant_control_supported(sc->variant)) {
-		ret = -EPERM;
-		goto out;
-	}
-
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
-	if (ret)
-		goto out;
-	if (reg & SC8547_CHG_EN) {
-		ret = -EBUSY;
-		goto out;
-	}
-
-	ret = sc8547_set_work_mode(sc, bypass);
-	if (ret)
-		goto out;
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
-	if (ret)
-		goto out;
-	if (!!(reg & SC8547_CHARGE_MODE) != bypass)
-		ret = -EIO;
-out:
-	mutex_unlock(&sc->lock);
+		dev_warn(sec->dev, "VOOC secondary disable failed: %d\n", ret);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(sc8547_set_manual_mode);
 
-static ssize_t work_mode_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
+/*
+ * The two SC8547 inputs are independent current-sense paths.  Do not infer
+ * secondary health from the primary ADC: a stopped or overheated slave can
+ * leave the primary looking normal while the parallel path is unsafe.
+ */
+static int sc8547_vooc_secondary_monitor(
+	struct sc8547_vooc_secondary_state *state,
+	int primary_ibus_ua, int *total_ibus_ua)
 {
-	bool bypass;
+	struct sc8547_device *sec = state->sc;
+	unsigned int reg06, reg07, reg0e;
+	int vbus_uv, ibus_ua, vout_uv, tdie_mc;
 	int ret;
 
-	if (sysfs_streq(buf, "2:1"))
-		bypass = false;
-	else if (sysfs_streq(buf, "bypass"))
-		bypass = true;
-	else
-		return -EINVAL;
+	if (!state->locked || !state->valid || !state->enabled)
+		return 0;
 
-	ret = sc8547_set_manual_mode(to_i2c_client(dev), bypass);
+	ret = sc8547_read_status(sec, &reg06, &reg0e);
 	if (ret)
 		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(work_mode);
-
-static int sc8547_window_check(struct sc8547_device *sc)
-{
-	const struct sc8547_enable_window *w = &sc->window;
-	int output_reference_uv, vbus_uv;
-
-	vbus_uv = sc8547_get_vbus_uv(sc);
-	if (vbus_uv < 0)
+	ret = regmap_read(sec->regmap, SC8547_REG_CHG_CTRL, &reg07);
+	if (ret)
+		return ret;
+	vbus_uv = sc8547_get_vbus_uv(sec);
+	if (vbus_uv < 0) {
+		dev_warn(sec->dev, "VOOC secondary VBUS ADC failed: %d\n", vbus_uv);
 		return vbus_uv;
-	output_reference_uv = sc8547_get_output_reference_uv(sc);
-	if (output_reference_uv < 0)
-		return output_reference_uv;
+	}
+	ibus_ua = sc8547_get_ibus_ua(sec);
+	if (ibus_ua < 0) {
+		dev_warn(sec->dev, "VOOC secondary IBUS ADC failed: %d\n", ibus_ua);
+		return ibus_ua;
+	}
+	vout_uv = sc8547_get_vout_uv(sec);
+	if (vout_uv < 0) {
+		dev_warn(sec->dev, "VOOC secondary VOUT ADC failed: %d\n", vout_uv);
+		return vout_uv;
+	}
+	tdie_mc = sc8547_get_tdie_mc(sec);
+	if (tdie_mc < 0) {
+		dev_warn(sec->dev, "VOOC secondary TDIE ADC failed: %d\n", tdie_mc);
+		return tdie_mc;
+	}
 
-	if ((u32)vbus_uv < w->vbus_min_uv || (u32)vbus_uv > w->vbus_max_uv ||
-	    (u32)output_reference_uv < w->vbat_min_uv ||
-	    (u32)output_reference_uv > w->vbat_max_uv)
+	state->last_reg06 = reg06;
+	state->last_reg07 = reg07;
+	state->last_reg0e = reg0e;
+	state->last_vbus_uv = vbus_uv;
+	state->last_ibus_ua = ibus_ua;
+	state->last_vout_uv = vout_uv;
+	state->last_tdie_mc = tdie_mc;
+	if (total_ibus_ua)
+		*total_ibus_ua = primary_ibus_ua >= 0 ?
+			primary_ibus_ua + ibus_ua : -ENODATA;
+
+	if (!(reg07 & SC8547_CHG_EN) ||
+	    !(reg06 & SC8547_CP_SWITCHING_STAT) ||
+	    sc8547_has_fatal_fault(reg06, reg0e)) {
+		dev_warn(sec->dev,
+			 "VOOC secondary status rejected reg06=0x%02x reg07=0x%02x "
+			 "reg0e=0x%02x vbus=%d ibus=%d vout=%d tdie=%d\n",
+			 reg06, reg07, reg0e, vbus_uv, ibus_ua, vout_uv, tdie_mc);
+		return -EIO;
+	}
+	if (vbus_uv < SC8547_VOOC_CP_MIN_VBUS_UV ||
+	    vbus_uv > SC8547_VOOC_MAX_VBUS_UV ||
+	    ibus_ua > SC8547_VOOC_CP_MAX_IBUS_UA ||
+	    (u32)tdie_mc > sec->tdie_max_mc) {
+		dev_warn(sec->dev,
+			 "VOOC secondary range rejected reg06=0x%02x reg07=0x%02x "
+			 "reg0e=0x%02x vbus=%d ibus=%d vout=%d tdie=%d\n",
+			 reg06, reg07, reg0e, vbus_uv, ibus_ua, vout_uv, tdie_mc);
 		return -ERANGE;
+	}
 
+	/*
+	 * The vendor CP_ENABLE path deliberately removes the startup UCP and
+	 * soft-start timeout only until switching has been confirmed.  Restore
+	 * both protections before exposing the pump to the longer session, then
+	 * refresh the five-second watchdog on every sample.
+	 */
+	ret = regmap_write(sec->regmap, SC8547_REG_IBUS_PROT,
+			   SC8547A_VENDOR_SECONDARY_IBUS_PROT);
+	if (ret) {
+		dev_warn(sec->dev, "VOOC secondary UCP/OCP restore failed: %d\n", ret);
+		return ret;
+	}
+	ret = regmap_update_bits(sec->regmap, SC8547_REG_SS_CTRL,
+				 SC8547_SS_TIMEOUT_MASK,
+				 SC8547A_VENDOR_CP_RUNTIME_SS_TIMEOUT);
+	if (ret) {
+		dev_warn(sec->dev, "VOOC secondary soft-start restore failed: %d\n", ret);
+		return ret;
+	}
+	ret = sc8547_set_watchdog_code(sec, SC8547A_VENDOR_PPS_WATCHDOG);
+	if (ret) {
+		dev_warn(sec->dev, "VOOC secondary watchdog update failed: %d\n", ret);
+		return ret;
+	}
+	if (primary_ibus_ua < 0 ||
+	    primary_ibus_ua > SC8547_VOOC_CP_MAX_IBUS_UA ||
+	    (total_ibus_ua && *total_ibus_ua > SC8547_VOOC_TOTAL_MAX_IBUS_UA)) {
+		dev_warn(sec->dev,
+			 "VOOC secondary aggregate range rejected primary=%d "
+			 "secondary=%d total=%d\n", primary_ibus_ua, ibus_ua,
+			 total_ibus_ua ? *total_ibus_ua : -ENODATA);
+		return -ERANGE;
+	}
+
+	/*
+	 * The stock monitor removes the secondary after a sustained low-current
+	 * window, then lets it return once the primary path recovers above the
+	 * 1.4-A enable threshold.  Our ADC cadence is 25 ms, so 20 samples gives
+	 * the vendor-like 500-ms hysteresis without rapid pump chatter.
+	 */
+	if (total_ibus_ua && *total_ibus_ua <
+			SC8547_VOOC_SECONDARY_DISABLE_MIN_IBUS_UA) {
+		if (state->low_current_samples <
+			    SC8547_VOOC_SECONDARY_DISABLE_SAMPLES)
+			state->low_current_samples++;
+	} else {
+		state->low_current_samples = 0;
+	}
+	if (state->low_current_samples >= SC8547_VOOC_SECONDARY_DISABLE_SAMPLES) {
+		ret = sc8547_vooc_secondary_disable(state);
+		if (ret)
+			return ret;
+		state->reenable_needed = true;
+		state->low_current_samples = 0;
+		dev_info(sec->dev,
+			 "VOOC secondary disabled after low aggregate current total=%d\n",
+			 total_ibus_ua ? *total_ibus_ua : -ENODATA);
+		return 0;
+	}
+
+	state->switching_confirmed = true;
 	return 0;
 }
 
-static int sc8547_enable_preflight(struct sc8547_device *sc)
+static int sc8547_vooc_secondary_enable(
+	struct sc8547_vooc_secondary_state *state,
+	int primary_ibus_ua, int *total_ibus_ua)
 {
-	unsigned int reg06, reg07, reg0e;
+	struct sc8547_device *sec = state->sc;
 	int ret;
 
-	if (!sc->init_done || !sc->window.complete)
-		return -EPERM;
-	if (!sc8547_variant_control_supported(sc->variant))
-		return -EOPNOTSUPP;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
-	if (ret)
-		return ret;
-	if (reg07 & SC8547_CHG_EN)
-		return -EBUSY;
-
-	ret = sc8547_read_status(sc, &reg06, &reg0e);
-	if (ret)
-		return ret;
-	if (!(reg0e & SC8547_ADAPTER_INSERT_STAT) ||
-	    !(reg0e & SC8547_VBAT_INSERT_STAT))
+	if (!state->locked || !state->valid)
 		return -ENODEV;
-	if (reg06 & SC8547_CP_SWITCHING_STAT)
-		return -EBUSY;
-	if (sc8547_has_blocking_fault(reg06, reg0e))
-		return -EIO;
+	if (state->enabled)
+		return sc8547_vooc_secondary_monitor(state, primary_ibus_ua,
+						     total_ibus_ua);
+	if (primary_ibus_ua < SC8547_VOOC_SECONDARY_ENABLE_MIN_IBUS_UA)
+		return -EAGAIN;
 
-	return sc8547_window_check(sc);
+	/*
+	 * Mirror sc8547_slave_cp_enable() from the vendor driver.  The slave
+	 * clears REG07 when VAC_OK/UCP/soft-start preconditions are not satisfied;
+	 * writing 0x81 alone therefore looks successful on the bus but leaves the
+	 * pump disabled a few hundred milliseconds later.
+	 */
+	ret = regmap_write(sec->regmap, SC8547_REG_AC_OVP, 0x01);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_VBUS_OVP,
+			   SC8547A_VENDOR_CP_ENABLE_VBUS_OVP);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_IBUS_PROT,
+			   SC8547A_VENDOR_CP_ENABLE_IBUS_PROT);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(sec->regmap, SC8547_REG_SS_CTRL,
+				 SC8547_SS_TIMEOUT_MASK,
+				 SC8547A_VENDOR_CP_ENABLE_SS_TIMEOUT);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_MODE_CTRL,
+			   SC8547A_VENDOR_CP_ENABLE_MODE);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_ADC_CTRL, SC8547_ADC_EN);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_PMID2OUT,
+			   SC8547A_VENDOR_PPS_PMID2OUT);
+	if (ret)
+		return ret;
+	ret = regmap_write(sec->regmap, SC8547_REG_IBUS_CTRL, 0x02);
+	if (ret)
+		return ret;
+	msleep(50);
+	ret = sc8547_set_charge_enabled(sec, true);
+	if (ret) {
+		dev_warn(sec->dev, "VOOC secondary work-start write failed: %d\n", ret);
+		return ret;
+	}
+	state->enabled = true;
+	state->ever_enabled = true;
+	state->reenable_needed = false;
+	state->held_off_logged = false;
+	state->low_current_samples = 0;
+	msleep(SC8547_VOOC_SECONDARY_START_SETTLE_MS);
+	ret = sc8547_vooc_secondary_monitor(state, primary_ibus_ua,
+						    total_ibus_ua);
+	if (ret) {
+		dev_warn(sec->dev,
+			 "VOOC secondary post-start monitor failed: %d\n", ret);
+		sc8547_vooc_secondary_disable(state);
+		return ret;
+	}
+
+	dev_info(sec->dev,
+		 "VOOC secondary CP switching confirmed vbus=%d ibus=%d total=%d tdie=%d\n",
+		 state->last_vbus_uv, state->last_ibus_ua,
+		 total_ibus_ua ? *total_ibus_ua : -ENODATA,
+		 state->last_tdie_mc);
+	return 0;
 }
 
-static int sc8547_pulse_preflight(struct sc8547_device *sc)
+static int sc8547_vooc_secondary_restore(
+	struct sc8547_vooc_secondary_state *state)
+{
+	struct sc8547_device *sec = state->sc;
+	int first = 0;
+	int ret;
+
+	if (!state->locked)
+		return 0;
+
+	ret = sc8547_vooc_secondary_disable(state);
+	if (ret && !first)
+		first = ret;
+	if (state->valid) {
+		ret = regmap_write(sec->regmap, SC8547_REG_BAT_OVP,
+				   state->reg00);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_AC_OVP,
+				   state->reg02);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_VBUS_OVP,
+				   state->reg04);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_IBUS_PROT,
+				   state->reg05);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_SS_CTRL,
+				   state->reg08);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_MODE_CTRL,
+				   state->reg09);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_IBUS_CTRL,
+				   state->reg0c);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_PMID2OUT,
+				   state->reg0d);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_ADC_CTRL,
+				   state->reg11);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_VOOCPHY_CTRL,
+				   state->reg2b);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_VOOC_INT_MASK,
+				   state->reg30);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_VBUS_RANGE_CTRL,
+				   state->reg3c);
+		if (ret && !first)
+			first = ret;
+		ret = regmap_write(sec->regmap, SC8547_REG_CHG_CTRL,
+				   state->reg07);
+		if (ret && !first)
+			first = ret;
+	}
+
+	mutex_unlock(&sec->lock);
+	state->locked = false;
+	if (first)
+		dev_warn(sec->dev, "VOOC secondary restore failed: %d\n", first);
+	return first;
+}
+
+static int sc8547_vooc_secondary_prepare(
+	struct sc8547_device *primary,
+	struct sc8547_vooc_secondary_state *state)
+{
+	struct sc8547_secondary_find_context ctx = {
+		.primary = primary,
+	};
+	struct sc8547_device *sec;
+	unsigned int val;
+	int ret;
+
+	i2c_for_each_dev(&ctx, sc8547_find_secondary_device);
+	sec = ctx.secondary;
+	if (!sec) {
+		dev_warn(primary->dev,
+			 "VOOC secondary device not found; probing primary only\n");
+		return 0;
+	}
+
+	state->sc = sec;
+	mutex_lock(&sec->lock);
+	state->locked = true;
+
+	ret = regmap_read(sec->regmap, SC8547_REG_BAT_OVP, &val);
+	if (ret)
+		goto fail;
+	state->reg00 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_AC_OVP, &val);
+	if (ret)
+		goto fail;
+	state->reg02 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_VBUS_OVP, &val);
+	if (ret)
+		goto fail;
+	state->reg04 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_IBUS_PROT, &val);
+	if (ret)
+		goto fail;
+	state->reg05 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_SS_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg08 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_MODE_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg09 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_IBUS_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg0c = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_PMID2OUT, &val);
+	if (ret)
+		goto fail;
+	state->reg0d = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_CHG_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg07 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_ADC_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg11 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_VOOCPHY_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg2b = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_VOOC_INT_MASK, &val);
+	if (ret)
+		goto fail;
+	state->reg30 = val;
+	ret = regmap_read(sec->regmap, SC8547_REG_VBUS_RANGE_CTRL, &val);
+	if (ret)
+		goto fail;
+	state->reg3c = val;
+	state->valid = true;
+	state->last_vbus_uv = -ENODATA;
+	state->last_ibus_ua = -ENODATA;
+	state->last_vout_uv = -ENODATA;
+	state->last_tdie_mc = -ENODATA;
+
+	ret = regmap_update_bits(sec->regmap, SC8547_REG_CHG_CTRL,
+				 SC8547_REG_RESET, SC8547_REG_RESET);
+	if (ret)
+		goto fail;
+	msleep(SC8547_RESET_SETTLE_MS);
+	ret = regmap_write(sec->regmap, SC8547_REG_ADC_CTRL, 0x00);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_AC_OVP, 0x01);
+	if (ret)
+		goto fail;
+	/* Match sc8547_slave_svooc_hw_setting() before the master starts. */
+	ret = regmap_write(sec->regmap, SC8547_REG_VBUS_OVP, 0x50);
+	if (ret)
+		goto fail;
+	/* Match sc8547_slave_svooc_hw_setting(): SC8547A uses the
+	 * 5-ms UCP-fall setting in bit 4 plus the 3.6-A OCP code. */
+	ret = regmap_write(sec->regmap, SC8547_REG_IBUS_PROT,
+			   sec->variant == SC8547_VARIANT_SC8547A ?
+			   SC8547A_VENDOR_SECONDARY_IBUS_PROT :
+			   SC8547_VENDOR_SECONDARY_IBUS_PROT);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_MODE_CTRL, 0x03);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_IBUS_CTRL, 0x00);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_PMID2OUT, 0x70);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_VOOCPHY_CTRL, 0x00);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_VOOC_INT_MASK, 0x7f);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_VBUS_RANGE_CTRL, 0x40);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_ADC_CTRL, 0x80);
+	if (ret)
+		goto fail;
+	ret = regmap_write(sec->regmap, SC8547_REG_CHG_CTRL, 0x01);
+	if (ret)
+		goto fail;
+
+	dev_info(primary->dev,
+		 "VOOC secondary initialized for bounded handshake (CP off)\n");
+	return 0;
+
+fail:
+	if (state->valid) {
+		sc8547_vooc_secondary_restore(state);
+	} else {
+		mutex_unlock(&sec->lock);
+		state->locked = false;
+	}
+	return ret;
+}
+
+static int sc8547_vooc_cleanup(struct sc8547_device *sc, u8 saved_loose,
+				       u8 saved_timing)
+{
+	int first = 0;
+	int ret;
+
+	/* Disable the protocol before disconnecting the analog DP/DM path. */
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOCPHY_CTRL, 0);
+	if (ret)
+		first = ret;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_DPDM_CTRL,
+				  SC8547_VOOC_DPDM_HIZ);
+	if (ret && !first)
+		first = ret;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_DPDM_CFG, 0);
+	if (ret && !first)
+		first = ret;
+	ret = sc8547_vooc_write_word(sc, SC8547_REG_VOOC_TX_DATA_H, 0);
+	if (ret && !first)
+		first = ret;
+	ret = sc8547_vooc_write_word(sc, SC8547_REG_VOOC_PRE_DATA_H, 0);
+	if (ret && !first)
+		first = ret;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_INT_MASK,
+				  SC8547_VOOC_INT_MASKED);
+	if (ret && !first)
+		first = ret;
+
+	/* These are normal idle-profile values and were not protocol inputs. */
+	ret = regmap_write(sc->regmap, SC8547_REG_LOOSE_DET, saved_loose);
+	if (ret && !first)
+		first = ret;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOCPHY_TIMING,
+				  saved_timing);
+	if (ret && !first)
+		first = ret;
+
+	sc->vooc_initialized = false;
+	return first;
+}
+
+static void sc8547_vooc_select_tx_head(struct sc8547_device *sc, u8 rx)
+{
+	u8 head = (rx & 0xe0) >> 5;
+	u8 move_head = (rx & 0x70) >> 4;
+
+	/* Match the vendor priority and its staged VOOC2 detection. The first
+	 * SVOOC probe frame is commonly 0xa8, whose framing bits look like VOOC2;
+	 * changing the reply head immediately makes the adapter report ERR_TRANS. */
+	if (head == SC8547_VOOC_HEAD_SVOOC ||
+	    move_head == SC8547_VOOC_HEAD_SVOOC)
+		sc->vooc_tx_head = SC8547_VOOC_INVERT_SVOOC;
+	else if (head == SC8547_VOOC_HEAD_VOOC30 ||
+		 move_head == SC8547_VOOC_HEAD_VOOC30)
+		sc->vooc_tx_head = SC8547_VOOC_INVERT_VOOC30;
+	else if (head == SC8547_VOOC_HEAD_VOOC20 ||
+		 move_head == SC8547_VOOC_HEAD_VOOC20) {
+		if (sc->vooc_adapter_model_detect_remaining)
+			sc->vooc_adapter_model_detect_remaining--;
+		else
+			sc->vooc_tx_head = SC8547_VOOC_INVERT_VOOC20;
+	}
+}
+
+static int sc8547_vooc_send_data(struct sc8547_device *sc, u8 data,
+					 u8 *tx_h, u8 *tx_l)
+{
+	u16 source = sc->vooc_tx_head | ((u16)(data & 0x7f) << 3);
+	u16 wire = 0;
+	int bit;
+
+	for (bit = 0; bit < 10; bit++)
+		wire |= ((source >> bit) & 0x1) << (9 - bit);
+
+	*tx_h = wire & 0xff;
+	*tx_l = (wire >> 8) & 0x03;
+	return sc8547_vooc_write_word(sc, SC8547_REG_VOOC_TX_DATA_H,
+					      (*tx_h << 8) | *tx_l);
+}
+
+static void sc8547_vooc_identification(struct sc8547_device *sc, u8 *data)
+{
+	u32 random = get_random_u32();
+	u8 l = random & 0x7f;
+	u8 h = (random >> 8) & 0x7f;
+	u8 first_l, first_h;
+
+	sc->vooc_ident_local = ((u16)h << 9) | ((u16)l << 1);
+	first_l = ((l >> 6) & 0x1) |
+		  (((l >> 4) & 0x1) << 1) |
+		  (((h >> 6) & 0x1) << 2) |
+		  ((l & 0x1) << 3) |
+		  ((h & 0x1) << 4);
+	first_h = ((h >> 4) & 0x1) | (((l >> 2) & 0x1) << 1);
+	sc->vooc_ident_next_l = ((l >> 3) & 0x1) |
+				(((h >> 5) & 0x1) << 1) |
+				(((l >> 5) & 0x1) << 2) |
+				(((h >> 1) & 0x1) << 3) |
+				(((h >> 2) & 0x1) << 4);
+	sc->vooc_ident_next_h = ((l >> 1) & 0x1) |
+				(((h >> 3) & 0x1) << 1);
+	sc->vooc_ident_far = 0;
+	sc->vooc_commu_remaining = 5;
+	*data = first_l | (first_h << 5);
+}
+
+static u8 sc8547_vooc_batt_model_data(unsigned int row)
+{
+	/*
+	 * OnePlus Pad Pro uses the six seven-bit SVOOC battery-system rows from
+	 * the stock oplus,sc8547a@6f DT node.  The protocol asks for row 6 first
+	 * and row 1 last; the caller passes that reverse-order index here.  Each
+	 * value is the little-endian packing of the seven individual DT bits,
+	 * matching oplus_voocphy_handle_ask_bat_model_process_cmd().
+	 */
+	static const u8 curve[SC8547_VOOC_BAT_SYS_COUNT] = {
+		0x0a, 0x0f, 0x2c, 0x0f, 0x68, 0x0f,
+	};
+
+	return row < ARRAY_SIZE(curve) ? curve[row] : 0;
+}
+
+/*
+ * VOOC places the seven-bit value on TX0 bit3..7 followed by TX1 bit0..1.
+ * Those wire positions correspond to value bits 6..0 in that order; they are
+ * not a little-endian integer field.  Keep battery/current replies identical
+ * to oplus_voocphy's two write_mesg_mask() calls.
+ */
+static u8 sc8547_vooc_pack_value(u8 value)
+{
+	return ((value >> 6) & 0x01) |
+		(((value >> 5) & 0x01) << 1) |
+		(((value >> 4) & 0x01) << 2) |
+		(((value >> 3) & 0x01) << 3) |
+		(((value >> 2) & 0x01) << 4) |
+		(((value >> 1) & 0x01) << 5) |
+		((value & 0x01) << 6);
+}
+
+/*
+ * The vendor SVOOC path reports the cell-side voltage from the live battery
+ * gauge/CP ADC.  The half-bus estimate is only a fallback for the short
+ * interval where that ADC is unavailable; feeding VBUS/2 back while a valid
+ * VBAT sample exists creates a positive feedback loop and drives the adapter
+ * above the intended 2:1 operating point.
+ */
+static int sc8547_vooc_report_bat_uv(int vbus_uv, int measured_vbat_uv,
+				     int ibus_ua, bool fast_entry)
+{
+	int estimate_uv;
+
+	/*
+	 * The vendor SVOOC handler does not echo the noisy SC8547A VBAT ADC.
+	 * It reports the cell-side voltage inferred from the live 2:1 bus and
+	 * input-current drop.  Feeding the raw local ADC back to the adapter can
+	 * move the requested VBUS by several hundred millivolts between frames;
+	 * that eventually trips the pump's VBUS_ERRORLO protection.
+	 */
+	if (fast_entry && vbus_uv >= SC8547_VOOC_CP_MIN_VBUS_UV &&
+	    vbus_uv <= SC8547_VOOC_MAX_VBUS_UV && ibus_ua >= 0) {
+		estimate_uv = vbus_uv / 2 - div_s64((s64)ibus_ua * 75, 1000);
+		if (estimate_uv >= 3404000 && estimate_uv <= 4650000)
+			return estimate_uv;
+	}
+	if (measured_vbat_uv > 0)
+		return measured_vbat_uv;
+	return measured_vbat_uv;
+}
+
+/*
+ * Reply to one adapter frame.  The state carried here mirrors the vendor
+ * interrupt state machine, but the caller still bounds the whole exchange and
+ * keeps the charge pump disabled.  Data is expressed in the pre-reversal
+ * physical positions (bits 3..9), as in the vendor tx buffer.
+ */
+static int sc8547_vooc_send_safe_reply(struct sc8547_device *sc, u8 rx,
+					       int vbus_uv, int cached_vbat_uv,
+					       int cached_ibus_ua,
+					       bool fast_entry,
+					       u8 *tx_h, u8 *tx_l,
+					       int *reply_vbat_uv,
+					       bool *reply_vbus_window_ok,
+					       bool *adapter_bad)
+{
+	u8 command = (rx & 0x1e) >> 1;
+	u8 data = 0;
+	int vbat_uv;
+	int code;
+	int ret;
+
+	if (reply_vbat_uv)
+		*reply_vbat_uv = -ENODATA;
+	if (reply_vbus_window_ok)
+		*reply_vbus_window_ok = false;
+	if (adapter_bad)
+		*adapter_bad = false;
+
+	sc8547_vooc_select_tx_head(sc, rx);
+	if (sc->vooc_commu_remaining)
+		command = SC8547_VOOC_CMD_ADAPTER_CHECK;
+	else if (sc->vooc_model_remaining)
+		command = SC8547_VOOC_CMD_TELL_MODEL_PROC;
+	else if (sc->vooc_batt_remaining)
+		command = SC8547_VOOC_CMD_BAT_MODEL_PROC;
+
+	switch (command) {
+	case SC8547_VOOC_CMD_ASK_FAST:
+		/* The vendor leaves the first offer bit clear.  It only advertises
+		 * fast-charge acceptance after the identification/model exchange and
+		 * the final battery-system curve response have completed. */
+		data = SC8547_VOOC_SAFE_R_BITS |
+			(sc->vooc_batt_model_done ? 1 : 0);
+		break;
+	case SC8547_VOOC_CMD_IDENTIFICATION:
+		sc8547_vooc_identification(sc, &data);
+		break;
+	case SC8547_VOOC_CMD_ADAPTER_CHECK:
+		if (sc->vooc_commu_remaining == 5) {
+			data = sc->vooc_ident_next_l |
+				(sc->vooc_ident_next_h << 5);
+		} else {
+			/* The vendor sends TX0_DET_BIT5 for the final four nibbles. */
+			data = BIT(2);
+			if (sc->vooc_commu_remaining == 4)
+				sc->vooc_ident_far = ((u16)((rx & 0x1e) >> 1) << 12);
+			else if (sc->vooc_commu_remaining == 3)
+				sc->vooc_ident_far |= ((u16)((rx & 0x1e) >> 1) << 8);
+			else if (sc->vooc_commu_remaining == 2)
+				sc->vooc_ident_far |= ((u16)((rx & 0x1e) >> 1) << 4);
+			else if (sc->vooc_commu_remaining == 1) {
+				sc->vooc_ident_far |= (rx & 0x1e) >> 1;
+				sc->vooc_ident_far &= 0xfefe;
+				sc->vooc_adapter_check_ok =
+					sc->vooc_ident_far == sc->vooc_ident_local;
+			}
+		}
+		if (sc->vooc_commu_remaining)
+			sc->vooc_commu_remaining--;
+		break;
+	case SC8547_VOOC_CMD_TELL_MODEL:
+		/* Set TX0 bits 4 and 6, then receive two model nibbles. */
+		data = BIT(1) | BIT(3);
+		sc->vooc_model_remaining = 2;
+		break;
+	case SC8547_VOOC_CMD_TELL_MODEL_PROC:
+		data = BIT(2); /* TX0_DET_BIT5 */
+		if (sc->vooc_model_remaining == 2)
+			sc->vooc_adapter_model = ((rx & 0x1e) >> 1) << 4;
+		else if (sc->vooc_model_remaining == 1) {
+			sc->vooc_adapter_model |= (rx & 0x1e) >> 1;
+			sc->vooc_adapter_model &= 0x7f;
+			sc->vooc_model_done = true;
+		}
+		if (sc->vooc_model_remaining)
+			sc->vooc_model_remaining--;
+		break;
+	case SC8547_VOOC_CMD_ASK_BAT_MODEL:
+		/* BATT_SYS_VOL_CUR_PAIR (0x0c) in TX bits 3..6. */
+		data = 0x0c;
+		sc->vooc_batt_remaining = SC8547_VOOC_BAT_SYS_COUNT;
+		break;
+	case SC8547_VOOC_CMD_BAT_MODEL_PROC:
+		if (sc->vooc_batt_remaining)
+			data = sc8547_vooc_batt_model_data(sc->vooc_batt_remaining - 1);
+		if (sc->vooc_batt_remaining)
+			sc->vooc_batt_remaining--;
+		if (!sc->vooc_batt_remaining) {
+			sc->vooc_batt_model_done = true;
+		}
+		break;
+	case SC8547_VOOC_CMD_ASK_POWER_BANK:
+		/* Match oplus_vooc_adapter_work_as_power_bank(): set TX0 bit 3. */
+		data = BIT(0);
+		break;
+	case SC8547_VOOC_CMD_TELL_USB_BAD:
+		/* The adapter is explicitly ending the session.  The wire reply is
+		 * still the selected head with zero data, but the AP must stop using
+		 * the pump and let the outer retry path perform a clean re-arm. */
+		if (adapter_bad)
+			*adapter_bad = true;
+		dev_warn(sc->dev,
+			 "VOOC adapter reported USB bad connection (rx=0x%02x)\n",
+			 rx);
+		break;
+	case SC8547_VOOC_CMD_ASK_AP_STATUS:
+		/* Vendor handler has no payload; keep the selected head. */
+		break;
+	case SC8547_VOOC_CMD_IS_VBUS_OK:
+		vbat_uv = cached_vbat_uv;
+		if (vbat_uv < 0)
+			return vbat_uv;
+		if (reply_vbat_uv)
+			*reply_vbat_uv = vbat_uv;
+		/* Match oplus_voocphy_vbus_vbatt_detect(): the adapter raises
+		 * VBUS below +100 mV headroom and lowers it above +200 mV. */
+		if (vbus_uv - vbat_uv * 2 > SC8547_VOOC_VBUS_HIGH_DELTA_UV)
+			data |= BIT(1); /* TX0_DET_BIT4 */
+		else if (vbus_uv - vbat_uv * 2 < SC8547_VOOC_VBUS_LOW_DELTA_UV)
+			data |= BIT(2); /* TX0_DET_BIT5 */
+		else
+			data |= BIT(1) | BIT(2);
+		if (reply_vbus_window_ok &&
+		    vbus_uv - vbat_uv * 2 >= SC8547_VOOC_CP_START_LOW_DELTA_UV &&
+		    vbus_uv - vbat_uv * 2 <= SC8547_VOOC_VBUS_HIGH_DELTA_UV)
+			*reply_vbus_window_ok = true;
+		break;
+	case SC8547_VOOC_CMD_ASK_CURRENT:
+		data = sc8547_vooc_pack_value(sc->vooc_active_current_code ?
+						      sc->vooc_active_current_code :
+						      SC8547_VOOC_DEFAULT_CURRENT_CODE);
+		break;
+	case SC8547_VOOC_CMD_GET_BATT_VOL:
+		vbat_uv = sc8547_vooc_report_bat_uv(vbus_uv, cached_vbat_uv,
+						    cached_ibus_ua, fast_entry);
+		if (vbat_uv < 0)
+			return vbat_uv;
+		/* Vendor units are 10 mV above 3404 mV. */
+		code = clamp((vbat_uv / 1000 - 3404) / 10, 0, 125);
+		data = sc8547_vooc_pack_value(code);
+		break;
+	default:
+		/* Unknown/null frames receive the selected head with zero data. */
+		break;
+	}
+
+	ret = sc8547_vooc_send_data(sc, data, tx_h, tx_l);
+	if (ret)
+		return ret;
+	dev_dbg(sc->dev,
+		"VOOC reply cmd=0x%02x data=0x%02x head=0x%02x check=%u model=0x%02x commu=%u model_left=%u batt_left=%u\n",
+		command, data, sc->vooc_tx_head, sc->vooc_adapter_check_ok,
+		sc->vooc_adapter_model, sc->vooc_commu_remaining,
+		sc->vooc_model_remaining, sc->vooc_batt_remaining);
+	return 0;
+}
+
+static int sc8547_vooc_session(struct sc8547_device *sc)
+{
+	u8 saved_loose, saved_timing;
+	u8 rx = 0, flags = 0;
+	u8 tx_h = 0, tx_l = 0;
+	unsigned int reg;
+	u8 saved_reg07 = 0, saved_reg05 = 0, saved_reg08 = 0, saved_reg09 = 0,
+	    saved_reg0c = 0, saved_reg0d = 0, saved_reg10 = 0, saved_reg11 = 0,
+	    saved_reg3b = 0;
+	s64 elapsed_us = 0;
+	s64 timeout_us = SC8547_VOOC_HANDSHAKE_TIMEOUT_MS * 1000LL;
+	s64 next_adc_sample_us = 0;
+	s64 next_battery_policy_us = 0;
+	s64 next_secondary_sample_us = 0;
+	s64 next_secondary_enable_us = 0;
+	s64 secondary_enable_deadline_us = 0;
+	ktime_t start;
+	u8 rx_count = 0;
+	u8 vbus_ok_count = 0;
+	int reply_vbat_uv = -ENODATA;
+	int vooc_bat_uv = -ENODATA;
+	bool fast_entry_sent = false;
+	bool vooc_cp_enabled = false;
+	bool vooc_cp_status_confirmed = false;
+	bool secondary_enable_attempted = false;
+	bool vooc_current_request_seen = false;
+	bool vooc_first_current_tx_failed = false;
+	bool vooc_tx_fail_seen = false;
+	bool vooc_cp_gate_pending = false;
+	bool vooc_session_ending = false;
+	bool continuous_session;
+	bool reply_vbus_window_ok = false;
+	bool adapter_bad = false;
+	bool skip_reply = false;
+	s64 vooc_cp_gate_due_us = 0;
+	s64 vooc_session_end_deadline_us = 0;
+	s64 vooc_cp_start_us = 0;
+	unsigned int vooc_cp_reg0c = 0;
+	int vbus_uv = -ENODATA;
+	int cleanup_vbus_uv = -ENODATA;
+	int ibus_ua = -ENODATA;
+	int secondary_total_ibus_ua = -ENODATA;
+	int switch_ret;
+	struct power_supply *usb_psy = NULL;
+	int saved_input_current_limit = -1;
+	bool charger_suspended = false;
+	bool dpdm_switched = false;
+	struct sc8547_vooc_secondary_state secondary_state = { };
+	int ret, cleanup_ret, restore_ret, reg07_restore_ret;
+	int secondary_restore_ret, secondary_disable_ret;
+
+	if (!sc->vooc_capable)
+		return -EPERM;
+	if (strcmp(sc->role, "primary") ||
+	    sc->variant != SC8547_VARIANT_SC8547A)
+		return -EOPNOTSUPP;
+	continuous_session = READ_ONCE(sc->vooc_cable_online);
+	/* Reset session state before arming the PHY. */
+	sc->vooc_last_cp_started = false;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg07 = reg;
+	if (reg & SC8547_CHG_EN)
+		return -EBUSY;
+
+	ret = regmap_read(sc->regmap, SC8547_REG_LOOSE_DET, &reg);
+	if (ret)
+		return ret;
+	saved_loose = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_VOOCPHY_TIMING, &reg);
+	if (ret)
+		return ret;
+	saved_timing = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg09 = reg;
+	ret = regmap_read(sc->regmap, SC8547A_REG_OTG_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg3b = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_INT_MASK, &reg);
+	if (ret)
+		return ret;
+	saved_reg10 = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_PROT, &reg);
+	if (ret)
+		return ret;
+	saved_reg05 = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg0c = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_SS_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg08 = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_PMID2OUT, &reg);
+	if (ret)
+		return ret;
+	saved_reg0d = reg;
+	ret = regmap_read(sc->regmap, SC8547_REG_ADC_CTRL, &reg);
+	if (ret)
+		return ret;
+	saved_reg11 = reg;
+	ret = sc8547_update_vooc_current_policy(sc);
+	if (ret) {
+		dev_info(sc->dev,
+			 "VOOC fast session refused by battery policy: %d full=%u capacity=%d vbat=%d temp=%d\n",
+			 ret, sc->vooc_policy_full, sc->vooc_policy_capacity,
+			 sc->vooc_policy_vbat_uv, sc->vooc_policy_temp_decic);
+		return ret;
+	}
+
+	/* The vendor init_vooc entry always resets the SC8547A PHY first.  This
+	 * clears a latched ERR_TRANS/TX state left by a previous session while the
+	 * charge pump remains disabled. */
+	ret = regmap_update_bits(sc->regmap, SC8547_REG_CHG_CTRL,
+				 SC8547_REG_RESET, SC8547_REG_RESET);
+	if (ret)
+		return ret;
+	msleep(SC8547_RESET_SETTLE_MS);
+	sc->vooc_last_total_ibus_ua = -ENODATA;
+
+	ret = sc8547_vooc_secondary_prepare(sc, &secondary_state);
+	if (ret)
+		goto out_cleanup;
+
+	sc->vooc_last_vbus_uv = -ENODATA;
+	sc->vooc_last_ibus_ua = -ENODATA;
+	sc->vooc_tx_head = SC8547_VOOC_INVERT_SVOOC;
+	/* The vendor starts with the SVOOC head and only changes after
+	 * repeated VOOC2-head frames during adapter detection. */
+	sc->vooc_adapter_model_detect_remaining = 3;
+	sc->vooc_commu_remaining = 0;
+	sc->vooc_model_remaining = 0;
+	sc->vooc_batt_remaining = 0;
+	sc->vooc_ident_next_l = 0;
+	sc->vooc_ident_next_h = 0;
+	sc->vooc_ident_local = 0;
+	sc->vooc_ident_far = 0;
+	sc->vooc_adapter_model = 0;
+	sc->vooc_adapter_check_ok = false;
+	sc->vooc_model_done = false;
+	sc->vooc_batt_model_done = false;
+	sc->vooc_initialized = true;
+
+	ret = wcd939x_usbss_set_vooc_dpdm(true);
+	if (ret)
+		goto out_cleanup;
+	{
+		u8 bat_ovp = sc->profile.reg00;
+		u8 bat_ocp = sc->profile.has_reg01 ? sc->profile.reg01 :
+			SC8547A_VENDOR_BAT_OCP;
+
+		/* The vendor init_device() always restores the 4.65-V/0xbf battery
+		 * protection profile before VOOC.  A previously loaded DT/module may
+		 * leave a lower REG00 value (for example 0x22), which can latch
+		 * VBAT_OVP during a fast-charge voltage step.  Keep a stale low profile
+		 * from turning a protocol session into a false CP/VBUS failure. */
+		if ((bat_ovp & GENMASK(4, 0)) <
+		    (SC8547A_VENDOR_BAT_OVP & GENMASK(4, 0))) {
+			dev_warn(sc->dev,
+				 "VOOC replacing low battery OVP profile 0x%02x with official 0x%02x\n",
+				 bat_ovp, SC8547A_VENDOR_BAT_OVP);
+			bat_ovp = SC8547A_VENDOR_BAT_OVP;
+		}
+		dev_info(sc->dev,
+			 "VOOC primary protection profile reg00=0x%02x reg01=0x%02x\n",
+			 bat_ovp, bat_ocp);
+		ret = regmap_write(sc->regmap, SC8547_REG_BAT_OVP, bat_ovp);
+		if (ret)
+			goto out_cleanup;
+		ret = regmap_write(sc->regmap, SC8547_REG_BAT_OCP, bat_ocp);
+		if (ret)
+			goto out_cleanup;
+		/* Match sc8547_svooc_hw_setting() while REG07 stays off. */
+		ret = regmap_write(sc->regmap, SC8547_REG_AC_OVP,
+				   sc->profile.reg02);
+		if (ret)
+			goto out_cleanup;
+		ret = regmap_write(sc->regmap, SC8547_REG_VBUS_OVP,
+				   sc->profile.reg04);
+		if (ret)
+			goto out_cleanup;
+		ret = regmap_write(sc->regmap, SC8547_REG_IBUS_PROT,
+				   sc->profile.reg05);
+		if (ret)
+			goto out_cleanup;
+		/*
+		 * The vendor init_vooc path only selects 2:1/UCP-rise here.  The
+		 * 1-second watchdog and PMID-to-OUT SVOOC range are applied after
+		 * the adapter accepts the first fast-charge reply below.
+		 */
+		ret = regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
+					 SC8547_IBUS_UCP_RISE_MASK,
+					 SC8547_IBUS_UCP_RISE_MASK);
+		if (ret)
+			goto out_cleanup;
+		ret = regmap_write(sc->regmap, SC8547_REG_ADC_CTRL,
+				   SC8547_ADC_EN);
+		if (ret)
+			goto out_cleanup;
+		/* Keep the idle PMID-to-OUT range until fast entry is accepted. */
+		ret = regmap_write(sc->regmap, SC8547_REG_PMID2OUT, saved_reg0d);
+		if (ret)
+			goto out_cleanup;
+	}
+	dpdm_switched = true;
+
+	ret = sc8547_vooc_write_word(sc, SC8547_REG_VOOC_PRE_DATA_H, 0);
+	if (ret)
+		goto out_cleanup;
+	/* Match the vendor init_vooc profile: 0x60 selects the 800-us
+	 * bit-0 hold timing used by SC8547A VOOC. */
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOCPHY_TIMING,
+			   SC8547_VOOC_TIMING_ACTIVE);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_DPDM_CTRL,
+				  SC8547_VOOC_DPDM_ACTIVE);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_DPDM_CFG, 0);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547_REG_LOOSE_DET,
+				  SC8547_VOOC_LOOSE_DET);
+	if (ret)
+		goto out_cleanup;
+	/* Match the vendor SC8547A init path before arming the VOOC PHY. */
+	ret = regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
+				 SC8547_IBUS_UCP_RISE_MASK,
+				 SC8547_IBUS_UCP_RISE_MASK);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547A_REG_OTG_CTRL, 0x04);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547_REG_INT_MASK,
+				  SC8547A_VENDOR_INSERT_IRQ_MASK);
+	if (ret)
+		goto out_cleanup;
+	ret = sc8547_vooc_write_word(sc, SC8547_REG_VOOC_TX_DATA_H, 0);
+	if (ret)
+		goto out_cleanup;
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOC_INT_MASK,
+				  SC8547_VOOC_INT_ACTIVE);
+	if (ret)
+		goto out_cleanup;
+
+	/*
+	 * Establish the safety baseline before starting the time-sensitive wire
+	 * exchange.  The vendor IRQ path treats 1.5 ms as a late reply, so the
+	 * protocol status must be polled before the slower ADC transactions.
+	 */
+	vbus_uv = sc8547_get_vbus_uv(sc);
+	if (vbus_uv < 0) {
+		ret = vbus_uv;
+		goto out_cleanup;
+	}
+	sc->vooc_last_vbus_uv = vbus_uv;
+	if (vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+		dev_warn(sc->dev,
+			 "VOOC VBUS safety ceiling exceeded before handshake: %d uV (limit %d)\n",
+			 vbus_uv, SC8547_VOOC_MAX_VBUS_UV);
+		ret = -EOVERFLOW;
+		goto out_cleanup;
+	}
+	ibus_ua = sc8547_get_ibus_ua(sc);
+	if (ibus_ua >= 0)
+		sc->vooc_last_ibus_ua = ibus_ua;
+	vooc_bat_uv = sc8547_get_vooc_bat_uv(sc);
+	if (vooc_bat_uv < 0) {
+		ret = vooc_bat_uv;
+		goto out_cleanup;
+	}
+
+	ret = regmap_write(sc->regmap, SC8547_REG_VOOCPHY_CTRL,
+				  SC8547_VOOC_CTRL_HANDSHAKE);
+	if (ret)
+		goto out_cleanup;
+
+	ret = -ETIMEDOUT;
+	start = ktime_get();
+	while (elapsed_us < timeout_us) {
+		if (atomic_read(&sc->policy_cancel)) {
+			ret = -ECANCELED;
+			break;
+		}
+		elapsed_us = ktime_us_delta(ktime_get(), start);
+		if (!vooc_session_ending &&
+		    elapsed_us >= next_battery_policy_us) {
+			ret = sc8547_update_vooc_current_policy(sc);
+			if (ret)
+				break;
+			next_battery_policy_us = elapsed_us +
+				SC8547_VOOC_BATTERY_SAMPLE_US;
+		}
+		ret = regmap_read(sc->regmap, SC8547_REG_VOOC_INT_STATUS,
+					&reg);
+		if (ret) {
+			if (ret == -EOVERFLOW)
+				dev_warn(sc->dev,
+					 "VOOC INT_STATUS read returned -EOVERFLOW at rx_count=%u\n",
+					 rx_count);
+			break;
+		}
+		flags = reg;
+		/* RXDATA_DONE remains usable with a simultaneous TX error. */
+		if (flags & SC8547_VOOC_RXDATA_DONE) {
+			ret = regmap_read(sc->regmap, SC8547_REG_VOOC_RX_DATA,
+						&reg);
+			if (ret) {
+				if (ret == -EOVERFLOW)
+					dev_warn(sc->dev,
+						 "VOOC RX_DATA read returned -EOVERFLOW at rx_count=%u\n",
+						 rx_count);
+				break;
+			}
+			rx = reg;
+			if (rx_count < U8_MAX)
+				rx_count++;
+			/* The stock voocphy treats a write failure on the first
+			 * post-model ASK_CURRENT frame as an adapter-state failure.  It
+			 * consumes the combined 0x0f interrupt without overwriting TXDATA,
+			 * then reports the failure on the following GET_BATT_VOL frame so
+			 * the outer state machine can perform a clean handshake restart. */
+			if (fast_entry_sent && sc->vooc_batt_model_done &&
+			    !sc->vooc_commu_remaining &&
+			    !sc->vooc_model_remaining &&
+			    !sc->vooc_batt_remaining &&
+			    ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_ASK_CURRENT &&
+			    !vooc_current_request_seen) {
+				vooc_current_request_seen = true;
+				if (flags & SC8547_VOOC_TXDATA_WR_FAIL) {
+					vooc_first_current_tx_failed = true;
+					dev_warn(sc->dev,
+						 "VOOC first current request TX failed (flags=0x%02x); deferring handshake restart\n",
+						 flags);
+				}
+			}
+			/* Match the vendor IRQ state machine: a complete 0x0f status
+			 * consumes the received byte but does not overwrite TXDATA again
+			 * after the battery-model exchange.  Rewriting during this combined
+			 * TX-done/TX-fail state can race the PHY and make the adapter report
+			 * USB bad after a long otherwise-valid session. */
+			skip_reply = flags == (SC8547_VOOC_RXDATA_DONE |
+					      SC8547_VOOC_RX_START |
+					      SC8547_VOOC_TXDATA_WR_FAIL |
+					      SC8547_VOOC_TXDATA_DONE);
+			if (skip_reply && !sc->vooc_batt_model_done) {
+				dev_warn(sc->dev,
+					 "VOOC 0x0f before battery model completion; aborting\n");
+				ret = -EAGAIN;
+				break;
+			}
+			/* oplus_voocphy reports the abnormal first-current exchange when
+			 * the adapter asks for the first battery-voltage report.  Do this
+			 * before writing a replacement TX word, matching its IRQ path and
+			 * leaving the adapter's failed frame intact for the reset path. */
+			if (vooc_first_current_tx_failed &&
+			    !sc->vooc_commu_remaining &&
+			    !sc->vooc_model_remaining &&
+			    !sc->vooc_batt_remaining &&
+			    ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_GET_BATT_VOL) {
+				dev_warn(sc->dev,
+					 "VOOC first current request failed; restarting at battery-voltage request\n");
+				ret = -EIO;
+				break;
+			}
+			/* IS_VBUS_OK is the point where the adapter may have just
+			 * changed VBUS.  Sample it synchronously before replying so a
+			 * stale 5 V value cannot authorize an unsafe transition. */
+			if (!sc->vooc_commu_remaining && !sc->vooc_model_remaining &&
+			    !sc->vooc_batt_remaining &&
+			    ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_IS_VBUS_OK) {
+				vbus_uv = sc8547_get_vbus_uv(sc);
+				if (vbus_uv < 0) {
+					ret = vbus_uv;
+					break;
+				}
+				sc->vooc_last_vbus_uv = vbus_uv;
+				if (vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+					dev_warn(sc->dev,
+						 "VOOC VBUS safety ceiling exceeded on reply: %d uV (limit %d)\n",
+						 vbus_uv, SC8547_VOOC_MAX_VBUS_UV);
+					ret = -EOVERFLOW;
+					break;
+				}
+				if (fast_entry_sent) {
+					if (vbus_ok_count >= SC8547_VOOC_MAX_VBUS_ADJUST) {
+						dev_warn(sc->dev,
+							 "VOOC VBUS adjustment exceeded %u rounds at %d uV\n",
+							 SC8547_VOOC_MAX_VBUS_ADJUST, vbus_uv);
+						ret = -ETIMEDOUT;
+						break;
+					}
+					vbus_ok_count++;
+				}
+			}
+			adapter_bad = false;
+			if (!skip_reply) {
+				reply_vbat_uv = -ENODATA;
+				reply_vbus_window_ok = false;
+				ret = sc8547_vooc_send_safe_reply(sc, rx, vbus_uv,
+								  vooc_bat_uv, ibus_ua,
+								  fast_entry_sent,
+								  &tx_h, &tx_l,
+								  &reply_vbat_uv,
+								  &reply_vbus_window_ok,
+								  &adapter_bad);
+				if (ret) {
+					if (ret == -EOVERFLOW)
+						dev_warn(sc->dev,
+							 "VOOC reply transaction returned -EOVERFLOW at rx_count=%u rx=0x%02x\n",
+							 rx_count, rx);
+					break;
+				}
+				if (adapter_bad) {
+					ret = -EIO;
+					break;
+				}
+			}
+			/* The vendor AP enters the fast-charge stage as soon as the final
+			 * battery-system row is sent.  Some adapters ask ASK_CURRENT
+			 * directly after that row instead of repeating ASK_FAST; accepting
+			 * only the latter leaves the PHY at 5 V and makes its next frame
+			 * look like a TXDATA_WR_FAIL.  Keep REG07 disabled here; the
+			 * adapter must still prove its voltage step in IS_VBUS_OK before
+			 * either charge pump is enabled. */
+			if (!fast_entry_sent &&
+			    ((sc->vooc_batt_model_done &&
+			      (((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_ASK_FAST ||
+			       ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_ASK_CURRENT)) ||
+			     (sc->vooc_model_done && !sc->vooc_batt_remaining))) {
+				fast_entry_sent = true;
+				/* The vendor path votes WIRED_CHARGE_SUSPEND here.
+				 * Mainline has no Oplus votable, so use the equivalent
+				 * USB power-supply input limit and restore it on every
+				 * exit path.  This does not touch the charge pump enable. */
+				usb_psy = power_supply_get_by_name("qcom-battmgr-usb");
+				if (usb_psy) {
+					union power_supply_propval pval = { };
+
+					ret = power_supply_get_property(usb_psy,
+							POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+							&pval);
+					if (!ret) {
+						saved_input_current_limit = pval.intval;
+						pval.intval = 0;
+						ret = power_supply_set_property(usb_psy,
+								POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+								&pval);
+						if (!ret)
+							charger_suspended = true;
+						else
+							dev_warn(sc->dev,
+								 "USB input suspend rejected: %d\n", ret);
+					}
+					if (ret && saved_input_current_limit < 0)
+						dev_warn(sc->dev,
+							 "USB input limit read failed: %d\n", ret);
+				} else {
+					dev_warn(sc->dev,
+						 "qcom-battmgr-usb power supply unavailable\n");
+				}
+				ret = sc8547_vooc_write_word(sc,
+						SC8547_REG_VOOC_PRE_DATA_H,
+						SC8547_VOOC_PRE_SVOOC);
+				if (ret)
+					break;
+				/* Match sc8547_svooc_hw_setting(false): select 2:1 and
+				 * UCP-rise while preserving the watchdog field. The vendor
+				 * PPS path then explicitly selects its five-second watchdog
+				 * before CP_SET_WORK_START, yielding REG09=0x14 here. */
+				ret = regmap_update_bits(sc->regmap, SC8547_REG_MODE_CTRL,
+							 SC8547_CHARGE_MODE |
+							 SC8547_IBUS_UCP_RISE_MASK,
+							 SC8547_IBUS_UCP_RISE_MASK);
+				if (ret)
+					break;
+				ret = sc8547_set_watchdog_code(sc,
+							SC8547A_VENDOR_PPS_WATCHDOG);
+				if (ret)
+					break;
+				ret = regmap_update_bits(sc->regmap, SC8547_REG_IBUS_PROT,
+								 SC8547_IBUS_UCP_DIS,
+								 SC8547_IBUS_UCP_DIS);
+				if (ret)
+					break;
+				ret = regmap_update_bits(sc->regmap, SC8547_REG_SS_CTRL,
+								 SC8547_SS_TIMEOUT_MASK, 0);
+				if (ret)
+					break;
+				ret = regmap_write(sc->regmap, SC8547_REG_PMID2OUT, 0x70);
+				if (ret)
+					break;
+				dev_info(sc->dev, "VOOC fast entry accepted\n");
+			}
+			/* The adapter may still be completing its VBUS step when the
+			 * IS_VBUS_OK reply arrives.  Defer the slow ADC/CP gate work so
+			 * this protocol iteration can return its reply immediately. */
+			if (fast_entry_sent && !vooc_cp_enabled &&
+			    ((rx & 0x1e) >> 1) == SC8547_VOOC_CMD_IS_VBUS_OK) {
+				/* A low reply may have queued the 500-ms fallback, but a
+				 * later normal reply is authoritative and must shorten that
+				 * deadline to the official immediate CP-start path. */
+				if (reply_vbus_window_ok) {
+					vooc_cp_gate_pending = true;
+					vooc_cp_gate_due_us =
+						ktime_us_delta(ktime_get(), start) + 10000LL;
+					dev_info(sc->dev,
+						 "VOOC CP gate ready after normal VBUS reply\n");
+				} else if (!vooc_cp_gate_pending) {
+					vooc_cp_gate_pending = true;
+					vooc_cp_gate_due_us =
+						ktime_us_delta(ktime_get(), start) +
+						SC8547_VOOC_CP_START_SETTLE_MS * 1000LL;
+					dev_info(sc->dev,
+						 "VOOC CP gate deferred %u ms for VBUS regulation\n",
+						 SC8547_VOOC_CP_START_SETTLE_MS);
+				}
+			}
+			if (vooc_cp_enabled) {
+				/* RXDATA_DONE can arrive back-to-back without entering the
+				 * idle polling branch. Keep the VBUS ceiling active on the
+				 * protocol path as well, but sample at the normal ADC cadence. */
+				elapsed_us = ktime_us_delta(ktime_get(), start);
+				if (elapsed_us >= next_adc_sample_us) {
+					vbus_uv = sc8547_get_vbus_uv(sc);
+					if (vbus_uv < 0) {
+						ret = vbus_uv;
+						break;
+					}
+					sc->vooc_last_vbus_uv = vbus_uv;
+					if (vbus_uv < SC8547_VOOC_CP_MIN_VBUS_UV ||
+					    vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+						if (vbus_uv > SC8547_VOOC_MAX_VBUS_UV)
+							dev_warn(sc->dev,
+								 "VOOC VBUS safety ceiling exceeded during CP monitor: %d uV (limit %d)\n",
+								 vbus_uv, SC8547_VOOC_MAX_VBUS_UV);
+						ret = vbus_uv > SC8547_VOOC_MAX_VBUS_UV ?
+							-EOVERFLOW : -ERANGE;
+						break;
+					}
+						next_adc_sample_us = elapsed_us +
+							SC8547_VOOC_ADC_SAMPLE_US;
+					}
+				}
+				if (secondary_state.enabled &&
+				    elapsed_us >= next_secondary_sample_us) {
+					ret = sc8547_vooc_secondary_monitor(
+						&secondary_state, ibus_ua,
+						&secondary_total_ibus_ua);
+					if (ret) {
+						dev_warn(sc->dev,
+							 "VOOC secondary CP monitor failed: %d\n", ret);
+						break;
+					}
+					sc->vooc_last_total_ibus_ua =
+						secondary_total_ibus_ua;
+					next_secondary_sample_us = elapsed_us +
+						SC8547_VOOC_SECONDARY_SAMPLE_MS * 1000LL;
+				}
+				/* A continuous SVOOC session exchanges this keepalive frame
+				 * roughly every 45 ms.  Keep it available for dynamic debug,
+				 * but do not evict policy transitions and faults from dmesg. */
+				dev_dbg_ratelimited(sc->dev,
+					"VOOC safe round=%u rx=0x%02x cmd=0x%02x flags=0x%02x tx=0x%02x%02x\n",
+					rx_count, rx, (rx & 0x1e) >> 1,
+					flags, tx_h, tx_l);
+			ret = 0;
+			elapsed_us = ktime_us_delta(ktime_get(), start);
+			if (!vooc_cp_enabled &&
+			    rx_count >= SC8547_VOOC_SESSION_ROUNDS)
+				break;
+			if (!continuous_session && vooc_cp_enabled &&
+			    elapsed_us - vooc_cp_start_us >=
+				(s64)SC8547_VOOC_SESSION_MS * 1000LL) {
+				/* Keep both pumps loaded while the adapter observes a
+				 * low-current termination window.  Abruptly disabling the
+				 * CP at the session deadline leaves some adapters unloaded
+				 * at their 11-V default and causes a short over-voltage step. */
+				if (!vooc_session_ending) {
+					vooc_session_ending = true;
+					vooc_session_end_deadline_us = elapsed_us +
+						SC8547_VOOC_SESSION_END_GRACE_MS * 1000LL;
+					sc->vooc_active_current_code =
+						SC8547_VOOC_MIN_CURRENT_CODE;
+					dev_info(sc->dev,
+						 "VOOC entering %u-ms low-current termination window\n",
+						 SC8547_VOOC_SESSION_END_GRACE_MS);
+				} else if (elapsed_us >= vooc_session_end_deadline_us) {
+					ret = 0;
+					break;
+				}
+			}
+			usleep_range(SC8547_VOOC_POLL_MIN_US,
+				     SC8547_VOOC_POLL_MAX_US);
+			elapsed_us = ktime_us_delta(ktime_get(), start);
+			continue;
+		}
+		if (flags & (SC8547_VOOC_ERR_TRANS |
+				     SC8547_VOOC_TXDATA_WR_FAIL |
+				     SC8547_VOOC_NINTH_CLK_ERR)) {
+			/* The vendor IRQ path can report a transient TX write failure
+			 * just after fast entry, while the adapter is stepping VBUS and
+			 * before the primary CP gate has run.  Keep the bounded exchange
+			 * alive in that state (and after CP start) so the next VBUS-OK
+			 * frame can complete the state transition; any protocol
+			 * transition or ninth-clock error still aborts immediately. */
+			if ((vooc_cp_enabled || fast_entry_sent ||
+			     (sc->vooc_model_done && sc->vooc_batt_remaining <= 1)) &&
+			    (flags & SC8547_VOOC_TXDATA_WR_FAIL) &&
+			    !(flags & (SC8547_VOOC_ERR_TRANS |
+				       SC8547_VOOC_NINTH_CLK_ERR))) {
+				if (!vooc_tx_fail_seen) {
+					dev_warn(sc->dev,
+						 "VOOC TXDATA_WR_FAIL during fast entry; continuing bounded monitor\n");
+					vooc_tx_fail_seen = true;
+				}
+				/* Continue with the normal ADC and CP status checks below. */
+				ret = 0;
+			} else {
+				ret = -EIO;
+				break;
+			}
+		}
+
+		elapsed_us = ktime_us_delta(ktime_get(), start);
+		if (elapsed_us >= next_adc_sample_us) {
+			vbus_uv = sc8547_get_vbus_uv(sc);
+			if (vbus_uv < 0) {
+				ret = vbus_uv;
+				break;
+			}
+			sc->vooc_last_vbus_uv = vbus_uv;
+			if (vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+				dev_warn(sc->dev,
+					 "VOOC VBUS safety ceiling exceeded while polling: %d uV (limit %d)\n",
+					 vbus_uv, SC8547_VOOC_MAX_VBUS_UV);
+				ret = -EOVERFLOW;
+				break;
+			}
+
+			ibus_ua = sc8547_get_ibus_ua(sc);
+				if (ibus_ua >= 0)
+					sc->vooc_last_ibus_ua = ibus_ua;
+				{
+					int sampled_bat_uv = sc8547_get_vbat_uv(sc);
+
+					if (sampled_bat_uv >= 0)
+						vooc_bat_uv = sampled_bat_uv;
+				}
+				if (fast_entry_sent && !vooc_cp_enabled &&
+				    vooc_cp_gate_pending &&
+				    elapsed_us >= vooc_cp_gate_due_us) {
+					int vbat_now_uv;
+
+					vooc_cp_gate_pending = false;
+					vbat_now_uv = vooc_bat_uv;
+					if (vbat_now_uv < 0) {
+						ret = vbat_now_uv;
+						break;
+					}
+					dev_info(sc->dev,
+						 "VOOC CP gate vbus=%d vbat=%d delta=%d\n",
+						 vbus_uv, vbat_now_uv,
+						 vbus_uv - 2 * vbat_now_uv);
+					if (vbus_uv >= SC8547_VOOC_CP_MIN_VBUS_UV &&
+					    vbus_uv <= SC8547_VOOC_CP_START_MAX_VBUS_UV &&
+					    vbus_uv - 2 * vbat_now_uv >=
+						SC8547_VOOC_CP_START_LOW_DELTA_UV &&
+					     vbus_uv - 2 * vbat_now_uv <=
+						SC8547_VOOC_VBUS_HIGH_DELTA_UV) {
+						/* The upstream SC8547A primary path asserts REG07
+						 * directly.  REG0C=0x02 is the downstream slave
+						 * CP_ENABLE precondition; forcing it on the primary
+						 * can leave REG06 non-switching and immediately trip
+						 * the fail-closed cleanup. */
+						ret = sc8547_set_charge_enabled(sc, true);
+						if (ret)
+							break;
+						/* Keep the pre-session value for a failure cleanup; the
+						 * primary register is intentionally left untouched. */
+						vooc_cp_reg0c = saved_reg0c;
+						vooc_cp_enabled = true;
+						sc->vooc_last_cp_started = true;
+						vooc_cp_start_us = ktime_us_delta(ktime_get(), start);
+						next_secondary_enable_us = vooc_cp_start_us;
+						secondary_enable_deadline_us = vooc_cp_start_us +
+							SC8547_VOOC_SECONDARY_ENABLE_TIMEOUT_MS * 1000LL;
+						/* Once the adapter has accepted fast charge, keep the
+						 * same bounded protocol/ADC loop alive for the long
+						 * session window.  The outer timeout remains finite so a
+						 * stalled source cannot hold the worker indefinitely. */
+			if (continuous_session)
+				timeout_us = S64_MAX;
+			else
+				/* Include the low-current termination window in the outer
+				 * timeout so bounded sessions can send final reduced-
+				 * current frames before CP is disabled. */
+				timeout_us = ((s64)SC8547_VOOC_SESSION_MS +
+						  SC8547_VOOC_SESSION_END_GRACE_MS +
+						  SC8547_VOOC_CP_START_GRACE_MS) *
+								  1000LL;
+						dev_info(sc->dev,
+							 "VOOC primary CP work-start asserted at vbus=%d vbat=%d; "
+							 "switching check deferred %u ms continuous=%u\n",
+							 vbus_uv, vbat_now_uv,
+							 SC8547_VOOC_CP_START_SETTLE_MS,
+							 continuous_session);
+					} else if (vbus_uv >= 0 &&
+						   vbus_uv <= SC8547_VOOC_CP_START_MAX_VBUS_UV) {
+						vooc_cp_gate_pending = true;
+						vooc_cp_gate_due_us = elapsed_us +
+							SC8547_VOOC_CP_GATE_RETRY_MS * 1000LL;
+						dev_info(sc->dev,
+							 "VOOC waiting for VBUS regulation: vbus=%d vbat=%d delta=%d; retry %u ms\n",
+							 vbus_uv, vbat_now_uv,
+							 vbus_uv - 2 * vbat_now_uv,
+							 SC8547_VOOC_CP_GATE_RETRY_MS);
+					}
+				}
+				if (vooc_cp_enabled) {
+					unsigned int cp_reg06, cp_reg07 = 0, cp_reg0e;
+					int tdie_mc;
+
+					if (vbus_uv < SC8547_VOOC_CP_MIN_VBUS_UV ||
+					    vbus_uv > SC8547_VOOC_MAX_VBUS_UV ||
+					    (ibus_ua >= 0 &&
+					     ibus_ua > SC8547_VOOC_CP_MAX_IBUS_UA)) {
+						ret = -ERANGE;
+						break;
+					}
+					tdie_mc = sc8547_get_tdie_mc(sc);
+					if (tdie_mc < 0) {
+						ret = tdie_mc;
+						break;
+					}
+					if ((u32)tdie_mc > sc->tdie_max_mc) {
+						ret = -ERANGE;
+						break;
+					}
+					ret = sc8547_read_status(sc, &cp_reg06, &cp_reg0e);
+					if (ret)
+						break;
+					if (sc8547_has_fatal_fault(cp_reg06, cp_reg0e) ||
+					    (!(cp_reg06 & SC8547_CP_SWITCHING_STAT) &&
+					     elapsed_us - vooc_cp_start_us >=
+						SC8547_VOOC_CP_START_GRACE_MS * 1000LL)) {
+						ret = regmap_read(sc->regmap,
+								  SC8547_REG_CHG_CTRL,
+								  &cp_reg07);
+						if (ret)
+							break;
+						dev_warn(sc->dev,
+							 "VOOC primary CP switching check failed "
+							 "reg06=0x%02x reg07=0x%02x reg0c=0x%02x reg0e=0x%02x\n",
+							 cp_reg06, cp_reg07, vooc_cp_reg0c, cp_reg0e);
+						ret = -EIO;
+						break;
+					}
+					if (!vooc_cp_status_confirmed &&
+					    elapsed_us - vooc_cp_start_us >=
+						SC8547_VOOC_CP_START_GRACE_MS * 1000LL) {
+						vooc_cp_status_confirmed = true;
+						sc->vooc_auto_retry_count = 0;
+						dev_info(sc->dev,
+							 "VOOC primary CP switching confirmed "
+							 "status=0x%02x after %u ms\n",
+							 cp_reg06, SC8547_VOOC_CP_START_GRACE_MS);
+					}
+					if (vooc_cp_status_confirmed &&
+					    secondary_state.valid &&
+					    (!secondary_enable_attempted ||
+					     secondary_state.reenable_needed) &&
+					    elapsed_us >= next_secondary_enable_us) {
+						int primary_ibus_now;
+
+						primary_ibus_now = sc8547_get_ibus_ua(sc);
+						if (primary_ibus_now < 0) {
+							ret = primary_ibus_now;
+							dev_warn(sc->dev,
+								 "VOOC primary IBUS read failed before secondary start: %d\n",
+								 ret);
+							break;
+						}
+						ibus_ua = primary_ibus_now;
+						sc->vooc_last_ibus_ua = ibus_ua;
+						if (ibus_ua <
+						    SC8547_VOOC_SECONDARY_ENABLE_MIN_IBUS_UA) {
+							if (elapsed_us < secondary_enable_deadline_us) {
+								next_secondary_enable_us = elapsed_us +
+									SC8547_VOOC_SECONDARY_ENABLE_RETRY_MS * 1000LL;
+							} else {
+								secondary_enable_attempted = true;
+								next_secondary_enable_us = elapsed_us +
+									SC8547_VOOC_SECONDARY_ENABLE_RETRY_MS * 1000LL;
+								if (!secondary_state.held_off_logged) {
+									secondary_state.held_off_logged = true;
+									dev_info(sc->dev,
+										 "VOOC secondary held off after %u ms: primary ibus=%d below %u uA\n",
+										 SC8547_VOOC_SECONDARY_ENABLE_TIMEOUT_MS,
+										 ibus_ua,
+										 SC8547_VOOC_SECONDARY_ENABLE_MIN_IBUS_UA);
+								}
+							}
+						} else {
+							secondary_enable_attempted = true;
+							ret = sc8547_vooc_secondary_enable(
+								&secondary_state, ibus_ua,
+								&secondary_total_ibus_ua);
+							if (ret) {
+								dev_warn(sc->dev,
+									 "VOOC secondary CP start failed: %d\n",
+									 ret);
+								break;
+							}
+							sc->vooc_last_total_ibus_ua =
+								secondary_total_ibus_ua;
+							next_secondary_sample_us = elapsed_us +
+								SC8547_VOOC_SECONDARY_SAMPLE_MS * 1000LL;
+						}
+					}
+					if (secondary_state.enabled &&
+					    elapsed_us >= next_secondary_sample_us) {
+						ret = sc8547_vooc_secondary_monitor(
+							&secondary_state, ibus_ua,
+							&secondary_total_ibus_ua);
+						if (ret) {
+							dev_warn(sc->dev,
+								 "VOOC secondary CP monitor failed: %d\n", ret);
+							break;
+						}
+						sc->vooc_last_total_ibus_ua =
+							secondary_total_ibus_ua;
+						next_secondary_sample_us = elapsed_us +
+							SC8547_VOOC_SECONDARY_SAMPLE_MS * 1000LL;
+					}
+					if (!continuous_session &&
+					    elapsed_us - vooc_cp_start_us >=
+					    (s64)SC8547_VOOC_SESSION_MS * 1000LL) {
+						if (!vooc_session_ending) {
+							vooc_session_ending = true;
+							vooc_session_end_deadline_us = elapsed_us +
+								SC8547_VOOC_SESSION_END_GRACE_MS * 1000LL;
+							sc->vooc_active_current_code =
+								SC8547_VOOC_MIN_CURRENT_CODE;
+							dev_info(sc->dev,
+								 "VOOC entering %u-ms low-current termination window\n",
+								 SC8547_VOOC_SESSION_END_GRACE_MS);
+						} else if (elapsed_us >= vooc_session_end_deadline_us) {
+							ret = 0;
+							break;
+						}
+					}
+				}
+				next_adc_sample_us = elapsed_us +
+						SC8547_VOOC_ADC_SAMPLE_US;
+		}
+
+		usleep_range(SC8547_VOOC_POLL_MIN_US,
+			     SC8547_VOOC_POLL_MAX_US);
+		elapsed_us = ktime_us_delta(ktime_get(), start);
+	}
+	if (!continuous_session && vooc_cp_enabled &&
+	    !vooc_session_ending) {
+		/* If the adapter stopped sending frames exactly at the deadline,
+		 * the outer timeout still provided the bounded load-holding grace
+		 * period. Record the same termination state before disabling CP. */
+		vooc_session_ending = true;
+		sc->vooc_active_current_code = SC8547_VOOC_MIN_CURRENT_CODE;
+		dev_info(sc->dev,
+			 "VOOC termination grace elapsed without a final protocol frame\n");
+	}
+	/* Sample once while the CP is still enabled.  This catches a source
+	 * overshoot at the end of the grace window before cleanup reports success. */
+	if (vooc_cp_enabled && !ret) {
+		int final_vbus_uv = sc8547_get_vbus_uv(sc);
+
+		if (final_vbus_uv < 0) {
+			ret = final_vbus_uv;
+		} else {
+			sc->vooc_last_vbus_uv = final_vbus_uv;
+			if (final_vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+				dev_warn(sc->dev,
+					 "VOOC VBUS safety ceiling exceeded at termination: %d uV (limit %d)\n",
+					 final_vbus_uv, SC8547_VOOC_MAX_VBUS_UV);
+				ret = -EOVERFLOW;
+			}
+		}
+	}
+	if (!rx_count && ret == 0)
+		ret = -ETIMEDOUT;
+	/* A fast-charge session is successful only after the primary CP has
+	 * actually started.  A source may continue sending protocol frames while
+	 * declining the requested voltage; treating that bounded exchange as a
+	 * success suppresses the adapter reset/retry path and leaves the user at
+	 * ordinary 5 V input. */
+	if (ret == 0 && !sc->vooc_last_cp_started) {
+		dev_warn(sc->dev,
+			 "VOOC fast entry not accepted: rx_count=%u vbus=%d; retrying\n",
+			 rx_count, sc->vooc_last_vbus_uv);
+		ret = -ETIMEDOUT;
+	}
+
+out_cleanup:
+	secondary_disable_ret = sc8547_vooc_secondary_disable(&secondary_state);
+	if (secondary_disable_ret) {
+		if (!ret)
+			ret = secondary_disable_ret;
+	}
+	if (vooc_cp_enabled) {
+		int cp_disable_ret;
+
+		cp_disable_ret = sc8547_set_charge_enabled(sc, false);
+		if (cp_disable_ret)
+			dev_warn(sc->dev,
+				 "VOOC CP disable during cleanup failed: %d\n",
+				 cp_disable_ret);
+		if (cp_disable_ret && !ret)
+			ret = cp_disable_ret;
+		if (!cp_disable_ret)
+			usleep_range(10000, 20000);
+		vooc_cp_enabled = false;
+	}
+	cleanup_ret = sc8547_vooc_cleanup(sc, saved_loose, saved_timing);
+	secondary_restore_ret = sc8547_vooc_secondary_restore(&secondary_state);
+	if (secondary_restore_ret && !cleanup_ret)
+		cleanup_ret = secondary_restore_ret;
+	if (dpdm_switched) {
+		switch_ret = wcd939x_usbss_set_vooc_dpdm(false);
+		if (switch_ret && !cleanup_ret)
+			cleanup_ret = switch_ret;
+		if (switch_ret)
+			dev_warn(sc->dev, "VOOC DPDM route restore failed: %d\n",
+				 switch_ret);
+	}
+	if (cleanup_ret && !ret)
+		ret = cleanup_ret;
+	if (cleanup_ret)
+		dev_warn(sc->dev, "VOOC session cleanup failed: %d\n", cleanup_ret);
+	restore_ret = 0;
+	/* Reset may change the low control bits; preserve the idle baseline. */
+	reg07_restore_ret = regmap_write(sc->regmap, SC8547_REG_CHG_CTRL,
+					 saved_reg07);
+	if (reg07_restore_ret && !ret)
+		ret = reg07_restore_ret;
+	if (reg07_restore_ret)
+		dev_warn(sc->dev, "VOOC charge control restore failed: %d\n",
+			 reg07_restore_ret);
+	restore_ret = regmap_write(sc->regmap, SC8547_REG_IBUS_PROT,
+				   saved_reg05);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_MODE_CTRL,
+					   saved_reg09);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_IBUS_CTRL,
+					   saved_reg0c);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_SS_CTRL,
+					   saved_reg08);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_PMID2OUT,
+					   saved_reg0d);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_ADC_CTRL,
+					   saved_reg11);
+	if (restore_ret && !ret)
+		ret = restore_ret;
+	if (restore_ret)
+		dev_warn(sc->dev, "VOOC fast config restore failed: %d\n",
+			 restore_ret);
+	/* REG09 and REG3B are also touched for the vendor PHY setup. */
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_MODE_CTRL,
+					   saved_reg09);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547A_REG_OTG_CTRL,
+					   saved_reg3b);
+	if (!restore_ret)
+		restore_ret = regmap_write(sc->regmap, SC8547_REG_INT_MASK,
+					   saved_reg10);
+	if (restore_ret && !ret)
+		ret = restore_ret;
+	if (restore_ret)
+		dev_warn(sc->dev, "VOOC PHY setup restore failed: %d\n", restore_ret);
+	if (charger_suspended && usb_psy) {
+		union power_supply_propval pval = {
+			/* Remove the vendor WIRED_CHARGE_SUSPEND vote. */
+			.intval = -1,
+		};
+		int unsuspend_ret;
+
+		unsuspend_ret = power_supply_set_property(usb_psy,
+				POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &pval);
+		if (unsuspend_ret && !ret)
+			ret = unsuspend_ret;
+		if (unsuspend_ret)
+			dev_warn(sc->dev,
+				 "USB input limit restore failed: %d\n", unsuspend_ret);
+	}
+	if (usb_psy)
+		power_supply_put(usb_psy);
+
+	/* A response may have changed the adapter voltage before the PHY reset.
+	 * Keep this safety check, but do not replace the last in-session sample
+	 * with the invalid low ADC value returned after ADC/CP cleanup. */
+	cleanup_vbus_uv = sc8547_get_vbus_uv(sc);
+	if (sc->vooc_last_vbus_uv < 0 && cleanup_vbus_uv >= 0)
+		sc->vooc_last_vbus_uv = cleanup_vbus_uv;
+	/* Restoring the USB route can leave the adapter's output capacitor and
+	 * SC8547 ADC briefly above the fast-charge ceiling while the source steps
+	 * back to its idle 5 V contract.  Give that bounded, observable transient
+	 * a short decay window; a persistent over-voltage still fails closed. */
+	if (cleanup_vbus_uv > SC8547_VOOC_MAX_VBUS_UV) {
+		unsigned int waited_ms;
+
+		for (waited_ms = 0;
+		     waited_ms < SC8547_VOOC_CLEANUP_VBUS_WAIT_MS;
+		     waited_ms += SC8547_VOOC_CLEANUP_VBUS_POLL_MS) {
+			msleep(SC8547_VOOC_CLEANUP_VBUS_POLL_MS);
+			cleanup_vbus_uv = sc8547_get_vbus_uv(sc);
+			if (cleanup_vbus_uv < 0 ||
+			    cleanup_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV)
+				break;
+		}
+		if (cleanup_vbus_uv > 0 &&
+		    cleanup_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV)
+			dev_info(sc->dev,
+				 "VOOC cleanup VBUS settled to %d uV after %u ms\n",
+				 cleanup_vbus_uv, waited_ms);
+	}
+	if (cleanup_vbus_uv > SC8547_VOOC_MAX_VBUS_UV && !ret)
+		ret = -EOVERFLOW;
+
+	if (ret == -EOVERFLOW)
+		dev_warn(sc->dev,
+			 "VOOC -EOVERFLOW source unresolved: rx_count=%u session_vbus=%d cleanup_vbus=%d\n",
+			 rx_count, sc->vooc_last_vbus_uv,
+			 cleanup_vbus_uv);
+	dev_info(sc->dev,
+		 "VOOC session rc=%d frames=%u vbus_uv=%d ibus_ua=%d\n",
+		 ret, rx_count, sc->vooc_last_vbus_uv,
+		 sc->vooc_last_ibus_ua);
+	return ret;
+}
+
+static int sc8547_vooc_usb_online(void)
+{
+	struct power_supply *psy;
+	union power_supply_propval val = { };
+	int ret;
+
+	psy = power_supply_get_by_name("qcom-battmgr-usb");
+	if (!psy)
+		return -ENODEV;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	power_supply_put(psy);
+	if (ret)
+		return ret;
+
+	return val.intval ? 1 : 0;
+}
+
+/*
+ * The vendor WIRED_CHARGE_SUSPEND vote is also used to restart an adapter
+ * which is still waiting in its previous VOOC state.  A direct PHY reset is
+ * insufficient for that case: the source has to observe a short removal of
+ * the normal USB input path before it will emit a new first frame.  The
+ * Caihong battmgr exposes the same firmware request through INPUT_CURRENT_LIMIT;
+ * zero is the suspend vote and -1 removes it (U32_MAX on the wire).
+ */
+static int sc8547_vooc_restart_adapter(struct sc8547_device *sc)
+{
+	struct power_supply *psy;
+	union power_supply_propval val = { };
+	int saved_limit;
+	int suspend_ret;
+	int restore_ret;
+	int fallback_ret;
+	int ret;
+
+	psy = power_supply_get_by_name("qcom-battmgr-usb");
+	if (!psy)
+		return -ENODEV;
+
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	if (ret)
+		goto out_put;
+	if (!val.intval) {
+		ret = -ENOTCONN;
+		goto out_put;
+	}
+
+	ret = power_supply_get_property(psy,
+			POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
+	if (ret)
+		goto out_put;
+	saved_limit = val.intval;
+	if (saved_limit <= 0) {
+		/* Do not override another policy's existing suspend vote. */
+		ret = -EBUSY;
+		goto out_put;
+	}
+
+	val.intval = 0;
+	ret = power_supply_set_property(psy,
+			POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
+	suspend_ret = ret;
+	if (ret)
+		goto out_put;
+
+	msleep(SC8547_VOOC_USB_SUSPEND_MS);
+
+	/* Match the vendor votable removal rather than restoring a stale ICL. */
+	val.intval = -1;
+	restore_ret = power_supply_set_property(psy,
+			POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
+	if (restore_ret) {
+		/* Leave the input usable if the firmware rejects U32_MAX. */
+		val.intval = saved_limit;
+		fallback_ret = power_supply_set_property(psy,
+				POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
+		if (!fallback_ret) {
+			dev_warn(sc->dev,
+				 "VOOC USB restart restore rejected (%d); restored ICL=%d\n",
+				restore_ret, saved_limit);
+			ret = 0;
+		} else {
+			dev_warn(sc->dev,
+				 "VOOC USB restart restore failed: remove=%d fallback=%d\n",
+				restore_ret, fallback_ret);
+			ret = restore_ret;
+		}
+	} else {
+		ret = 0;
+	}
+	/* The vendor reset leaves the source detached briefly after the vote is
+	 * removed, allowing its protocol state machine to return to 5 V before the
+	 * PHY handshake is armed again. */
+	msleep(SC8547_VOOC_USB_SETTLE_MS);
+
+	dev_info(sc->dev,
+		 "VOOC adapter restart suspend=%d restore=%d saved_icl=%d\n",
+		 suspend_ret, restore_ret, saved_limit);
+
+out_put:
+	power_supply_put(psy);
+	return ret;
+}
+
+/*
+ * Keep the retry policy outside the protocol loop.  The vendor charger owns
+ * this boundary too: one exchange is bounded, then the AP decides whether to
+ * reactivate the PHY and start a new exchange.  This prevents a stalled
+ * adapter from holding the I2C worker forever while still allowing retries
+ * without a physical unplug.
+ */
+static void sc8547_vooc_retry_workfn(struct work_struct *work)
+{
+	struct sc8547_device *sc = container_of(to_delayed_work(work),
+						struct sc8547_device, vooc_retry_work);
+	int online;
+	int ret;
+	bool dpdm_normalized = false;
+	bool dpdm_preselected = false;
+	bool session_started = false;
+
+	if (!READ_ONCE(sc->vooc_auto_retry))
+		return;
+	if (atomic_cmpxchg(&sc->vooc_retry_running, 0, 1))
+		return;
+
+	online = sc8547_vooc_usb_online();
+	if (online <= 0) {
+		/* USB online briefly drops while battmgr applies/removes the
+		 * WIRED_CHARGE_SUSPEND vote.  Do not lose the retry window during
+		 * that transition; a genuinely disconnected source is still bounded
+		 * by the same three attempts and then disables the lab policy. */
+		if (sc->vooc_auto_retry_count + 1 <
+			    SC8547_VOOC_AUTO_RETRY_MAX) {
+			sc->vooc_auto_retry_count++;
+			dev_warn(sc->dev,
+				 "VOOC USB temporarily offline; retry %u/%u\n",
+				 sc->vooc_auto_retry_count,
+				 SC8547_VOOC_AUTO_RETRY_MAX - 1);
+			sc8547_queue_vooc_retry(sc,
+				msecs_to_jiffies(SC8547_VOOC_AUTO_RETRY_DELAY_MS));
+		} else {
+			dev_warn(sc->dev,
+				 "VOOC automatic session stopped: USB offline\n");
+			WRITE_ONCE(sc->vooc_auto_retry, false);
+			sc->vooc_auto_retry_count = 0;
+		}
+		atomic_set(&sc->vooc_retry_running, 0);
+		return;
+	}
+
+	mutex_lock(&sc->lock);
+	if (!sc->vooc_capable ||
+	    !sc->vooc_auto_retry || atomic_read(&sc->pps_running)) {
+		mutex_unlock(&sc->lock);
+		atomic_set(&sc->vooc_retry_running, 0);
+		return;
+	}
+	/* Do not wake the adapter or touch DP/DM when the gauge already reports
+	 * full, an unsafe cell temperature, or a missing safety-critical sample. */
+	ret = sc8547_update_vooc_current_policy(sc);
+	if (ret) {
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		sc->vooc_auto_retry_count = 0;
+		dev_info(sc->dev,
+			 "VOOC automatic session stopped by battery policy rc=%d full=%u\n",
+			 ret, sc->vooc_policy_full);
+		mutex_unlock(&sc->lock);
+		atomic_set(&sc->vooc_retry_running, 0);
+		return;
+	}
+
+	/* The vendor recovery path first returns the USB switch to normal mode,
+	 * then cycles the input suspend vote, waits for the adapter MCU to leave its
+	 * previous VOOC state, and only afterwards re-arms the VOOC PHY. */
+	ret = wcd939x_usbss_set_vooc_dpdm(false);
+	if (!ret) {
+		dpdm_normalized = true;
+		msleep(SC8547_VOOC_REACTIVE_SETTLE_MS);
+		ret = sc8547_vooc_restart_adapter(sc);
+	}
+	if (!ret) {
+		/* The board's USBSS needs the VOOC analog path selected before the
+		 * SC8547 PHY reset to generate the adapter's first frame.  This is
+		 * equivalent to the vendor switch_fast_chg() edge; the session repeats
+		 * the selection after both pumps are prepared. */
+		ret = wcd939x_usbss_set_vooc_dpdm(true);
+		if (!ret)
+			dpdm_preselected = true;
+	}
+	if (!ret && (!READ_ONCE(sc->vooc_auto_retry) ||
+		     atomic_read(&sc->policy_cancel)))
+		ret = -ECANCELED;
+	if (!ret) {
+		session_started = true;
+		ret = sc8547_vooc_session(sc);
+	}
+	if ((dpdm_normalized || dpdm_preselected) && !session_started)
+		wcd939x_usbss_set_vooc_dpdm(false);
+	if (!ret) {
+		sc->vooc_auto_retry_count = 0;
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		dev_info(sc->dev, "VOOC automatic session completed\n");
+	} else if (ret == -EALREADY || sc->vooc_policy_full) {
+		struct power_supply *bat_psy;
+		int ffc_ret;
+
+		/* Full is a normal terminal state for unattended charging. */
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		sc->vooc_auto_retry_count = 0;
+		bat_psy = power_supply_get_by_name("qcom-battmgr-bat");
+		if (bat_psy) {
+			ffc_ret = qcom_battmgr_caihong_notify_fastchg_complete(
+				bat_psy);
+			power_supply_put(bat_psy);
+			if (ffc_ret && ffc_ret != -EOPNOTSUPP)
+				dev_warn(sc->dev,
+					 "failed to hand off VOOC completion to FFC: %d\n",
+					 ffc_ret);
+		}
+		dev_info(sc->dev,
+			 "VOOC session reached terminal threshold; normal charging resumed\n");
+	} else if (sc->vooc_auto_retry_count + 1 <
+			   SC8547_VOOC_AUTO_RETRY_MAX &&
+			   sc->vooc_last_vbus_uv <= SC8547_VOOC_MAX_VBUS_UV) {
+		sc->vooc_auto_retry_count++;
+		dev_warn(sc->dev,
+			 "VOOC automatic session failed rc=%d; retry %u/%u\n",
+			 ret, sc->vooc_auto_retry_count,
+			 SC8547_VOOC_AUTO_RETRY_MAX - 1);
+		sc8547_queue_vooc_retry(sc,
+			msecs_to_jiffies(SC8547_VOOC_AUTO_RETRY_DELAY_MS));
+	} else {
+		dev_warn(sc->dev,
+			 "VOOC automatic session stopped after rc=%d\n", ret);
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		sc->vooc_auto_retry_count = 0;
+	}
+	mutex_unlock(&sc->lock);
+	atomic_set(&sc->vooc_retry_running, 0);
+}
+
+static void sc8547_vooc_cable_workfn(struct work_struct *work)
+{
+	struct sc8547_device *sc = container_of(to_delayed_work(work),
+						struct sc8547_device, vooc_cable_work);
+	bool was_online = READ_ONCE(sc->vooc_cable_online);
+	bool initial_check = !READ_ONCE(sc->vooc_cable_state_known);
+	unsigned long retry_delay;
+	int online;
+	int vbus_uv;
+
+	online = sc8547_vooc_usb_online();
+	vbus_uv = sc8547_get_vbus_uv(sc);
+	if (online < 0 && vbus_uv < 0) {
+		mod_delayed_work(system_wq, &sc->vooc_cable_work,
+				 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+		return;
+	}
+	WRITE_ONCE(sc->vooc_cable_state_known, true);
+
+	/* battmgr intentionally reports offline while the USB buck input is
+	 * suspended for VOOC.  A live SC8547 VBUS distinguishes that transition
+	 * from a physical cable removal. */
+	if (online <= 0 && vbus_uv < SC8547_VOOC_CABLE_PRESENT_UV) {
+		/* The normal VOOC cleanup also removes VBUS briefly before the USB
+		 * input vote is restored.  Defer the edge while protocol work owns
+		 * that transition; a real unplug remains low after cleanup and is
+		 * confirmed by the next check. */
+		if (atomic_read(&sc->vooc_retry_running) ||
+		    READ_ONCE(sc->vooc_initialized)) {
+			mod_delayed_work(system_wq, &sc->vooc_cable_work,
+					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+			return;
+		}
+		/* The official adapter reset removes its output for one second and
+		 * waits another 500 ms before reactivation.  Confirm a low-VBUS edge
+		 * twice so that reset is not mistaken for a physical unplug after the
+		 * retry worker releases its running flag.  Actual cable removal is
+		 * already fail-safe: the protocol loop loses VBUS immediately. */
+		if (was_online && ++sc->vooc_cable_absent_count <
+				SC8547_VOOC_CABLE_REMOVE_SAMPLES) {
+			mod_delayed_work(system_wq, &sc->vooc_cable_work,
+					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
+			return;
+		}
+		WRITE_ONCE(sc->vooc_cable_online, false);
+		sc->vooc_cable_absent_count = 0;
+		sc8547_vooc_reset_curve(sc);
+		WRITE_ONCE(sc->vooc_auto_retry, false);
+		atomic_set(&sc->policy_cancel, 1);
+		cancel_delayed_work(&sc->vooc_retry_work);
+		if (was_online)
+			dev_info(sc->dev,
+				 "VOOC cable removed; automatic session cancelled (vbus=%d)\n",
+				 vbus_uv);
+		return;
+	}
+
+	WRITE_ONCE(sc->vooc_cable_online, true);
+	sc->vooc_cable_absent_count = 0;
+	if (was_online)
+		return;
+
+	sc8547_vooc_reset_curve(sc);
+	atomic_set(&sc->policy_cancel, 0);
+	WRITE_ONCE(sc->vooc_auto_retry, true);
+	sc->vooc_auto_retry_count = 0;
+	retry_delay = initial_check ?
+		msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS) : 0;
+	dev_info(sc->dev,
+		 "VOOC cable inserted; scheduling automatic session in %u ms (online=%d vbus=%d)\n",
+		 initial_check ? SC8547_VOOC_BOOT_SETTLE_MS : 0,
+		 online, vbus_uv);
+	sc8547_queue_vooc_retry(sc, retry_delay);
+}
+
+static int sc8547_vooc_psy_notifier(struct notifier_block *nb,
+					unsigned long event, void *data)
+{
+	struct sc8547_device *sc = container_of(nb, struct sc8547_device,
+						vooc_psy_nb);
+	struct power_supply *psy = data;
+
+	if (event != PSY_EVENT_PROP_CHANGED || !psy ||
+	    strcmp(psy->desc->name, "qcom-battmgr-usb"))
+		return NOTIFY_DONE;
+
+	mod_delayed_work(system_wq, &sc->vooc_cable_work,
+			 msecs_to_jiffies(SC8547_VOOC_CABLE_DEBOUNCE_MS));
+	return NOTIFY_OK;
+}
+
+static int sc8547_pps_preflight(struct sc8547_device *sc)
 {
 	unsigned int reg06, reg07, reg0e;
 	int ret;
@@ -2187,7 +3796,7 @@ static int sc8547_pulse_preflight(struct sc8547_device *sc)
 	 * SC8547A reports VBUS_ERRORLO while the pump is stopped even after the
 	 * source has reached the vendor 2:1 start voltage. The vendor start path
 	 * does not reject that status before CP_SET_WORK_START. Keep every other
-	 * blocking fault fatal here; sc8547_pulse_wait_start_window() performs the
+	 * blocking fault fatal here; sc8547_pps_wait_start_window() performs the
 	 * authoritative, repeated ADC check against the live 2 * VBAT target.
 	 */
 	if ((reg06 & (SC8547_BLOCKING_06 & ~SC8547_VBUS_ERRORLO_STAT)) ||
@@ -2197,27 +3806,16 @@ static int sc8547_pulse_preflight(struct sc8547_device *sc)
 	return 0;
 }
 
-static int sc8547_pulse_rearm_runtime(struct sc8547_device *sc,
-				       struct sc8547_pulse_result *p)
+static int sc8547_pps_rearm_runtime(struct sc8547_device *sc)
 {
-	unsigned int reg07, reg09, reg11;
+	unsigned int reg09, reg11;
 	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg09);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_ADC_CTRL, &reg11);
-	if (ret)
-		return ret;
-	p->rearm_entry_reg09 = reg09;
-	p->rearm_entry_reg11 = reg11;
-	p->rearm_attempted = true;
 
 	/*
 	 * The vendor policy explicitly enables ADC and its five-second watchdog
 	 * before work-start. Any I2C access refreshes that watchdog; its dedicated
 	 * kick helper reads REG36, while each monitor sample performs several
-	 * register/ADC reads. A userspace split between the PPS ramp and bounded pulse
+	 * register/ADC reads. A split between the PPS ramp and pump start
 	 * can expose the watchdog-expired state (REG09[3]) and ADC=0. Reproduce
 	 * those harmless runtime setup calls only after the pump-off preflight;
 	 * live VBUS/VBAT are sampled and checked again before REG07 is enabled.
@@ -2228,20 +3826,12 @@ static int sc8547_pulse_rearm_runtime(struct sc8547_device *sc,
 	ret = sc8547_set_watchdog_code(sc, SC8547A_VENDOR_PPS_WATCHDOG);
 	if (ret)
 		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
-	if (ret)
-		return ret;
-
 	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg09);
 	if (ret)
 		return ret;
 	ret = regmap_read(sc->regmap, SC8547_REG_ADC_CTRL, &reg11);
 	if (ret)
 		return ret;
-	p->rearm_final_reg09 = reg09;
-	p->rearm_final_reg11 = reg11;
-	p->rearm_snapshot_valid = true;
-
 	if ((reg09 & SC8547_WATCHDOG_MASK) !=
 	    SC8547A_VENDOR_PPS_WATCHDOG ||
 	    (reg11 & SC8547_ADC_MODE_MASK) != SC8547_ADC_EN)
@@ -2250,80 +3840,48 @@ static int sc8547_pulse_rearm_runtime(struct sc8547_device *sc,
 	return 0;
 }
 
-static int sc8547_pulse_wait_start_window(struct sc8547_device *sc,
-					   struct sc8547_pulse_result *p)
+static int sc8547_pps_wait_start_window(struct sc8547_device *sc,
+					struct sc8547_pps_run_state *state)
 {
 	const struct sc8547_enable_window *w = &sc->window;
 	unsigned int reg06, reg0e;
 	unsigned int stable_samples = 0;
 	unsigned int elapsed_ms = 0;
+	int output_reference_uv;
+	int vbus_uv;
 	u64 target_uv;
 	int ret;
 
 	/*
-	 * Authorize the source while the already-running ADC and insertion
-	 * detection are still valid. A later register reset makes the pump-side
-	 * VBUS ADC read low until CHG_EN on this board, so the reset must happen
-	 * only after an in-window sample has established a valid source and
-	 * battery. This deliberately matches oplus_pps_charge_start(), which
-	 * proceeds on its first CP_VIN sample in target..target+200 mV; requiring
-	 * consecutive 10 ms samples here caused valid PPS ripple to time out even
-	 * when both the first and final readings were in range. Keep the absolute
-	 * voltage limits, hard timeout, and fatal-fault rejection intact.
+	 * Authorize the source while ADC and insertion detection remain valid.
+	 * The later hardware reset makes the stopped pump's VBUS ADC read low, so
+	 * establish the vendor target window before changing the work mode.
 	 */
 	for (;;) {
-		p->pre_vbus_uv = sc8547_get_vbus_uv(sc);
-		if (p->pre_vbus_uv < 0)
-			return p->pre_vbus_uv;
-		p->pre_vbat_uv = sc8547_get_vbat_uv(sc);
-		if (p->pre_vbat_uv < 0)
-			return p->pre_vbat_uv;
-		if (sc8547_uses_vout_reference(sc))
-			p->pre_output_reference_uv = sc8547_get_vout_uv(sc);
-		else
-			p->pre_output_reference_uv = p->pre_vbat_uv;
-		if (p->pre_output_reference_uv < 0)
-			return p->pre_output_reference_uv;
+		vbus_uv = sc8547_get_vbus_uv(sc);
+		if (vbus_uv < 0)
+			return vbus_uv;
+		output_reference_uv = sc8547_get_output_reference_uv(sc);
+		if (output_reference_uv < 0)
+			return output_reference_uv;
 
-		if (!p->first_adc_snapshot_valid) {
-			p->first_vbus_uv = p->pre_vbus_uv;
-			p->first_vbat_uv = p->pre_vbat_uv;
-			p->first_output_reference_uv =
-				p->pre_output_reference_uv;
-			p->first_adc_snapshot_valid = true;
-		}
-
-		/*
-		 * The vendor policy derives this target from the system gauge, not
-		 * from the pump-local VBAT ADC. qcom_battmgr hands that exact value
-		 * over before preparing the pump. Retain the local derivation only as
-		 * a fail-closed fallback for older test paths.
-		 */
 		if (sc->pps_target_vbus_uv) {
 			target_uv = sc->pps_target_vbus_uv;
-			p->policy_target_valid = true;
 		} else {
-			target_uv = ((u64)p->pre_output_reference_uv * 2 /
-				     100000) * 100000;
+			target_uv = ((u64)output_reference_uv * 2 / 100000) * 100000;
 			target_uv += w->start_delta_uv;
-			p->policy_target_valid = false;
 		}
-		p->target_vbus_uv = (int)target_uv;
-		p->adc_wait_ms = elapsed_ms;
-		p->preflight_snapshot_valid = true;
+		state->target_vbus_uv = (int)target_uv;
 
-		/* High readings are unsafe, not merely conversion-not-ready. */
-		if ((u32)p->pre_vbus_uv > w->vbus_max_uv ||
-		    (u32)p->pre_output_reference_uv > w->vbat_max_uv)
+		if ((u32)vbus_uv > w->vbus_max_uv ||
+		    (u32)output_reference_uv > w->vbat_max_uv)
 			return -ERANGE;
 
-		if ((u32)p->pre_vbus_uv >= w->vbus_min_uv &&
-		    (u32)p->pre_output_reference_uv >= w->vbat_min_uv &&
-		    (u64)p->pre_vbus_uv >= target_uv &&
-		    (u64)p->pre_vbus_uv <=
-				target_uv + w->start_overshoot_max_uv) {
-			stable_samples++;
-			if (stable_samples >= SC8547_ADC_READY_STABLE_SAMPLES)
+		if ((u32)vbus_uv >= w->vbus_min_uv &&
+		    (u32)output_reference_uv >= w->vbat_min_uv &&
+		    (u64)vbus_uv >= target_uv &&
+		    (u64)vbus_uv <= target_uv + w->start_overshoot_max_uv) {
+			if (++stable_samples >= SC8547_ADC_READY_STABLE_SAMPLES)
 				return 0;
 		} else {
 			stable_samples = 0;
@@ -2342,40 +3900,20 @@ static int sc8547_pulse_wait_start_window(struct sc8547_device *sc,
 	}
 }
 
-static int
-sc8547_prepare_vendor_pps_startup(struct sc8547_device *sc,
-				  struct sc8547_pulse_result *p,
-				  bool *touched)
+static int sc8547_prepare_vendor_pps_startup(struct sc8547_device *sc,
+					     bool *touched)
 {
 	const struct sc8547_raw_profile *idle = &sc->profile;
 	unsigned int reg02, reg04, reg05, reg08, reg09, reg0c, reg0d, reg10;
 	unsigned int reg11, reg2b, reg30, reg3a, reg3b, reg3c;
 	bool secondary = !strcmp(sc->role, "secondary");
 	u8 pps_ibus_prot;
+	u32 mismatch = 0;
 	int ret;
 
 	*touched = false;
 	if (!sc8547_bounded_role_supported(sc))
 		return -EOPNOTSUPP;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_PROT, &reg05);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_SS_CTRL, &reg08);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_MODE_CTRL, &reg09);
-	if (ret)
-		return ret;
-	ret = regmap_read(sc->regmap, SC8547_REG_IBUS_CTRL, &reg0c);
-	if (ret)
-		return ret;
-
-	p->pre_reg05 = reg05;
-	p->pre_reg08 = reg08;
-	p->pre_reg09 = reg09;
-	p->pre_reg0c = reg0c;
-	p->control_snapshot_valid = true;
 
 	/*
 	 * Match the wired-PPS path, not the generic CP_ENABLE helper. In
@@ -2413,8 +3951,7 @@ sc8547_prepare_vendor_pps_startup(struct sc8547_device *sc,
 	/*
 	 * The vendor low-current/FCL path keeps IBUS UCP and the coupled
 	 * soft-start timeout disabled until measured input current exceeds
-	 * 600 mA. This deliberately limited 1-A source test has repeatedly
-	 * measured only about 0.2--0.4 A, so enabling the pair from startup can
+	 * 600 mA. At low source current, enabling the pair from startup can
 	 * autonomously stop the pump near the 81.92-s REG08 timeout. Preserve all
 	 * OCP/OVP fields while reproducing the vendor low-current state. Runtime
 	 * VBUS/VAC/ratio/temperature checks remain fail-closed every 500 ms.
@@ -2517,59 +4054,43 @@ sc8547_prepare_vendor_pps_startup(struct sc8547_device *sc,
 	if (ret)
 		return ret;
 
-	p->prep_reg02 = reg02;
-	p->prep_reg04 = reg04;
-	p->prep_reg05 = reg05;
-	p->prep_reg08 = reg08;
-	p->prep_reg09 = reg09;
-	p->prep_reg0c = reg0c;
-	p->prep_reg0d = reg0d;
-	p->prep_reg10 = reg10;
-	p->prep_reg11 = reg11;
-	p->prep_reg2b = reg2b;
-	p->prep_reg30 = reg30;
-	p->prep_reg3a = reg3a;
-	p->prep_reg3b = reg3b;
-	p->prep_reg3c = reg3c;
-	p->prep_snapshot_valid = true;
-
 	if ((reg02 & SC8547_AC_OVP_CONFIG_MASK) !=
 	    (idle->reg02 & SC8547_AC_OVP_CONFIG_MASK))
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG02_CONFIG;
+		mismatch |= SC8547_PREP_MISMATCH_REG02_CONFIG;
 	if (reg02 & SC8547_AC_OVP_STAT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG02_STATUS;
+		mismatch |= SC8547_PREP_MISMATCH_REG02_STATUS;
 	if (reg04 != idle->reg04)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG04;
+		mismatch |= SC8547_PREP_MISMATCH_REG04;
 	if (reg05 != pps_ibus_prot)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG05;
+		mismatch |= SC8547_PREP_MISMATCH_REG05;
 	if ((reg08 & SC8547_SS_TIMEOUT_MASK) !=
 	    SC8547A_VENDOR_LOW_CURRENT_SS_TIMEOUT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG08;
+		mismatch |= SC8547_PREP_MISMATCH_REG08;
 	if ((reg09 & (SC8547A_VENDOR_PPS_MODE_MASK | SC8547_WATCHDOG_MASK)) !=
 	    (SC8547A_VENDOR_PPS_MODE_2TO1 | SC8547A_VENDOR_PPS_WATCHDOG))
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG09;
+		mismatch |= SC8547_PREP_MISMATCH_REG09;
 	if ((reg0d & (SC8547_PMID2OUT_UVP_MASK | SC8547_PMID2OUT_OVP_MASK)) !=
 	    SC8547A_VENDOR_PPS_PMID2OUT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG0D;
+		mismatch |= SC8547_PREP_MISMATCH_REG0D;
 	if ((reg11 & SC8547_ADC_MODE_MASK) != SC8547_ADC_EN)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG11;
+		mismatch |= SC8547_PREP_MISMATCH_REG11;
 	if (reg2b != SC8547A_VENDOR_VOOCPHY_DISABLE)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG2B;
+		mismatch |= SC8547_PREP_MISMATCH_REG2B;
 	if (secondary) {
 		if (reg30 != SC8547_VENDOR_SECONDARY_CTRL)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG30;
+			mismatch |= SC8547_PREP_MISMATCH_REG30;
 		if (reg3c != SC8547_VENDOR_SECONDARY_VBUS_RANGE)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3C;
+			mismatch |= SC8547_PREP_MISMATCH_REG3C;
 	} else {
 		if (reg10 != SC8547A_VENDOR_INSERT_IRQ_MASK)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG10;
+			mismatch |= SC8547_PREP_MISMATCH_REG10;
 		if (reg3a != SC8547A_VENDOR_PPS_TIMING)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3A;
+			mismatch |= SC8547_PREP_MISMATCH_REG3A;
 		if (reg3b != SC8547A_VENDOR_OTG_CTRL)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3B;
+			mismatch |= SC8547_PREP_MISMATCH_REG3B;
 	}
 
-	if (p->prep_mismatch)
+	if (mismatch)
 		return -EIO;
 
 	return 0;
@@ -2578,12 +4099,11 @@ sc8547_prepare_vendor_pps_startup(struct sc8547_device *sc,
 /*
  * The vendor policy prepares the pump while the source is still at its low
  * PPS entry voltage, then suspends the buck and raises VBUS.  qcom_battmgr
- * invokes the CALIBRATE coordination property at that point.  The bounded
- * pulse must only verify the preserved state here; rewriting work-mode
+ * invokes the CALIBRATE coordination property at that point.  The pump start
+ * must only verify the preserved state here; rewriting work-mode
  * registers after VBUS is high was the ordering error in earlier stages.
  */
 static int sc8547_prepare_pps_startup(struct sc8547_device *sc,
-				      struct sc8547_pulse_result *p,
 				      bool *touched)
 {
 	const struct sc8547_raw_profile *idle = &sc->profile;
@@ -2591,6 +4111,7 @@ static int sc8547_prepare_pps_startup(struct sc8547_device *sc,
 	unsigned int reg11, reg2b, reg30, reg3a, reg3b, reg3c;
 	bool secondary = !strcmp(sc->role, "secondary");
 	u8 pps_ibus_prot;
+	u32 mismatch = 0;
 	int ret;
 
 	*touched = false;
@@ -2643,75 +4164,56 @@ static int sc8547_prepare_pps_startup(struct sc8547_device *sc,
 	if (ret)
 		return ret;
 
-	p->pre_reg05 = reg05;
-	p->pre_reg08 = reg08;
-	p->pre_reg09 = reg09;
-	p->pre_reg0c = reg0c;
-	p->control_snapshot_valid = true;
-	p->prep_reg02 = reg02;
-	p->prep_reg04 = reg04;
-	p->prep_reg05 = reg05;
-	p->prep_reg08 = reg08;
-	p->prep_reg09 = reg09;
-	p->prep_reg0c = reg0c;
-	p->prep_reg0d = reg0d;
-	p->prep_reg10 = reg10;
-	p->prep_reg11 = reg11;
-	p->prep_reg2b = reg2b;
-	p->prep_reg30 = reg30;
-	p->prep_reg3a = reg3a;
-	p->prep_reg3b = reg3b;
-	p->prep_reg3c = reg3c;
-	p->prep_snapshot_valid = true;
 	pps_ibus_prot = idle->reg05 | SC8547_IBUS_UCP_DIS;
 
 	if ((reg02 & SC8547_AC_OVP_CONFIG_MASK) !=
 	    (idle->reg02 & SC8547_AC_OVP_CONFIG_MASK))
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG02_CONFIG;
+		mismatch |= SC8547_PREP_MISMATCH_REG02_CONFIG;
 	if (reg02 & SC8547_AC_OVP_STAT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG02_STATUS;
+		mismatch |= SC8547_PREP_MISMATCH_REG02_STATUS;
 	if (reg04 != idle->reg04)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG04;
+		mismatch |= SC8547_PREP_MISMATCH_REG04;
 	if (reg05 != pps_ibus_prot)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG05;
+		mismatch |= SC8547_PREP_MISMATCH_REG05;
 	if ((reg08 & SC8547_SS_TIMEOUT_MASK) !=
 	    SC8547A_VENDOR_LOW_CURRENT_SS_TIMEOUT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG08;
+		mismatch |= SC8547_PREP_MISMATCH_REG08;
 	if ((reg09 & (SC8547A_VENDOR_PPS_MODE_MASK | SC8547_WATCHDOG_MASK)) !=
 	    (SC8547A_VENDOR_PPS_MODE_2TO1 | SC8547A_VENDOR_PPS_WATCHDOG))
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG09;
+		mismatch |= SC8547_PREP_MISMATCH_REG09;
 	if ((reg0d & (SC8547_PMID2OUT_UVP_MASK | SC8547_PMID2OUT_OVP_MASK)) !=
 	    SC8547A_VENDOR_PPS_PMID2OUT)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG0D;
+		mismatch |= SC8547_PREP_MISMATCH_REG0D;
 	if ((reg11 & SC8547_ADC_MODE_MASK) != SC8547_ADC_EN)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG11;
+		mismatch |= SC8547_PREP_MISMATCH_REG11;
 	if (reg2b != SC8547A_VENDOR_VOOCPHY_DISABLE)
-		p->prep_mismatch |= SC8547_PREP_MISMATCH_REG2B;
+		mismatch |= SC8547_PREP_MISMATCH_REG2B;
 	if (secondary) {
 		if (reg30 != SC8547_VENDOR_SECONDARY_CTRL)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG30;
+			mismatch |= SC8547_PREP_MISMATCH_REG30;
 		if (reg3c != SC8547_VENDOR_SECONDARY_VBUS_RANGE)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3C;
+			mismatch |= SC8547_PREP_MISMATCH_REG3C;
 	} else {
 		if (reg10 != SC8547A_VENDOR_INSERT_IRQ_MASK)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG10;
+			mismatch |= SC8547_PREP_MISMATCH_REG10;
 		if (reg3a != SC8547A_VENDOR_PPS_TIMING)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3A;
+			mismatch |= SC8547_PREP_MISMATCH_REG3A;
 		if (reg3b != SC8547A_VENDOR_OTG_CTRL)
-			p->prep_mismatch |= SC8547_PREP_MISMATCH_REG3B;
+			mismatch |= SC8547_PREP_MISMATCH_REG3B;
 	}
 
-	if (p->prep_mismatch)
+	if (mismatch)
 		return -EIO;
 
 	return 0;
 }
 
 static int sc8547_post_prepare_check(struct sc8547_device *sc,
-				      struct sc8547_pulse_result *p)
+				      struct sc8547_pps_run_state *p)
 {
 	unsigned int reg06, reg07, reg0e, reg11, reg12;
 	int output_reference_uv;
+	int vout_uv;
 	int vbat_uv;
 	int vbus_uv;
 	int ret;
@@ -2729,13 +4231,6 @@ static int sc8547_post_prepare_check(struct sc8547_device *sc,
 	if (ret)
 		return ret;
 
-	p->ready_reg06 = reg06;
-	p->ready_reg07 = reg07;
-	p->ready_reg0e = reg0e;
-	p->ready_reg11 = reg11;
-	p->ready_reg12 = reg12;
-	p->ready_snapshot_valid = true;
-
 	/* The no-reset PPS work-start path must retain live input telemetry. */
 	vbus_uv = sc8547_get_vbus_uv(sc);
 	if (vbus_uv < 0)
@@ -2743,21 +4238,11 @@ static int sc8547_post_prepare_check(struct sc8547_device *sc,
 	vbat_uv = sc8547_get_vbat_uv(sc);
 	if (vbat_uv < 0)
 		return vbat_uv;
-	p->post_prepare_vbus_uv = vbus_uv;
-	p->post_prepare_vbat_uv = vbat_uv;
-	p->post_prepare_adc_snapshot_valid = true;
-	ret = sc8547_capture_path_snapshot(sc, &p->ready_vac_uv,
-					   &p->ready_vout_uv,
-					   &p->ready_reg33,
-					   &p->ready_reg3a,
-					   &p->ready_reg3b,
-					   &p->ready_reg3c);
-	if (ret)
-		return ret;
-	p->ready_extended_snapshot_valid = true;
-	output_reference_uv = sc8547_select_output_reference_uv(
-		sc, p->ready_vout_uv, vbat_uv);
-	p->post_prepare_output_reference_uv = output_reference_uv;
+	vout_uv = sc8547_get_vout_uv(sc);
+	if (vout_uv < 0)
+		return vout_uv;
+	output_reference_uv = sc8547_select_output_reference_uv(sc, vout_uv,
+								vbat_uv);
 
 	if ((reg07 & SC8547_CHG_EN) ||
 	    (reg06 & SC8547_CP_SWITCHING_STAT))
@@ -2790,7 +4275,7 @@ static int sc8547_post_prepare_check(struct sc8547_device *sc,
 }
 
 static int sc8547_post_prepare_check_confirmed(
-	struct sc8547_device *sc, struct sc8547_pulse_result *p)
+	struct sc8547_device *sc, struct sc8547_pps_run_state *p)
 {
 	unsigned int attempt;
 	int ret;
@@ -2809,54 +4294,16 @@ static int sc8547_post_prepare_check_confirmed(
 	     attempt < SC8547_POST_PREPARE_RANGE_RECHECKS; attempt++) {
 		usleep_range(SC8547_RUNTIME_RANGE_RECHECK_MIN_US,
 			      SC8547_RUNTIME_RANGE_RECHECK_MAX_US);
-		p->post_prepare_range_rechecks++;
 		ret = sc8547_post_prepare_check(sc, p);
-		if (ret != -ERANGE) {
-			if (!ret)
-				p->post_prepare_range_recoveries++;
+		if (ret != -ERANGE)
 			return ret;
-		}
 	}
 
 	return ret;
 }
 
-static int sc8547_capture_reject_dump(struct sc8547_device *sc,
-				       struct sc8547_pulse_result *p)
-{
-	unsigned int val;
-	unsigned int reg;
-	int ret;
-
-	p->reject_dump_valid = false;
-	for (reg = SC8547_DIAG_FIRST_REG; reg <= SC8547_DIAG_LAST_REG; reg++) {
-		ret = regmap_read(sc->regmap, reg, &val);
-		if (ret)
-			return ret;
-		p->reject_regs[reg] = val;
-	}
-	p->reject_dump_valid = true;
-
-	p->reject_vbus_uv = sc8547_get_vbus_uv(sc);
-	if (p->reject_vbus_uv < 0)
-		return 0;
-	p->reject_vbat_uv = sc8547_get_vbat_uv(sc);
-	if (p->reject_vbat_uv < 0)
-		return 0;
-	ret = sc8547_capture_path_snapshot(sc, &p->reject_vac_uv,
-					   &p->reject_vout_uv,
-					   &p->reject_reg33,
-					   &p->reject_reg3a,
-					   &p->reject_reg3b,
-					   &p->reject_reg3c);
-	if (!ret)
-		p->reject_extended_snapshot_valid = true;
-
-	return 0;
-}
-
 static int sc8547_retry_start_preflight(struct sc8547_device *sc,
-					 struct sc8547_pulse_result *p)
+					 struct sc8547_pps_run_state *p)
 {
 	const struct sc8547_enable_window *w = &sc->window;
 	unsigned int reg06, reg0e;
@@ -2888,7 +4335,7 @@ static int sc8547_retry_start_preflight(struct sc8547_device *sc,
 	    (u32)vbus_uv > w->vbus_max_uv ||
 	    (u32)output_reference_uv < w->vbat_min_uv ||
 	    (u32)output_reference_uv > w->vbat_max_uv ||
-	    (u32)tdie_mc > sc->pulse_tdie_max_mc ||
+	    (u32)tdie_mc > sc->tdie_max_mc ||
 	    vbus_uv < p->target_vbus_uv ||
 	    vbus_uv > p->target_vbus_uv +
 			(int)w->start_overshoot_max_uv)
@@ -2897,45 +4344,7 @@ static int sc8547_retry_start_preflight(struct sc8547_device *sc,
 	return 0;
 }
 
-
-int sc8547_manual_preflight(struct i2c_client *client)
-{
-	struct sc8547_device *sc = sc8547_from_client(client);
-	int ret;
-
-	if (!sc)
-		return -ENODEV;
-
-	mutex_lock(&sc->lock);
-	if (!sc->allow_experimental_cp_enable)
-		ret = -EPERM;
-	else
-		ret = sc8547_enable_preflight(sc);
-	mutex_unlock(&sc->lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sc8547_manual_preflight);
-
-static int sc8547_post_enable_check(struct sc8547_device *sc)
-{
-	unsigned int reg06, reg0e;
-	int ret;
-
-	ret = sc8547_read_status(sc, &reg06, &reg0e);
-	if (ret)
-		return ret;
-	if (!(reg0e & SC8547_ADAPTER_INSERT_STAT) ||
-	    !(reg0e & SC8547_VBAT_INSERT_STAT))
-		return -ENODEV;
-	if (!(reg06 & SC8547_CP_SWITCHING_STAT))
-		return -EIO;
-	if (sc8547_has_blocking_fault(reg06, reg0e))
-		return -EIO;
-
-	return sc8547_window_check(sc);
-}
-
-static int sc8547_manual_disable(struct sc8547_device *sc)
+static int sc8547_disable_charge_checked(struct sc8547_device *sc)
 {
 	unsigned int reg;
 	int ret;
@@ -2955,14 +4364,14 @@ static int sc8547_manual_disable(struct sc8547_device *sc)
 }
 
 static int sc8547_capture_active_sample(struct sc8547_device *sc,
-					 struct sc8547_pulse_result *p,
+					 struct sc8547_pps_run_state *p,
 					 struct sc8547_active_sample *s)
 {
 	const struct sc8547_enable_window *w = &sc->window;
 	unsigned int reg06, reg07, reg0e;
 	u32 ibus_max_ua = p->vendor_current_control ?
 		SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA :
-		SC8547_TEST_IBUS_MAX_UA;
+		SC8547_PPS_FIXED_IBUS_MAX_UA;
 	int headroom_uv;
 	int ret;
 
@@ -2974,20 +4383,18 @@ static int sc8547_capture_active_sample(struct sc8547_device *sc,
 	if (ret)
 		return ret;
 
-	s->reg06 = reg06;
-	s->reg07 = reg07;
-	s->reg0e = reg0e;
 	s->vbus_uv = sc8547_get_vbus_uv(sc);
 	if (s->vbus_uv < 0)
 		return s->vbus_uv;
 	s->vbat_uv = sc8547_get_vbat_uv(sc);
 	if (s->vbat_uv < 0)
 		return s->vbat_uv;
-	ret = sc8547_capture_path_snapshot(sc, &s->vac_uv, &s->vout_uv,
-					   &s->reg33, &s->reg3a,
-					   &s->reg3b, &s->reg3c);
-	if (ret)
-		return ret;
+	s->vac_uv = sc8547_get_vac_uv(sc);
+	if (s->vac_uv < 0)
+		return s->vac_uv;
+	s->vout_uv = sc8547_get_vout_uv(sc);
+	if (s->vout_uv < 0)
+		return s->vout_uv;
 	s->output_reference_uv = sc8547_select_output_reference_uv(
 		sc, s->vout_uv, s->vbat_uv);
 	s->ibus_ua = sc8547_get_ibus_ua(sc);
@@ -3003,39 +4410,36 @@ static int sc8547_capture_active_sample(struct sc8547_device *sc,
 	 * worker shutdown threshold against a pump-local ADC: on this board the
 	 * primary VBAT reading can sit above the gauge terminal reading, while the
 	 * secondary VBAT channel is not connected.  Keep the role-correct local
-	 * output as a diagnostic and reject only excessive low-side conversion
+	 * output for the role-correct conversion ratio and reject excessive low-side
 	 * error here.  Positive headroom remains bounded independently by the
 	 * absolute VBUS/VAC, output, current, temperature and hardware-fault gates.
 	 */
 	headroom_uv = s->vbus_uv - 2 * s->output_reference_uv;
-	s->headroom_uv = headroom_uv;
 	s->ratio_error_uv = s->vbus_uv - 2 * s->output_reference_uv;
 	if (s->ratio_error_uv < 0)
 		s->ratio_error_uv = -s->ratio_error_uv;
-	s->valid = true;
-
 	if (!(reg07 & SC8547_CHG_EN) ||
 	    !(reg06 & SC8547_CP_SWITCHING_STAT) ||
 	    sc8547_has_blocking_fault(reg06, reg0e))
 		return -EIO;
-	if ((u32)s->vbus_uv < w->pulse_vbus_min_uv ||
+	if ((u32)s->vbus_uv < w->active_vbus_min_uv ||
 	    (u32)s->vbus_uv > w->vbus_max_uv ||
-	    (u32)s->vac_uv < w->pulse_vbus_min_uv ||
+	    (u32)s->vac_uv < w->active_vbus_min_uv ||
 	    (u32)s->vac_uv > w->vbus_max_uv ||
 	    (u32)s->output_reference_uv < w->vbat_min_uv ||
 	    (u32)s->output_reference_uv > w->vbat_max_uv ||
 	    (p->vendor_current_control ?
-	     headroom_uv < -(int)w->pulse_ratio_error_max_uv :
-	     (u32)s->ratio_error_uv > w->pulse_ratio_error_max_uv) ||
+	     headroom_uv < -(int)w->ratio_error_max_uv :
+	     (u32)s->ratio_error_uv > w->ratio_error_max_uv) ||
 	    (u32)s->ibus_ua > ibus_max_ua ||
-	    (u32)s->tdie_mc > sc->pulse_tdie_max_mc)
+	    (u32)s->tdie_mc > sc->tdie_max_mc)
 		return -ERANGE;
 
 	return 0;
 }
 
 static int sc8547_capture_confirmed_active_sample(
-	struct sc8547_device *sc, struct sc8547_pulse_result *p,
+	struct sc8547_device *sc, struct sc8547_pps_run_state *p,
 	struct sc8547_active_sample *s)
 {
 	unsigned int attempt;
@@ -3055,100 +4459,19 @@ static int sc8547_capture_confirmed_active_sample(
 			return -ECANCELED;
 		usleep_range(SC8547_RUNTIME_RANGE_RECHECK_MIN_US,
 			      SC8547_RUNTIME_RANGE_RECHECK_MAX_US);
-		p->runtime_range_rechecks++;
 		ret = sc8547_capture_active_sample(sc, p, s);
-		if (ret != -ERANGE) {
-			if (!ret)
-				p->runtime_range_recoveries++;
+		if (ret != -ERANGE)
 			return ret;
-		}
 	}
 
 	return ret;
 }
 
-static void sc8547_publish_active_sample(struct sc8547_pulse_result *p,
-					  const struct sc8547_active_sample *s)
-{
-	p->on_reg06 = s->reg06;
-	p->on_reg07 = s->reg07;
-	p->on_reg0e = s->reg0e;
-	p->on_reg33 = s->reg33;
-	p->on_reg3a = s->reg3a;
-	p->on_reg3b = s->reg3b;
-	p->on_reg3c = s->reg3c;
-	p->on_vac_uv = s->vac_uv;
-	p->vbus_uv = s->vbus_uv;
-	p->on_vout_uv = s->vout_uv;
-	p->vbat_uv = s->vbat_uv;
-	p->output_reference_uv = s->output_reference_uv;
-	p->headroom_uv = s->headroom_uv;
-	p->active_target_vbus_uv = 2 * s->output_reference_uv;
-	p->ratio_error_uv = s->ratio_error_uv;
-	p->ibus_ua = s->ibus_ua;
-	p->tdie_mc = s->tdie_mc;
-	p->on_snapshot_valid = true;
-	p->on_extended_snapshot_valid = true;
-}
-
-static bool sc8547_record_runtime_sample(unsigned int sample,
-					  unsigned int count,
-					  bool continuous)
-{
-	unsigned int interval;
-
-	if (continuous)
-		return !sample ||
-		       !((sample + 1) % SC8547_SOAK_REPORT_INTERVAL);
-	if (count <= SC8547_VENDOR_START_ATTEMPTS)
-		return true;
-	if (count <= SC8547_STABILITY_RUN_MS /
-		     SC8547_STABILITY_SAMPLE_MS)
-		interval = SC8547_SHORT_REPORT_INTERVAL;
-	else if (count <= SC8547_LONG_RUN_MS /
-			  SC8547_STABILITY_SAMPLE_MS)
-		interval = SC8547_LONG_REPORT_INTERVAL;
-	else if (count <= SC8547_SOAK_RUN_MS /
-			  SC8547_STABILITY_SAMPLE_MS)
-		interval = SC8547_SOAK_REPORT_INTERVAL;
-	else
-		interval = DIV_ROUND_UP(count, SC8547_RUNTIME_RECORDS - 1);
-
-	return !sample || !((sample + 1) % interval) || sample + 1 == count;
-}
-
-static void sc8547_update_runtime_range(struct sc8547_pulse_result *p,
-					 const struct sc8547_active_sample *s)
-{
-	if (!p->runtime_observed) {
-		p->runtime_vac_min_uv = p->runtime_vac_max_uv = s->vac_uv;
-		p->runtime_vbus_min_uv = p->runtime_vbus_max_uv = s->vbus_uv;
-		p->runtime_ratio_min_uv =
-			p->runtime_ratio_max_uv = s->ratio_error_uv;
-		p->runtime_ibus_min_ua = p->runtime_ibus_max_ua = s->ibus_ua;
-		p->runtime_tdie_min_mc = p->runtime_tdie_max_mc = s->tdie_mc;
-		p->runtime_observed = true;
-		return;
-	}
-
-	p->runtime_vac_min_uv = min(p->runtime_vac_min_uv, s->vac_uv);
-	p->runtime_vac_max_uv = max(p->runtime_vac_max_uv, s->vac_uv);
-	p->runtime_vbus_min_uv = min(p->runtime_vbus_min_uv, s->vbus_uv);
-	p->runtime_vbus_max_uv = max(p->runtime_vbus_max_uv, s->vbus_uv);
-	p->runtime_ratio_min_uv =
-		min(p->runtime_ratio_min_uv, s->ratio_error_uv);
-	p->runtime_ratio_max_uv =
-		max(p->runtime_ratio_max_uv, s->ratio_error_uv);
-	p->runtime_ibus_min_ua = min(p->runtime_ibus_min_ua, s->ibus_ua);
-	p->runtime_ibus_max_ua = max(p->runtime_ibus_max_ua, s->ibus_ua);
-	p->runtime_tdie_min_mc = min(p->runtime_tdie_min_mc, s->tdie_mc);
-	p->runtime_tdie_max_mc = max(p->runtime_tdie_max_mc, s->tdie_mc);
-}
-
 static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 			  bool vendor_current_control, bool continuous)
 {
-	struct sc8547_pulse_result *p = &sc->pulse;
+	struct sc8547_pps_run_state state = { };
+	struct sc8547_pps_run_state *p = &state;
 	struct sc8547_active_sample active;
 	unsigned int attempt;
 	unsigned int sample;
@@ -3158,11 +4481,11 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	int recovery_ret;
 	int disable_ret = 0;
 	int final_ret;
+	int restore_ret;
+	int tdie_mc;
 	int ret;
 
-	atomic_set(&sc->pulse_running, 1);
-	memset(p, 0, sizeof(*p));
-	p->requested_run_ms = run_ms;
+	atomic_set(&sc->pps_running, 1);
 	p->vendor_current_control = vendor_current_control;
 	if ((!continuous &&
 	     (!run_ms || run_ms % SC8547_STABILITY_SAMPLE_MS ||
@@ -3173,7 +4496,7 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	}
 	sample_goal = continuous ? 0 :
 		run_ms / SC8547_STABILITY_SAMPLE_MS;
-	if (!sc->allow_experimental_cp_pulse ||
+	if (!sc->pps_capable ||
 	    !sc8547_bounded_role_supported(sc)) {
 		ret = -EPERM;
 		goto record;
@@ -3184,34 +4507,34 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	}
 
 	/* Preserve the vendor watchdog while confirming the role-specific off state. */
-	ret = sc8547_manual_disable(sc);
+	ret = sc8547_disable_charge_checked(sc);
 	if (ret)
 		goto record;
 	usleep_range(10000, 20000);
 
-	ret = sc8547_pulse_preflight(sc);
+	ret = sc8547_pps_preflight(sc);
 	if (ret)
 		goto record;
-	ret = sc8547_pulse_rearm_runtime(sc, p);
+	ret = sc8547_pps_rearm_runtime(sc);
 	if (ret)
 		goto record;
 
-	p->tdie_mc = sc8547_get_tdie_mc(sc);
-	if (p->tdie_mc < 0) {
-		ret = p->tdie_mc;
+	tdie_mc = sc8547_get_tdie_mc(sc);
+	if (tdie_mc < 0) {
+		ret = tdie_mc;
 		goto record;
 	}
-	if ((u32)p->tdie_mc > sc->pulse_tdie_max_mc) {
+	if ((u32)tdie_mc > sc->tdie_max_mc) {
 		ret = -ERANGE;
 		goto record;
 	}
-	ret = sc8547_pulse_preflight(sc);
+	ret = sc8547_pps_preflight(sc);
 	if (ret)
 		goto record;
-	ret = sc8547_pulse_wait_start_window(sc, p);
+	ret = sc8547_pps_wait_start_window(sc, p);
 	if (ret)
 		goto record;
-	ret = sc8547_prepare_pps_startup(sc, p, &prep_touched);
+	ret = sc8547_prepare_pps_startup(sc, &prep_touched);
 	if (ret)
 		goto disable;
 
@@ -3228,7 +4551,7 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	 * REG07 readback. The vendor state machine writes work-start, waits 500
 	 * ms, checks REG07[7], and permits three failed checks before its terminal
 	 * disable path. Revalidate the live target window before each retry and
-	 * retain a compact per-attempt trace for the test result.
+	 * retain a bounded retry sequence.
 	 */
 	for (attempt = 0; attempt < SC8547_VENDOR_START_ATTEMPTS; attempt++) {
 		if (atomic_read(&sc->policy_cancel)) {
@@ -3245,16 +4568,10 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 		ret = sc8547_set_charge_enabled(sc, true);
 		if (ret)
 			goto disable;
-		p->start_attempts++;
 
 		ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
 		if (ret)
 			goto disable;
-		p->start_immediate_reg07[attempt] = reg07;
-		if (!attempt) {
-			p->enable_reg07 = reg07;
-			p->enable_snapshot_valid = true;
-		}
 
 		msleep(SC8547_VENDOR_START_CHECK_MS);
 		ret = sc8547_read_status(sc, &reg06, &reg0e);
@@ -3263,11 +4580,6 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 		ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
 		if (ret)
 			goto disable;
-		p->start_check_reg06[attempt] = reg06;
-		p->start_check_reg07[attempt] = reg07;
-		p->start_check_reg0e[attempt] = reg0e;
-		p->start_checks++;
-
 		if (reg07 & SC8547_CHG_EN)
 			break;
 		if (sc8547_has_fatal_fault(reg06, reg0e)) {
@@ -3282,10 +4594,10 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 	}
 
 	/*
-	 * The +450 mV target belongs only to the pre-start source ramp. For legacy
-	 * bounded tests, retain the narrow 2:1 ratio-error window. The vendor-shaped
+	 * The +450 mV target belongs only to the pre-start source ramp. For
+	 * fixed-ratio PPS, retain the narrow 2:1 ratio-error window. The vendor-shaped
 	 * current-controlled run instead uses the vendor runtime floor of
-	 * 2 * VBAT + 100 mV. VOUT remains a diagnostic conversion reference, not
+	 * 2 * VBAT + 100 mV. VOUT remains the conversion reference, not
 	 * the floor reference. Absolute VBUS, IBUS, temperature and hardware-fault
 	 * limits remain unchanged. The first sample is the vendor 500-ms start
 	 * check; longer endpoints continue fail-closed sampling at 500-ms intervals
@@ -3299,29 +4611,15 @@ static int sc8547_pps_run(struct sc8547_device *sc, unsigned int run_ms,
 			goto disable;
 		}
 		ret = sc8547_capture_confirmed_active_sample(sc, p, &active);
-		p->runtime_samples = sample + 1;
-		if (active.valid) {
-			sc8547_publish_active_sample(p, &active);
-			sc8547_update_runtime_range(p, &active);
-		}
-		if ((ret || sc8547_record_runtime_sample(sample, sample_goal,
-							 continuous)) &&
-		    p->runtime_recorded < SC8547_RUNTIME_RECORDS) {
-			active.ordinal = sample + 1;
-			p->runtime[p->runtime_recorded++] = active;
-		}
 		if (ret)
 			goto reject;
 	}
 	goto disable;
 
 reject:
-	/* Match the downstream terminal dump before restore clears the cause. */
-	sc8547_capture_reject_dump(sc, p);
-
 disable:
 	/* Always turn the pump off before returning to userspace. */
-	disable_ret = sc8547_manual_disable(sc);
+	disable_ret = sc8547_disable_charge_checked(sc);
 	if (disable_ret) {
 		/* Retry through the broader fail-closed path if readback/write failed. */
 		recovery_ret = sc8547_fail_closed(sc);
@@ -3331,22 +4629,16 @@ disable:
 	if (!ret && disable_ret)
 		ret = disable_ret;
 	if (prep_touched) {
-		p->restore_attempted = true;
-		p->restore_result = sc8547_apply_experimental_init(sc);
-		p->restore_check = sc->profile_check;
-		if (!ret && p->restore_result)
-			ret = p->restore_result;
+		restore_ret = sc8547_restore_idle_profile(sc);
+		if (!ret && restore_ret)
+			ret = restore_ret;
 	}
 
 record:
-	p->disable_result = disable_ret;
 	final_ret = sc8547_read_status(sc, &reg06, &reg0e);
 	if (!final_ret)
 		final_ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg07);
 	if (!final_ret) {
-		p->final_reg06 = reg06;
-		p->final_reg07 = reg07;
-		p->final_snapshot_valid = true;
 		if ((reg06 & SC8547_CP_SWITCHING_STAT) ||
 		    (reg07 & SC8547_CHG_EN)) {
 			if (!ret)
@@ -3355,554 +4647,22 @@ record:
 	} else if (!ret) {
 		ret = final_ret;
 	}
-	p->result = ret;
-	p->valid = true;
-	atomic_set(&sc->pulse_running, 0);
+	atomic_set(&sc->pps_running, 0);
 
 	return ret;
 }
 
-static int sc8547_bounded_pps_pulse(struct sc8547_device *sc,
+static int sc8547_run_pps_bounded(struct sc8547_device *sc,
 				    unsigned int run_ms,
 				    bool vendor_current_control)
 {
 	return sc8547_pps_run(sc, run_ms, vendor_current_control, false);
 }
 
-static int sc8547_continuous_pps_run(struct sc8547_device *sc)
+static int sc8547_run_pps_continuous(struct sc8547_device *sc)
 {
 	return sc8547_pps_run(sc, 0, true, true);
 }
-
-static ssize_t cp_pulse_500ms_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	mutex_lock(&sc->lock);
-	ret = sc8547_bounded_pps_pulse(sc, SC8547_TEST_PULSE_MS, false);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(cp_pulse_500ms);
-
-static ssize_t cp_run_2s_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	mutex_lock(&sc->lock);
-	ret = sc8547_bounded_pps_pulse(sc, SC8547_SHORT_RUN_MS, false);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(cp_run_2s);
-
-static ssize_t cp_run_10s_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	mutex_lock(&sc->lock);
-	ret = sc8547_bounded_pps_pulse(sc, SC8547_STABILITY_RUN_MS, false);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(cp_run_10s);
-
-static ssize_t cp_run_60s_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	mutex_lock(&sc->lock);
-	ret = sc8547_bounded_pps_pulse(sc, SC8547_LONG_RUN_MS, false);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(cp_run_60s);
-
-static ssize_t cp_run_5m_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	mutex_lock(&sc->lock);
-	ret = sc8547_bounded_pps_pulse(sc, SC8547_SOAK_RUN_MS, false);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(cp_run_5m);
-
-static const char *
-sc8547_pulse_result_cause(const struct sc8547_pulse_result *p)
-{
-	if (!p->result)
-		return "none";
-	if (p->result == -ECANCELED)
-		return "cancelled";
-	if (!p->reject_dump_valid)
-		return "setup";
-	if (p->reject_regs[SC8547_REG_FAULT_0F] &
-	    SC8547_IBUS_UCP_FALL_FLAG)
-		return "ibus-ucp-fall";
-	if (p->reject_regs[SC8547_REG_FAULT_0F])
-		return "hardware-protection";
-	if (p->reject_regs[SC8547_REG_STATUS_06] & SC8547_SS_TIMEOUT_FLAG)
-		return "soft-start-timeout";
-	if (!(p->reject_regs[SC8547_REG_CHG_CTRL] & SC8547_CHG_EN))
-		return "pump-stopped";
-	if (p->result == -ERANGE)
-		return "runtime-window";
-
-	return "runtime";
-}
-
-static ssize_t pulse_result_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	struct sc8547_pulse_result p;
-	unsigned int sample;
-	size_t len = 0;
-
-	if (!mutex_trylock(&sc->lock))
-		return sysfs_emit(buf, "revision=%s running=%u busy=1\n",
-				  SC8547_EXPERIMENT_REVISION,
-				  !!atomic_read(&sc->pulse_running));
-	p = sc->pulse;
-	mutex_unlock(&sc->lock);
-
-	if (!p.valid)
-		return sysfs_emit(buf, "not_run\n");
-
-	len += sysfs_emit_at(buf, len,
-		"revision=%s sequence=%s role=%s device_id=%02x variant=%s output_source=%s run_ms=%u rc=%d cause=%s\n",
-		SC8547_EXPERIMENT_REVISION, SC8547_EXPERIMENT_SEQUENCE,
-		sc->role, sc->device_id, sc8547_variant_name(sc->variant),
-		sc8547_output_reference_source(sc),
-		p.requested_run_ms, p.result,
-		sc8547_pulse_result_cause(&p));
-	len += sysfs_emit_at(buf, len,
-		"pre_vbus_uv=%d pre_vbat_uv=%d pre_output_reference_uv=%d target_vbus_uv=%d target_source=%s pre_wait_ms=%d\n",
-		p.pre_vbus_uv, p.pre_vbat_uv, p.pre_output_reference_uv,
-		p.target_vbus_uv,
-		p.policy_target_valid ? "qcom-gauge" : "cp-local",
-		p.adc_wait_ms);
-	len += sysfs_emit_at(buf, len,
-		"start_attempts=%u start_checks=%u start_check_ms=%u\n",
-		p.start_attempts, p.start_checks,
-		SC8547_VENDOR_START_CHECK_MS);
-	len += sysfs_emit_at(buf, len,
-		"run_samples=%u reported_samples=%u sample_ms=%u range_rechecks=%u range_recoveries=%u envelope=%s active_min_uv=%u undershoot_max_uv=%u ratio_max_uv=%u ibus_max_ua=%u ibus_adc_ceiling_ua=%u\n",
-		p.runtime_samples, p.runtime_recorded,
-		SC8547_STABILITY_SAMPLE_MS,
-		p.runtime_range_rechecks, p.runtime_range_recoveries,
-		p.vendor_current_control ? "vendor-current" : "fixed-ratio",
-		sc->window.pulse_vbus_min_uv,
-		p.vendor_current_control ?
-			sc->window.pulse_ratio_error_max_uv : 0,
-		p.vendor_current_control ? 0 :
-			sc->window.pulse_ratio_error_max_uv,
-		p.vendor_current_control ? SC8547_VENDOR_CURRENT_IBUS_MAX_UA :
-			SC8547_TEST_IBUS_MAX_UA,
-		p.vendor_current_control ?
-			SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA :
-			SC8547_TEST_IBUS_MAX_UA);
-	for (sample = 0; sample < p.runtime_recorded; sample++) {
-		len += sysfs_emit_at(buf, len,
-			"sample=%u elapsed_ms=%u valid=%u enabled=%u switching=%u vac_uv=%d vbus_uv=%d vout_uv=%d vbat_uv=%d output_reference_uv=%d headroom_uv=%d ratio_error_uv=%d ibus_ua=%d tdie_mc=%d\n",
-			p.runtime[sample].ordinal,
-			p.runtime[sample].ordinal * SC8547_STABILITY_SAMPLE_MS,
-			p.runtime[sample].valid,
-			!!(p.runtime[sample].reg07 & SC8547_CHG_EN),
-			!!(p.runtime[sample].reg06 &
-			   SC8547_CP_SWITCHING_STAT),
-			p.runtime[sample].vac_uv,
-			p.runtime[sample].vbus_uv,
-			p.runtime[sample].vout_uv,
-			p.runtime[sample].vbat_uv,
-			p.runtime[sample].output_reference_uv,
-			p.runtime[sample].headroom_uv,
-			p.runtime[sample].ratio_error_uv,
-			p.runtime[sample].ibus_ua,
-			p.runtime[sample].tdie_mc);
-	}
-	if (p.runtime_observed)
-		len += sysfs_emit_at(buf, len,
-			"observed_vac_uv=%d..%d observed_vbus_uv=%d..%d observed_ratio_error_uv=%d..%d observed_ibus_ua=%d..%d observed_tdie_mc=%d..%d\n",
-			p.runtime_vac_min_uv, p.runtime_vac_max_uv,
-			p.runtime_vbus_min_uv, p.runtime_vbus_max_uv,
-			p.runtime_ratio_min_uv, p.runtime_ratio_max_uv,
-			p.runtime_ibus_min_ua, p.runtime_ibus_max_ua,
-			p.runtime_tdie_min_mc, p.runtime_tdie_max_mc);
-	len += sysfs_emit_at(buf, len,
-		"disable_rc=%d restore_rc=%d restore_mismatch=%u final_valid=%u final_enabled=%u final_switching=%u\n",
-		p.disable_result, p.restore_result, p.restore_check.mismatch,
-		p.final_snapshot_valid,
-		p.final_snapshot_valid &&
-		!!(p.final_reg07 & SC8547_CHG_EN),
-		p.final_snapshot_valid &&
-		!!(p.final_reg06 & SC8547_CP_SWITCHING_STAT));
-	if (p.result)
-		len += sysfs_emit_at(buf, len,
-			"details=sc8547_experimental/pulse_diagnostics\n");
-
-	return len;
-}
-static DEVICE_ATTR_RO(pulse_result);
-
-static ssize_t pulse_diagnostics_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	struct sc8547_pulse_result p;
-	unsigned int reg;
-	size_t len = 0;
-
-	if (!mutex_trylock(&sc->lock))
-		return sysfs_emit(buf, "revision=%s running=%u busy=1\n",
-				  SC8547_EXPERIMENT_REVISION,
-				  !!atomic_read(&sc->pulse_running));
-	p = sc->pulse;
-	mutex_unlock(&sc->lock);
-
-	if (!p.valid)
-		return sysfs_emit(buf, "not_run\n");
-
-	len += sysfs_emit_at(buf, len,
-		"revision=%s sequence=%s role=%s device_id=%02x variant=%s output_source=%s pulse_on_cmd=%02x pulse_off_cmd=%02x run_ms=%u rc=%d disable_rc=%d restore_attempted=%u restore_rc=%d\n",
-		SC8547_EXPERIMENT_REVISION, SC8547_EXPERIMENT_SEQUENCE,
-		sc->role, sc->device_id,
-		sc8547_variant_name(sc->variant),
-		sc8547_output_reference_source(sc),
-		sc8547_charge_command(sc, true),
-		sc8547_charge_command(sc, false),
-		p.requested_run_ms, p.result, p.disable_result,
-		p.restore_attempted, p.restore_result);
-	len += sysfs_emit_at(buf, len,
-		"restore_check_attempted=%u restore_check_rc=%d restore_actual_valid=%u restore_mismatch=%u restore_reg=%02x restore_mask=%02x restore_expected=%02x restore_actual=%02x\n",
-		p.restore_check.attempted, p.restore_check.result,
-		p.restore_check.actual_valid, p.restore_check.mismatch,
-		p.restore_check.reg, p.restore_check.mask,
-		p.restore_check.expected,
-		p.restore_check.actual);
-	len += sysfs_emit_at(buf, len,
-		"rearm_attempted=%u rearm_valid=%u rearm_entry_reg09=%02x rearm_entry_reg11=%02x rearm_wd_timeout=%u rearm_final_reg09=%02x rearm_final_reg11=%02x\n",
-		p.rearm_attempted, p.rearm_snapshot_valid,
-		p.rearm_entry_reg09, p.rearm_entry_reg11,
-		!!(p.rearm_entry_reg09 & SC8547_WD_TIMEOUT2_FLAG),
-		p.rearm_final_reg09, p.rearm_final_reg11);
-	len += sysfs_emit_at(buf, len,
-		"pre_first_valid=%u pre_first_vbus_uv=%d pre_first_vbat_uv=%d pre_first_output_reference_uv=%d pre_wait_ms=%d\n",
-		p.first_adc_snapshot_valid, p.first_vbus_uv,
-		p.first_vbat_uv, p.first_output_reference_uv, p.adc_wait_ms);
-	len += sysfs_emit_at(buf, len,
-		"pre_valid=%u pre_vbus_uv=%d pre_vbat_uv=%d pre_output_reference_uv=%d target_vbus_uv=%d target_source=%s\n",
-		p.preflight_snapshot_valid, p.pre_vbus_uv, p.pre_vbat_uv,
-		p.pre_output_reference_uv, p.target_vbus_uv,
-		p.policy_target_valid ? "qcom-gauge" : "cp-local");
-	len += sysfs_emit_at(buf, len,
-		"control_valid=%u pre_reg05=%02x pre_reg08=%02x pre_reg09=%02x pre_reg0c=%02x\n",
-		p.control_snapshot_valid, p.pre_reg05, p.pre_reg08,
-		p.pre_reg09, p.pre_reg0c);
-	len += sysfs_emit_at(buf, len,
-		"prep_valid=%u prep_mismatch=%08x prep_reg02=%02x prep_reg04=%02x prep_reg05=%02x prep_reg08=%02x prep_reg09=%02x prep_reg0c=%02x prep_reg0d=%02x prep_reg10=%02x prep_reg11=%02x prep_reg2b=%02x prep_reg30=%02x prep_reg3a=%02x prep_reg3b=%02x prep_reg3c=%02x\n",
-		p.prep_snapshot_valid, p.prep_mismatch, p.prep_reg02,
-		p.prep_reg04, p.prep_reg05, p.prep_reg08, p.prep_reg09,
-		p.prep_reg0c, p.prep_reg0d, p.prep_reg10, p.prep_reg11,
-		p.prep_reg2b, p.prep_reg30, p.prep_reg3a, p.prep_reg3b,
-		p.prep_reg3c);
-	len += sysfs_emit_at(buf, len,
-		"ready_valid=%u ready_reg06=%02x ready_reg07=%02x ready_reg0e=%02x ready_reg11=%02x ready_reg12=%02x\n",
-		p.ready_snapshot_valid, p.ready_reg06, p.ready_reg07,
-		p.ready_reg0e, p.ready_reg11, p.ready_reg12);
-	len += sysfs_emit_at(buf, len,
-		"post_prepare_adc_valid=%u post_prepare_vbus_uv=%d post_prepare_vbat_uv=%d post_prepare_output_reference_uv=%d range_rechecks=%u range_recoveries=%u\n",
-		p.post_prepare_adc_snapshot_valid, p.post_prepare_vbus_uv,
-		p.post_prepare_vbat_uv, p.post_prepare_output_reference_uv,
-		p.post_prepare_range_rechecks,
-		p.post_prepare_range_recoveries);
-	len += sysfs_emit_at(buf, len,
-		"ready_path_valid=%u ready_vac_uv=%d ready_vout_uv=%d ready_reg33=%02x ready_reg3a=%02x ready_reg3b=%02x ready_reg3c=%02x vbus_range_disabled=%u\n",
-		p.ready_extended_snapshot_valid, p.ready_vac_uv,
-		p.ready_vout_uv, p.ready_reg33, p.ready_reg3a,
-		p.ready_reg3b, p.ready_reg3c, !!(p.ready_reg3c & BIT(6)));
-	len += sysfs_emit_at(buf, len,
-		"enable_valid=%u enable_reg07=%02x early_valid=%u early_enabled=%u early_switching=%u early_reg06=%02x early_reg07=%02x early_reg0e=%02x\n",
-		p.enable_snapshot_valid, p.enable_reg07,
-		p.early_snapshot_valid,
-		p.early_snapshot_valid && !!(p.early_reg07 & SC8547_CHG_EN),
-		p.early_snapshot_valid &&
-		!!(p.early_reg06 & SC8547_CP_SWITCHING_STAT),
-		p.early_reg06, p.early_reg07, p.early_reg0e);
-	len += sysfs_emit_at(buf, len,
-		"start_attempts=%u start_checks=%u start_check_ms=%u start_trace=",
-		p.start_attempts, p.start_checks,
-		SC8547_VENDOR_START_CHECK_MS);
-	for (reg = 0; reg < p.start_attempts; reg++)
-		len += sysfs_emit_at(buf, len, "%s%u:%02x/%02x/%02x/%02x",
-				     reg ? "," : "", reg + 1,
-				     p.start_immediate_reg07[reg],
-				     p.start_check_reg06[reg],
-				     p.start_check_reg07[reg],
-				     p.start_check_reg0e[reg]);
-	len += sysfs_emit_at(buf, len, "\n");
-	len += sysfs_emit_at(buf, len,
-		"run_samples=%u reported_samples=%u sample_ms=%u range_rechecks=%u range_recoveries=%u envelope=%s active_vbus_min_uv=%u active_vac_min_uv=%u undershoot_max_uv=%u ratio_max_uv=%u ibus_max_ua=%u ibus_adc_ceiling_ua=%u\n",
-		p.runtime_samples, p.runtime_recorded,
-		SC8547_STABILITY_SAMPLE_MS,
-		p.runtime_range_rechecks, p.runtime_range_recoveries,
-		p.vendor_current_control ? "vendor-current" : "fixed-ratio",
-		sc->window.pulse_vbus_min_uv,
-		sc->window.pulse_vbus_min_uv,
-		p.vendor_current_control ?
-			sc->window.pulse_ratio_error_max_uv : 0,
-		p.vendor_current_control ? 0 :
-			sc->window.pulse_ratio_error_max_uv,
-		p.vendor_current_control ? SC8547_VENDOR_CURRENT_IBUS_MAX_UA :
-			SC8547_TEST_IBUS_MAX_UA,
-		p.vendor_current_control ?
-			SC8547_VENDOR_CURRENT_IBUS_ADC_MAX_UA :
-			SC8547_TEST_IBUS_MAX_UA);
-	for (reg = 0; reg < p.runtime_recorded; reg++) {
-		len += sysfs_emit_at(buf, len,
-			"run_sample=%u elapsed_ms=%u valid=%u reg06=%02x reg07=%02x reg0e=%02x vac_uv=%d vbus_uv=%d vout_uv=%d vbat_uv=%d output_reference_uv=%d headroom_uv=%d ratio_error_uv=%d ibus_ua=%d tdie_mc=%d reg33=%02x reg3a=%02x reg3b=%02x reg3c=%02x\n",
-			p.runtime[reg].ordinal,
-			p.runtime[reg].ordinal * SC8547_STABILITY_SAMPLE_MS,
-			p.runtime[reg].valid, p.runtime[reg].reg06,
-			p.runtime[reg].reg07, p.runtime[reg].reg0e,
-			p.runtime[reg].vac_uv, p.runtime[reg].vbus_uv,
-			p.runtime[reg].vout_uv, p.runtime[reg].vbat_uv,
-			p.runtime[reg].output_reference_uv,
-			p.runtime[reg].headroom_uv,
-			p.runtime[reg].ratio_error_uv,
-			p.runtime[reg].ibus_ua, p.runtime[reg].tdie_mc,
-			p.runtime[reg].reg33, p.runtime[reg].reg3a,
-			p.runtime[reg].reg3b, p.runtime[reg].reg3c);
-	}
-	len += sysfs_emit_at(buf, len, "reject_dump_valid=%u regs00_11=",
-			     p.reject_dump_valid);
-	for (reg = SC8547_DIAG_FIRST_REG; reg <= SC8547_DIAG_LAST_REG; reg++)
-		len += sysfs_emit_at(buf, len, "%s%02x",
-				     reg == SC8547_DIAG_FIRST_REG ? "" : ",",
-				     p.reject_regs[reg]);
-	len += sysfs_emit_at(buf, len, "\n");
-	len += sysfs_emit_at(buf, len,
-		"reject_path_valid=%u reject_vac_uv=%d reject_vbus_uv=%d reject_vout_uv=%d reject_vbat_uv=%d reject_reg33=%02x reject_reg3a=%02x reject_reg3b=%02x reject_reg3c=%02x\n",
-		p.reject_extended_snapshot_valid, p.reject_vac_uv,
-		p.reject_vbus_uv, p.reject_vout_uv, p.reject_vbat_uv,
-		p.reject_reg33, p.reject_reg3a, p.reject_reg3b,
-		p.reject_reg3c);
-	len += sysfs_emit_at(buf, len,
-		"on_valid=%u enabled=%u switching=%u reg06=%02x reg07=%02x reg0e=%02x vbus_uv=%d vbat_uv=%d output_reference_uv=%d headroom_uv=%d active_target_vbus_uv=%d target_error_uv=%d ibus_ua=%d tdie_mc=%d\n",
-		p.on_snapshot_valid,
-		p.on_snapshot_valid && !!(p.on_reg07 & SC8547_CHG_EN),
-		p.on_snapshot_valid &&
-		!!(p.on_reg06 & SC8547_CP_SWITCHING_STAT),
-		p.on_reg06, p.on_reg07, p.on_reg0e, p.vbus_uv, p.vbat_uv,
-		p.output_reference_uv, p.headroom_uv, p.active_target_vbus_uv,
-		p.ratio_error_uv,
-		p.ibus_ua, p.tdie_mc);
-	len += sysfs_emit_at(buf, len,
-		"on_path_valid=%u on_vac_uv=%d on_vout_uv=%d on_reg33=%02x on_reg3a=%02x on_reg3b=%02x on_reg3c=%02x\n",
-		p.on_extended_snapshot_valid, p.on_vac_uv, p.on_vout_uv,
-		p.on_reg33, p.on_reg3a, p.on_reg3b, p.on_reg3c);
-	len += sysfs_emit_at(buf, len,
-		"final_valid=%u final_enabled=%u final_switching=%u final_reg06=%02x final_reg07=%02x\n",
-		p.final_snapshot_valid,
-		p.final_snapshot_valid && !!(p.final_reg07 & SC8547_CHG_EN),
-		p.final_snapshot_valid &&
-		!!(p.final_reg06 & SC8547_CP_SWITCHING_STAT),
-		p.final_reg06, p.final_reg07);
-
-	return len;
-}
-static DEVICE_ATTR_RO(pulse_diagnostics);
-
-static ssize_t cp_enable_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-	unsigned int reg;
-	int ret;
-
-	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &reg);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%u\n", !!(reg & SC8547_CHG_EN));
-}
-
-int sc8547_manual_enable(struct i2c_client *client)
-{
-	struct sc8547_device *sc = sc8547_from_client(client);
-	int ret;
-
-	if (!sc)
-		return -ENODEV;
-
-	mutex_lock(&sc->lock);
-	if (!sc->allow_experimental_cp_enable) {
-		ret = -EPERM;
-		goto out;
-	}
-
-	ret = sc8547_enable_preflight(sc);
-	if (ret)
-		goto out;
-	ret = sc8547_set_charge_enabled(sc, true);
-	if (ret)
-		goto out;
-
-	msleep(SC8547_POST_ENABLE_MS);
-	ret = sc8547_post_enable_check(sc);
-	if (ret)
-		sc8547_set_charge_enabled(sc, false);
-out:
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sc8547_manual_enable);
-
-int sc8547_manual_disable_client(struct i2c_client *client)
-{
-	struct sc8547_device *sc = sc8547_from_client(client);
-	int ret;
-
-	if (!sc)
-		return -ENODEV;
-
-	mutex_lock(&sc->lock);
-	if (!sc->allow_experimental_cp_enable)
-		ret = -EPERM;
-	else
-		ret = sc8547_manual_disable(sc);
-	mutex_unlock(&sc->lock);
-	if (sc->psy)
-		power_supply_changed(sc->psy);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sc8547_manual_disable_client);
-
-static ssize_t cp_enable_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	bool enable;
-	int ret;
-
-	ret = kstrtobool(buf, &enable);
-	if (ret)
-		return ret;
-
-	if (enable)
-		ret = sc8547_manual_enable(to_i2c_client(dev));
-	else
-		ret = sc8547_manual_disable_client(to_i2c_client(dev));
-	if (ret)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(cp_enable);
-
-static struct attribute *sc8547_experimental_attrs[] = {
-	&dev_attr_profile_raw.attr,
-	&dev_attr_init_state.attr,
-	&dev_attr_apply_init.attr,
-	&dev_attr_watchdog_ms.attr,
-	&dev_attr_enable_window.attr,
-	&dev_attr_work_mode.attr,
-	&dev_attr_cp_enable.attr,
-	&dev_attr_cp_pulse_500ms.attr,
-	&dev_attr_cp_run_2s.attr,
-	&dev_attr_cp_run_10s.attr,
-	&dev_attr_cp_run_60s.attr,
-	&dev_attr_cp_run_5m.attr,
-	&dev_attr_pulse_result.attr,
-	&dev_attr_pulse_diagnostics.attr,
-	NULL,
-};
-
-static umode_t sc8547_experimental_is_visible(struct kobject *kobj,
-					      struct attribute *attr, int n)
-{
-	struct device *dev = kobj_to_dev(kobj);
-	struct sc8547_device *sc = dev_get_drvdata(dev);
-
-	if (attr == &dev_attr_enable_window.attr) {
-		if (!sc || (!sc->allow_experimental_cp_enable &&
-			    !sc->allow_experimental_cp_pulse))
-			return 0;
-	} else if (attr == &dev_attr_work_mode.attr ||
-	    attr == &dev_attr_cp_enable.attr) {
-		if (!sc || !sc->allow_experimental_cp_enable)
-			return 0;
-	} else if (attr == &dev_attr_cp_pulse_500ms.attr ||
-		   attr == &dev_attr_pulse_result.attr ||
-		   attr == &dev_attr_pulse_diagnostics.attr) {
-		if (!sc || !sc->allow_experimental_cp_pulse)
-			return 0;
-	} else if (attr == &dev_attr_cp_run_2s.attr ||
-		   attr == &dev_attr_cp_run_10s.attr ||
-		   attr == &dev_attr_cp_run_60s.attr ||
-		   attr == &dev_attr_cp_run_5m.attr) {
-		if (!sc || !sc->allow_experimental_cp_pulse ||
-		    strcmp(sc->role, "primary"))
-			return 0;
-	}
-
-	return attr->mode;
-}
-
-static const struct attribute_group sc8547_experimental_attr_group = {
-	.name = "sc8547_experimental",
-	.attrs = sc8547_experimental_attrs,
-	.is_visible = sc8547_experimental_is_visible,
-};
 
 static int sc8547_probe(struct i2c_client *client)
 {
@@ -3921,7 +4681,11 @@ static int sc8547_probe(struct i2c_client *client)
 	sc->match_info = device_get_match_data(&client->dev);
 	mutex_init(&sc->lock);
 	atomic_set(&sc->policy_cancel, 0);
-	atomic_set(&sc->pulse_running, 0);
+	atomic_set(&sc->pps_running, 0);
+	atomic_set(&sc->vooc_retry_running, 0);
+	INIT_DELAYED_WORK(&sc->vooc_retry_work, sc8547_vooc_retry_workfn);
+	INIT_DELAYED_WORK(&sc->vooc_cable_work, sc8547_vooc_cable_workfn);
+	sc->vooc_psy_nb.notifier_call = sc8547_vooc_psy_notifier;
 	sc->regmap = devm_regmap_init_i2c(client, &sc8547_regmap_config);
 	if (IS_ERR(sc->regmap))
 		return dev_err_probe(&client->dev, PTR_ERR(sc->regmap),
@@ -3947,8 +4711,18 @@ static int sc8547_probe(struct i2c_client *client)
 			 sc->match_info->name, sc->device_id,
 			 sc8547_variant_name(sc->variant));
 
-	sc8547_parse_experimental_profile(sc);
-	sc8547_parse_enable_window(sc);
+	sc8547_init_board_config(sc);
+	if (sc->vooc_capable) {
+		sc->vooc_wq = alloc_ordered_workqueue("sc8547-vooc",
+						     WQ_MEM_RECLAIM);
+		if (!sc->vooc_wq)
+			return -ENOMEM;
+		ret = devm_add_action_or_reset(&client->dev,
+					       sc8547_destroy_vooc_workqueue,
+					       sc->vooc_wq);
+		if (ret)
+			return ret;
+	}
 
 	/* ADC enable alone does not start charge pumping. */
 	ret = sc8547_set_adc_enabled(sc, true);
@@ -3971,6 +4745,7 @@ static int sc8547_probe(struct i2c_client *client)
 
 	sc->psy_desc.name = psy_name;
 	sc->psy_desc.type = POWER_SUPPLY_TYPE_MAINS;
+	sc->psy_desc.no_thermal = true;
 	sc->psy_desc.properties = sc8547_psy_props;
 	sc->psy_desc.num_properties = ARRAY_SIZE(sc8547_psy_props);
 	sc->psy_desc.get_property = sc8547_psy_get_property;
@@ -3984,24 +4759,6 @@ static int sc8547_probe(struct i2c_client *client)
 		return dev_err_probe(&client->dev, PTR_ERR(sc->psy),
 				     "failed to register power supply\n");
 
-	ret = devm_device_add_group(&client->dev, &sc8547_attr_group);
-	if (ret)
-		return dev_err_probe(&client->dev, ret,
-				     "failed to create bring-up attributes\n");
-
-	if (sc->allow_experimental_control) {
-		ret = devm_device_add_group(&client->dev,
-					    &sc8547_experimental_attr_group);
-		if (ret)
-			return dev_err_probe(&client->dev, ret,
-					     "failed to create experimental attributes\n");
-		dev_warn(&client->dev,
-			 "development-only controls exposed (manual-enable=%u bounded-%s-pulse=%u)\n",
-			 sc->allow_experimental_cp_enable,
-			 sc->role,
-			 sc->allow_experimental_cp_pulse);
-	}
-
 	ret = regmap_read(sc->regmap, SC8547_REG_CHG_CTRL, &enabled);
 	if (ret)
 		return ret;
@@ -4013,17 +4770,29 @@ static int sc8547_probe(struct i2c_client *client)
 		return ret;
 
 	dev_info(&client->dev,
-		 "%s ID=0x%02x role=%s CP=%s switching=%s mode=%s%s\n",
+		 "%s ID=0x%02x role=%s CP=%s switching=%s mode=%s PPS=%s VOOC=%s\n",
 		 sc8547_variant_name(sc->variant), sc->device_id, sc->role,
 		 enabled & SC8547_CHG_EN ? "on" : "off",
 		 status & SC8547_CP_SWITCHING_STAT ? "yes" : "no",
 		 mode & SC8547_CHARGE_MODE ? "bypass" : "2:1",
-		 sc->allow_experimental_control ?
-		 " experimental-control" : " telemetry-only");
+		 sc->pps_capable ? "yes" : "no",
+		 sc->vooc_capable ? "yes" : "no");
 
 	if (!sc8547_variant_control_supported(sc->variant))
 		dev_warn(&client->dev,
-			 "silicon variant is not enabled for experimental writes\n");
+			 "silicon variant does not support charge-pump control\n");
+
+	if (sc->vooc_capable) {
+		ret = power_supply_reg_notifier(&sc->vooc_psy_nb);
+		if (ret)
+			return dev_err_probe(&client->dev, ret,
+					     "failed to register VOOC power notifier\n");
+		mod_delayed_work(system_wq, &sc->vooc_cable_work,
+				 msecs_to_jiffies(SC8547_VOOC_CABLE_DEBOUNCE_MS));
+		if (sc->vooc_auto_retry)
+			sc8547_queue_vooc_retry(sc,
+				msecs_to_jiffies(SC8547_VOOC_BOOT_SETTLE_MS));
+	}
 
 	return 0;
 }
@@ -4032,18 +4801,38 @@ static void sc8547_shutdown(struct i2c_client *client)
 {
 	struct sc8547_device *sc = i2c_get_clientdata(client);
 
-	if (!sc || !sc->allow_experimental_control)
+	if (!sc)
 		return;
 
-	/* Best-effort fail closed; never leave development CP/WDT active. */
+	if (sc->vooc_capable)
+		power_supply_unreg_notifier(&sc->vooc_psy_nb);
+	WRITE_ONCE(sc->vooc_auto_retry, false);
 	atomic_set(&sc->policy_cancel, 1);
+	cancel_delayed_work_sync(&sc->vooc_cable_work);
+	cancel_delayed_work_sync(&sc->vooc_retry_work);
+
+	/* Best-effort fail closed; never leave a charge pump or watchdog active. */
 	sc8547_fail_closed(sc);
+}
+
+static void sc8547_remove(struct i2c_client *client)
+{
+	struct sc8547_device *sc = i2c_get_clientdata(client);
+
+	if (!sc)
+		return;
+	if (sc->vooc_capable)
+		power_supply_unreg_notifier(&sc->vooc_psy_nb);
+	WRITE_ONCE(sc->vooc_auto_retry, false);
+	atomic_set(&sc->policy_cancel, 1);
+	cancel_delayed_work_sync(&sc->vooc_cable_work);
+	cancel_delayed_work_sync(&sc->vooc_retry_work);
 }
 
 static const struct of_device_id sc8547_of_match[] = {
 	{ .compatible = "southchip,sc8547", .data = &sc8547_info },
 	{ .compatible = "southchip,sc8547a", .data = &sc8547a_info },
-	/* Downstream aliases are accepted only to simplify bring-up. */
+	/* Accept downstream compatible aliases used by existing device trees. */
 	{ .compatible = "oplus,sc8547a", .data = &sc8547a_info },
 	{ .compatible = "slave_vphy_sc8547", .data = &sc8547_info },
 	{ }
@@ -4063,10 +4852,11 @@ static struct i2c_driver sc8547_driver = {
 		.of_match_table = sc8547_of_match,
 	},
 	.probe = sc8547_probe,
+	.remove = sc8547_remove,
 	.shutdown = sc8547_shutdown,
 	.id_table = sc8547_i2c_id,
 };
 module_i2c_driver(sc8547_driver);
 
-MODULE_DESCRIPTION("Southchip SC8547/SC8547A charge-pump bring-up driver");
+MODULE_DESCRIPTION("Southchip SC8547/SC8547A charge-pump driver");
 MODULE_LICENSE("GPL");

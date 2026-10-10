@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Bounded CPS8601 identification and attachment diagnostics. */
+/* Bounded CPS8601 pen charging controller for OnePlus Pad Pro (caihong). */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/completion.h>
@@ -38,12 +38,7 @@
 #define PEN_INT_FAULT (BIT(6) | BIT(7) | BIT(8) | BIT(13))
 #define PEN_INT_UNDEFINED (BIT(11) | BIT(14) | BIT(15))
 
-/* No boot-time activation: select a stage explicitly after reaching userspace. */
-static unsigned int stage;
-module_param(stage, uint, 0400);
-MODULE_PARM_DESC(stage, "Manual diagnostic: 1=transport only, 2=hardware plus probe_once/attach_once");
-
-/* Board-local lookup for the unmodified Stage6b DT; never use global GPIO IDs. */
+/* Board-local lookup for the current DT; never use global GPIO IDs. */
 static struct gpiod_lookup_table pen_gpios = {
 	.dev_id = PEN_NAME,
 	.table = {
@@ -440,8 +435,6 @@ static int pen_prepare_attach(struct pen_power *pen)
 		ret = pen_read(pen, 7, 2, &flags);
 	if (!ret && flags)
 		ret = -EBUSY;
-	dev_info(pen->dev, "attach=prepare initial_flags=%#x result=%d\n",
-		 pen->exchange.initial_flags, ret);
 	return ret;
 }
 
@@ -491,8 +484,6 @@ static int pen_cycle(struct pen_power *pen)
 		ret = pen_write_checked(pen, 5, 0xffff);
 	if (!ret)
 		ret = pen_read(pen, 4, 1, &ex->mode_after);
-	dev_info(pen->dev, "attach=supply-cycle result=%d checked=%#x mode=%#x\n",
-		 ret, ex->cycle_valid, ex->mode_after);
 	return ret;
 }
 
@@ -506,7 +497,6 @@ static void pen_cutoff(struct work_struct *work)
 	pen_off(pen);
 	mutex_unlock(&pen->power_lock);
 	complete(&pen->event);
-	dev_info(pen->dev, "attach=deadline; physical supply disabled\n");
 }
 
 static irqreturn_t pen_irq_thread(int irq, void *data)
@@ -557,8 +547,6 @@ static int pen_receive(struct pen_power *pen)
 		}
 		ret = pen_packet(ex);
 	}
-	dev_info(pen->dev, "attach=event flags=%#x asks=%u checks=%u addresses=%u valid=%u\n",
-		 flags, ex->asks, ex->checks, ex->addresses, ex->mac_valid);
 	return ret;
 }
 
@@ -603,13 +591,9 @@ static int pen_attach(struct pen_power *pen)
 			ret = pen_read(pen, 0xb, 1, &pen->exchange.command_after);
 		if (!ret)
 			ret = pen_read(pen, 4, 1, &pen->exchange.mode_after);
-		dev_info(pen->dev, "attach=enter-tx result=%d command=%#x mode=%#x\n",
-			 ret, pen->exchange.command_after, pen->exchange.mode_after);
 	}
 	if (!ret) {
 		pen->phase = "attach-observe";
-		dev_info(pen->dev, "attach=observe tx_command=%u; maximum %u ms\n",
-			 pen->tx_requested, PEN_ATTACH_MS);
 	}
 	while (!ret && !pen->exchange.mac_valid) {
 		if (atomic_read(&pen->cutoff_fired) || time_after_eq(jiffies, deadline)) {
@@ -691,7 +675,6 @@ static int pen_charge(struct pen_power *pen, unsigned long deadline)
 	pen->phase = "charge-observe";
 	started = jiffies;
 	sample_at = jiffies;
-	dev_info(pen->dev, "charge=observe; total startup/charge budget %u ms\n", PEN_ATTACH_MS);
 	while (!ret) {
 		if (time_after_eq(jiffies, deadline)) {
 			ex->charge_complete = true;
@@ -712,9 +695,6 @@ static int pen_charge(struct pen_power *pen, unsigned long deadline)
 			if (ex->temp > ex->charge_temp_max)
 				ex->charge_temp_max = ex->temp;
 			ex->charge_samples++;
-			if (ex->charge_samples % 10 == 1)
-				dev_info(pen->dev, "charge=sample vin=%u iin=%u temp=%u ept=%#x\n",
-					 ex->vin, ex->iin, ex->temp, ex->ept);
 			sample_at = jiffies + msecs_to_jiffies(100);
 		}
 		ret = pen_receive(pen);
@@ -813,9 +793,6 @@ out:
 	pen_off(pen);
 	if (atomic_read(&pen->cutoff_fired) && !pen->exchange.charge_complete)
 		ret = -ETIMEDOUT;
-	dev_info(pen->dev, "startup result=%d reads=%u checks=%u addresses=%u valid=%u\n",
-		 ret, pen->startup_ready_reads, pen->exchange.checks,
-		 pen->exchange.addresses, pen->exchange.mac_valid);
 	return ret;
 }
 
@@ -831,12 +808,10 @@ static int pen_run(struct pen_power *pen)
 	    gpiod_get_value_cansleep(pen->supply) != 0)
 		return -EIO;
 	pen->phase = "hboost";
-	dev_info(pen->dev, "probe=hboost begin\n");
 	ret = pen_set_boost(pen, 76); /* (5800 mV - 2000 mV) / 50 */
 	if (ret)
 		goto out;
 	pen->phase = "supply";
-	dev_info(pen->dev, "probe=supply begin\n");
 	gpiod_set_value_cansleep(pen->supply, 1);
 	if (gpiod_get_value_cansleep(pen->supply) != 1) {
 		ret = -EIO;
@@ -846,7 +821,6 @@ static int pen_run(struct pen_power *pen)
 	if (ret)
 		goto out;
 	pen->phase = "wake";
-	dev_info(pen->dev, "probe=wake begin\n");
 	gpiod_set_value_cansleep(pen->wake, 1);
 	if (gpiod_get_value_cansleep(pen->wake) != 1) {
 		ret = -EIO;
@@ -859,14 +833,12 @@ static int pen_run(struct pen_power *pen)
 	ret = pen_delay(pen, 2500);
 	if (!ret) {
 		pen->phase = "read-id-status";
-		dev_info(pen->dev, "probe=read-id-status begin\n");
 		ret = pen_identify(pen);
 	}
 	if (!ret && pen->attach_requested)
 		ret = pen_attach(pen);
 out:
 	/* Cut the physical path before attempting the minimum HBOOST request. */
-	dev_info(pen->dev, "probe=power-off begin; result=%d\n", ret);
 	pen_off(pen);
 	pen->cleanup = pen_set_boost(pen, 0);
 	if (gpiod_get_value_cansleep(pen->disable) != 1 ||
@@ -875,19 +847,18 @@ out:
 		pen->cleanup = -EIO;
 	if (!ret)
 		pen->phase = pen->cleanup ? "cleanup" : "done";
-	dev_info(pen->dev, "probe=power-off complete; cleanup=%d\n", pen->cleanup);
 	return ret ?: pen->cleanup;
 }
 
-static ssize_t pen_start(struct device *dev, const char *buf, size_t count, bool attach)
+static ssize_t pen_start(struct device *dev, const char *buf, size_t count)
 {
 	struct pen_power *pen = dev_get_drvdata(dev);
 	unsigned long flags;
 	int ret;
 
-	if (!sysfs_streq(buf, "1") &&
-	    !(attach && (sysfs_streq(buf, "tx") || sysfs_streq(buf, "cycle") ||
-			 sysfs_streq(buf, "startup") || sysfs_streq(buf, "charge"))))
+	if (!sysfs_streq(buf, "1") && !sysfs_streq(buf, "tx") &&
+	    !sysfs_streq(buf, "cycle") && !sysfs_streq(buf, "startup") &&
+	    !sysfs_streq(buf, "charge"))
 		return -EINVAL;
 	if (!pen->hardware_ready)
 		return -EOPNOTSUPP;
@@ -907,36 +878,27 @@ static ssize_t pen_start(struct device *dev, const char *buf, size_t count, bool
 	pen->active = true;
 	spin_unlock_irqrestore(&pen->ack_lock, flags);
 	pen_used = true;
-	pen->attach_requested = attach;
-	pen->tx_requested = attach && sysfs_streq(buf, "tx");
-	pen->cycle_requested = attach && sysfs_streq(buf, "cycle");
-	pen->charge_requested = attach && sysfs_streq(buf, "charge");
-	pen->startup_requested = attach && (sysfs_streq(buf, "startup") || pen->charge_requested);
+	pen->attach_requested = true;
+	pen->tx_requested = sysfs_streq(buf, "tx");
+	pen->cycle_requested = sysfs_streq(buf, "cycle");
+	pen->charge_requested = sysfs_streq(buf, "charge");
+	pen->startup_requested = sysfs_streq(buf, "startup") || pen->charge_requested;
 	pm_stay_awake(dev);
 	pen->result = pen_run(pen);
 	spin_lock_irqsave(&pen->ack_lock, flags);
 	pen->active = false;
 	spin_unlock_irqrestore(&pen->ack_lock, flags);
 	pm_relax(dev);
-	dev_info(dev, "diagnostic attach=%u result=%d cleanup=%d valid=%#x chip_id=%#x\n",
-		 attach, pen->result, pen->cleanup, pen->valid, pen->values[0]);
 	ret = pen->result;
 unlock:
 	mutex_unlock(&pen->lock);
 	return ret ?: count;
 }
 
-static ssize_t probe_once_store(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	return pen_start(dev, buf, count, false);
-}
-static DEVICE_ATTR_WO(probe_once);
-
 static ssize_t attach_once_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	return pen_start(dev, buf, count, true);
+	return pen_start(dev, buf, count);
 }
 static DEVICE_ATTR_WO(attach_once);
 
@@ -992,10 +954,10 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 	rejected = pen->rejected;
 	spin_unlock_irqrestore(&pen->ack_lock, flags);
 	count = sysfs_emit(buf,
-		"stage=%u hardware_ready=%u attempted=%u transport_up=%u poisoned=%u rejected=%u phase=%s result=%d cleanup=%d valid=%#x\n"
+		"hardware_ready=%u attempted=%u transport_up=%u poisoned=%u rejected=%u phase=%s result=%d cleanup=%d valid=%#x\n"
 		"chip_id=%#06x firmware=%#06x mode=%#x irq=%#x vin_raw=%u iin_raw=%u temperature_raw=%u ept=%#x\n"
 		"charge_disable=%d supply=%d wake=%d scan=%d irq_level=%d\n",
-		stage, pen->hardware_ready, pen_used, up, poisoned, rejected,
+		pen->hardware_ready, pen_used, up, poisoned, rejected,
 		pen->phase, pen->result, pen->cleanup, pen->valid,
 		pen->values[0], pen->values[1], pen->values[2], pen->values[3],
 		pen->values[4], pen->values[5], pen->values[6], pen->values[7],
@@ -1010,7 +972,6 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 static DEVICE_ATTR_RO(status);
 
 static struct attribute *pen_attrs[] = {
-	&dev_attr_probe_once.attr,
 	&dev_attr_attach_once.attr,
 	&dev_attr_attach_status.attr,
 	&dev_attr_status.attr,
@@ -1033,7 +994,6 @@ static int pen_get_hardware(struct pen_power *pen)
 	struct pinctrl_state *irq_state;
 	int ret, irq;
 
-	dev_info(dev, "setup=i2c begin\n");
 	bus = of_find_node_by_path(PEN_I2C_PATH);
 	if (!bus)
 		return -ENODEV;
@@ -1053,7 +1013,6 @@ static int pen_get_hardware(struct pen_power *pen)
 	pen->i2c = devm_i2c_new_dummy_device(dev, adapter, 0x41);
 	if (IS_ERR(pen->i2c))
 		return dev_err_probe(dev, PTR_ERR(pen->i2c), "reserve CPS8601 address\n");
-	dev_info(dev, "setup=i2c complete; address reserved, no transfer\n");
 
 	bus = of_find_node_by_path(PEN_TLMM_PATH);
 	if (!bus)
@@ -1073,27 +1032,21 @@ static int pen_get_hardware(struct pen_power *pen)
 		return ret;
 
 	/* Acquire the charge-inhibit line before any power/wake output. */
-	dev_info(dev, "setup=gpio111 inhibit begin\n");
 	pen->disable = devm_gpiod_get(dev, "charge-disable", GPIOD_OUT_HIGH);
 	if (IS_ERR(pen->disable))
 		return dev_err_probe(dev, PTR_ERR(pen->disable), "charge-disable GPIO\n");
-	dev_info(dev, "setup=gpio10 supply-off begin\n");
 	pen->supply = devm_gpiod_get(dev, "supply", GPIOD_OUT_LOW);
 	if (IS_ERR(pen->supply))
 		return dev_err_probe(dev, PTR_ERR(pen->supply), "supply GPIO\n");
-	dev_info(dev, "setup=gpio15 wake-low begin\n");
 	pen->wake = devm_gpiod_get(dev, "wake", GPIOD_OUT_LOW);
 	if (IS_ERR(pen->wake))
 		return dev_err_probe(dev, PTR_ERR(pen->wake), "wake GPIO\n");
-	dev_info(dev, "setup=gpio85 scan-low begin\n");
 	pen->scan = devm_gpiod_get(dev, "scan", GPIOD_OUT_LOW);
 	if (IS_ERR(pen->scan))
 		return dev_err_probe(dev, PTR_ERR(pen->scan), "scan GPIO\n");
-	dev_info(dev, "setup=gpio12 irq-input begin\n");
 	pen->irq = devm_gpiod_get(dev, "irq", GPIOD_IN);
 	if (IS_ERR(pen->irq))
 		return dev_err_probe(dev, PTR_ERR(pen->irq), "IRQ GPIO\n");
-	dev_info(dev, "setup=irq-pinctrl begin\n");
 	pinctrl = devm_pinctrl_get(dev);
 	if (IS_ERR(pinctrl))
 		return dev_err_probe(dev, PTR_ERR(pinctrl), "IRQ pinctrl\n");
@@ -1111,7 +1064,6 @@ static int pen_get_hardware(struct pen_power *pen)
 	if (ret)
 		return dev_err_probe(dev, ret, "IRQ request\n");
 	pen->hardware_ready = true;
-	dev_info(dev, "setup=gpio complete; supply off, charging inhibited\n");
 	return 0;
 }
 
@@ -1139,17 +1091,13 @@ static int pen_setup(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&pen->cutoff_work, pen_cutoff);
 	platform_set_drvdata(pdev, pen);
 
-	dev_info(dev, "setup=transport begin\n");
 	pen->glink = devm_pmic_glink_client_alloc(dev, PEN_OWNER, pen_reply, pen_transport, pen);
 	if (IS_ERR(pen->glink))
 		return PTR_ERR(pen->glink);
 	pmic_glink_client_register(pen->glink);
-	dev_info(dev, "setup=transport complete; no request sent\n");
-	if (stage == 2) {
-		ret = pen_get_hardware(pen);
-		if (ret)
-			return ret;
-	}
+	ret = pen_get_hardware(pen);
+	if (ret)
+		return ret;
 	ret = device_init_wakeup(dev, true);
 	if (ret)
 		return ret;
@@ -1158,8 +1106,7 @@ static int pen_setup(struct platform_device *pdev)
 		device_init_wakeup(dev, false);
 		return ret;
 	}
-	dev_info(dev, "setup=ready stage=%u hardware_ready=%u; waiting for userspace\n",
-		 stage, pen->hardware_ready);
+	dev_info(dev, "CPS8601 pen power controller ready\n");
 	return 0;
 }
 
@@ -1234,10 +1181,6 @@ static int __init pen_init(void)
 	struct platform_device *parent;
 	int ret = -ENODEV;
 
-	if (stage != 1 && stage != 2) {
-		pr_err("manual post-boot diagnostic only; specify stage=1 or stage=2\n");
-		return -EINVAL;
-	}
 	if (!of_machine_is_compatible("oneplus,caihong"))
 		return ret;
 	np = of_find_node_by_path("/pmic-glink");
@@ -1247,7 +1190,6 @@ static int __init pen_init(void)
 	if (!parent)
 		goto put_node;
 	/* A real child plus supplier link, with no DT/boot image changes. */
-	pr_info("setup=parent-lock begin stage=%u\n", stage);
 	if (!device_trylock(&parent->dev)) {
 		ret = -EBUSY;
 		goto put_parent;
@@ -1255,7 +1197,6 @@ static int __init pen_init(void)
 	if (!device_is_bound(&parent->dev) ||
 	    !of_device_is_compatible(parent->dev.of_node, "qcom,pmic-glink"))
 		goto unlock_parent;
-	pr_info("setup=child-add begin\n");
 	pen_device = platform_device_alloc(PEN_NAME, PLATFORM_DEVID_NONE);
 	if (!pen_device) {
 		ret = -ENOMEM;
@@ -1268,7 +1209,6 @@ static int __init pen_init(void)
 		pen_device = NULL;
 		goto unlock_parent;
 	}
-	pr_info("setup=provider-link begin\n");
 	if (!device_link_add(&pen_device->dev, &parent->dev, DL_FLAG_AUTOPROBE_CONSUMER)) {
 		ret = -EINVAL;
 		goto unlock_parent;
@@ -1285,23 +1225,18 @@ put_node:
 			platform_device_unregister(pen_device);
 		return ret;
 	}
-	if (stage == 2) {
-		ret = pinctrl_register_mappings(pen_pinmaps, ARRAY_SIZE(pen_pinmaps));
-		if (ret)
-			goto unregister_device;
-		gpiod_add_lookup_table(&pen_gpios);
-	}
-	pr_info("setup=driver-register begin\n");
+	ret = pinctrl_register_mappings(pen_pinmaps, ARRAY_SIZE(pen_pinmaps));
+	if (ret)
+		goto unregister_device;
+	gpiod_add_lookup_table(&pen_gpios);
 	ret = platform_driver_register(&pen_driver);
 	if (!ret && pen_probe_result) {
 		ret = pen_probe_result;
 		platform_driver_unregister(&pen_driver);
 	}
 	if (ret) {
-		if (stage == 2) {
-			gpiod_remove_lookup_table(&pen_gpios);
-			pinctrl_unregister_mappings(pen_pinmaps);
-		}
+		gpiod_remove_lookup_table(&pen_gpios);
+		pinctrl_unregister_mappings(pen_pinmaps);
 		goto unregister_device;
 	}
 	return 0;
@@ -1316,13 +1251,11 @@ static void __exit pen_exit(void)
 {
 	platform_device_unregister(pen_device);
 	platform_driver_unregister(&pen_driver);
-	if (stage == 2) {
-		gpiod_remove_lookup_table(&pen_gpios);
-		pinctrl_unregister_mappings(pen_pinmaps);
-	}
+	gpiod_remove_lookup_table(&pen_gpios);
+	pinctrl_unregister_mappings(pen_pinmaps);
 }
 module_exit(pen_exit);
 
-MODULE_DESCRIPTION("Caihong CPS8601 bounded power, ID and attachment diagnostics");
-MODULE_VERSION("9.3");
+MODULE_DESCRIPTION("Caihong CPS8601 bounded pen charging controller");
+MODULE_VERSION("10.0");
 MODULE_LICENSE("GPL");

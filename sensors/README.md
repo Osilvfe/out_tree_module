@@ -1,0 +1,248 @@
+# Caihong non-camera sensors
+
+This directory contains the non-camera sensor integration separately from the
+Qualcomm camera stack.
+
+## Architecture: the physical sensors are SSC-owned downstream
+
+The OnePlus Pad Pro (`caihong`, project 23926) device tree includes
+`sensor/caihong-sensor-23926.dtsi`.  That file does **not** describe physical
+accelerometer, gyroscope, magnetometer or ALS devices on AP-visible I2C/SPI
+buses.  It only creates the Oplus sensor-feedback SMEM endpoint and
+`sensor-devinfo` node.
+
+That matches the OnePlus `vendor/oplus/sensor` implementation: the Oplus kernel
+code is an Android/Qualcomm sensor support layer (devinfo, tracing, virtual
+sensors and command plumbing).  `sensor-devinfo` asks the sensor hub for
+`CUST_ACTION_GET_SENSOR_INFO` and receives the physical device name from SSC;
+it is not the physical sensor driver itself.
+
+For mainline Linux the validated architecture is therefore:
+
+1. recover the actual SSC registry hardware configuration;
+2. run the upstream Hexagon FastRPC default listener for the ADSP sensors
+   process;
+3. serve the stock vendor and Caihong ODM registry configuration through a
+   writable, persistent HexagonFS tree;
+4. consume SSC data through `libssc`, while keeping direct-AP IIO drivers as
+   explicit bus-handoff experiments only;
+5. use the in-tree Linux input driver for the AP-visible GPIO Hall switch.
+
+## Hardware recovered from Caihong vendor sensor registry
+
+The public Caihong vendor image contains
+`/odm/etc/sensor/config/json_list`.  Its hardware entries identify the active
+sensor set below.
+
+| Function | Registry hardware | Downstream bus / IRQ | Mainline plan |
+| --- | --- | --- | --- |
+| accelerometer + gyroscope | `icm4x607` | `bus_type=1` (SPI), instance 3, IRQ 80, high-level, keeper; orientation `-x -y +z` | validated through SSC; live accelerometer and gyroscope data, with the AP SPI node kept disabled |
+| magnetometer | `mmc56x3x` | `bus_type=0` (I2C), instance 2, address 48 decimal (`0x30`), 100-400 kHz; orientation `+y -x +z` | validated through SSC for magnetometer and compass data; direct `mmc5633.ko` remains optional only |
+| ALS / CCT | `tcs3701` through `sns_alsps` | I2C instance 2, address 57 decimal (`0x39`), IRQ 84 falling-edge, two sensor rails | live lux and vendor RGB/CCT data validated through SSC; proximity remains unavailable; direct `tcs3701.ko` remains optional only |
+| Hall / lid | `bu52053nvx` | SoC TLMM GPIO66, dual-edge, no pull, one `sensor_vddio` rail | in-tree `gpio-keys` exposes standard `EV_SW/SW_LID`; probe and suspend/resume validated |
+| free-fall / flight-detect | virtual/algorithm configuration | built on physical sensor data | do not port until the underlying physical sensors work |
+| barometer | absent from the Caihong device-specific registry and live SSC SUID list | none | no device evidence supports a pressure sensor; do not add one from generic firmware strings |
+
+Qualcomm's SSC communication-port enum confirms registry `bus_type=0` is I2C
+and `bus_type=1` is SPI.  Its interrupt enum confirms trigger type 1 is falling
+edge, 2 is dual edge and 3 is high level.
+
+### Runtime identity evidence
+
+The live SSC attribute response confirms the registry-selected physical
+drivers without handing either bus to the AP:
+
+- accelerometer and gyroscope report `icm4x607`, vendor `TDK-Invensense`,
+  driver version `0x102`, hardware ID 0, 25--400 Hz normal sample rates and an
+  800 Hz low-latency rate. Their published ranges and resolutions match the
+  official Linux ICM42607 family implementation, including up to 16 g and
+  2000 dps;
+- the magnetometer reports `mmc56x3x`, vendor `memsic`, hardware ID 0,
+  10/20/50/100 Hz sample rates, a +/-3000 range and 0.0976 resolution.
+
+The stock ADSP firmware contains both family drivers in `adsp.b22`. The IMU
+driver reads `WHO_AM_I` and rejects unknown values; the magnetometer driver
+also performs a WHO-AM-I read and reads trim registers 0x27--0x29. SSC does not
+publish either detected register value as a standard attribute. Consequently,
+the evidence confirms the driver families but does not distinguish ICM42607
+from ICM42607P or MMC5603 from MMC5633. A specific compatible must not be
+selected solely from the common range table.
+
+### TCS3701 RGB stream
+
+The stock sensor declaration enables both `android.sensor.light` and
+`qti.sensor.rgb` for TCS3701. Runtime SUID discovery confirms that SSC publishes
+the latter as data type `rgb`, name `tcs3701`, vendor `oplus`, using
+`sns_std_sensor.proto`. `cct` and `wise_rgb` are not independently published
+data types on Caihong.
+
+A live subscription produces 68-byte events containing 16 floats plus status
+3 at about 10 Hz. Matching the values against the firmware's TCS3701 report
+labels and a simultaneous `ambient_light` stream identifies this layout:
+
+| Index | Meaning | Validation |
+| --- | --- | --- |
+| 0 | CCT in kelvin | value and firmware `rpt cct` label |
+| 1--5 | R, G, B, C, W | TCS3701 firmware channel order |
+| 6 | IR ratio | firmware reports `ir_ratio / 1000` |
+| 7--8 | reserved | zero throughout the capture |
+| 9 | lux | exactly matched simultaneous `ambient_light` samples |
+| 10 | report counter | incremented once per event |
+| 11 | report type | constant 1 in the capture |
+| 12--15 | reserved | zero throughout the capture |
+
+This is an Oplus vendor payload rather than a standard Linux userspace ABI.
+`iio-sensor-proxy` has no RGB/CCT interface, while its standard ambient-light
+backend already exposes the same calibrated lux value. The RGB stream is
+therefore validated and available to a dedicated libssc consumer, but is not
+enabled persistently or translated into a made-up SensorProxy property.
+
+## Upstream/adaptation policy
+
+Prefer reviewed upstream Linux implementations over copying Android sensor-hub
+code.  Linux v7.2 already contains the MMC5603/MMC5633 IIO driver; the local
+`sensors/mmc5633.c` externalizes that implementation and intentionally keeps
+only the I2C transport because Caihong's registry explicitly places this device
+on I2C.
+
+The upstream ICM42607 driver landed after Linux v7.2 and supports both
+ICM42607/ICM42607P over I2C and SPI.  It remains the preferred IMU
+implementation, but this tree does not guess whether Caihong's `icm4x607` is
+ICM42607 (`WHO_AM_I=0x67`) or ICM42607P (`WHO_AM_I=0x60`).  The exact variant
+must come from runtime or firmware evidence.
+
+## TCS3701 direct-I2C fallback
+
+Linux v7.2 has no TCS3701-specific IIO driver and the OnePlus kernel source does
+not contain a physical TCS3701 AP driver; downstream ownership lives in the
+Qualcomm sensor subsystem.  `sensors/tcs3701.c` therefore implements a small
+standard-IIO baseline directly from the public ams OSRAM TCS3701 datasheet.
+
+The baseline intentionally stays conservative:
+
+- validates the documented device ID (`0x18`);
+- exposes raw CLEAR, RED, GREEN and BLUE 16-bit ALS channels;
+- exposes the raw 14-bit proximity result;
+- programs the datasheet-recommended 50 ms ALS integration setup
+  (`ASTEP=599`, `ATIME=29`);
+- starts ALS at the documented 256x reset gain and allows the standard IIO
+  calibration-scale control to select the documented 0.5x..1024x gain range;
+- uses the datasheet characterization proximity setup (4 mA LED drive, 4x
+  proximity gain, 8 us pulses, 8 pulses) as a conservative fallback;
+- enables each measurement engine only for a direct read, so the first version
+  does not depend on IRQ routing or runtime-PM state machines.
+
+It does **not** yet claim production lux/CCT output or a calibrated near/far
+threshold.  Those require the Caihong optical stack, panel/glass compensation,
+factory calibration and board-specific IRQ/power validation.
+
+## BU52053NVX Hall switch
+
+The BU52053NVX is a GPIO-only switch, so Caihong uses the official in-tree
+`gpio-keys` driver rather than a device-specific module:
+
+- reads a GPIO only; there is no register bus for this Hall switch;
+- reports `EV_SW/SW_LID` through the Linux input subsystem;
+- handles both rising and falling edges as required by the Caihong SSC
+  registry;
+- supports wakeup.
+
+`sensors/caihong-bu52053nvx-hall.dtsi` maps the confirmed TLMM GPIO66 and uses
+`GPIO_ACTIVE_LOW`, matching the BU52053NVX output behavior.  The downstream
+registry names its rail only as `/pmic/client/sensor_vddio`, so the DTS fragment
+does not change its power controls.
+
+Runtime validation on Caihong with Linux v7.2 confirmed that `gpio-keys`
+claims GPIO66 with no pull, registers a dual-edge IRQ named `BU52053NVX Hall
+Switch`, exposes the `SW_LID` capability, and remains wake-enabled after a
+deep-sleep cycle.  The initial GPIO level was high and `SW_LID` was inactive,
+as expected with no magnet present.  A physical cover/magnet transition is the
+remaining event-path test.
+
+## ICM42607 upstream driver port
+
+The IMU module uses the official Linux `inv_icm42607` implementation from
+commit `512d321b9397` (the complete upstream series, including the SPI front
+end, accelerometer, gyroscope and temperature support).  It is built here as
+three external modules:
+
+- `inv_icm42607.ko` (shared core and IIO devices)
+- `inv_icm42607_spi.ko` (SPI transport)
+- `inv_icm42607_i2c.ko` (I2C transport)
+
+The source is kept under `sensors/inv_icm42607/` without local protocol or
+register changes.  Caihong's registry identifies the IMU as `icm4x607` on SSC
+SPI instance 3 with a high-level IRQ and the orientation `-x -y +z`; the exact
+ICM42607 versus ICM42607P identity and the AP-visible handoff still require
+runtime evidence.  No DTS node is enabled by this module branch until that
+handoff, chip-select, interrupt GPIO and `vdd`/`vddio` regulator mapping are
+confirmed.
+
+Build it with:
+
+```sh
+make -C sensors KDIR=/path/to/linux ARCH=arm64 \
+    CROSS_COMPILE=aarch64-linux-gnu-
+```
+
+The resulting modules only prove source/API compatibility.  Loading them on a
+kernel whose DTS still assigns the same SPI controller to SSC is deliberately
+unsupported.
+
+## Qualcomm SSC runtime
+
+The official SSC route is now functional. `hexagonrpcd` attaches to
+`/dev/fastrpc-adsp` with `FASTRPC_IOCTL_INIT_ATTACH_SNS` and serves the stock
+registry to the ADSP sensors process. The firmware requires registry writes;
+using a read-only listener causes an ADSP fatal assertion. The pinned upstream
+write-support series and Caihong mapping are documented in
+[`ssc/README.md`](ssc/README.md).
+
+Runtime testing produced stable accelerometer, gyroscope, magnetometer,
+compass, ambient-light and vendor RGB/CCT samples through libssc. The ADSP
+remained running,
+and its generated persistent registry files survived listener restart, cold
+boot and deep suspend/resume. The stock Caihong `sensor_config.json` declares
+TCS3701 light and RGB sensors but no Android proximity sensor, which explains
+why SSC does not publish a proximity SUID. This confirms SSC SE3 and SE2
+ownership, so the AP `spi3` and `i2c2` probe fragments must remain opt-in and
+disabled in normal images. The board udev rule enables the validated
+`ssc-accel`, `ssc-light` and `ssc-compass` backends in `iio-sensor-proxy`;
+accelerometer orientation, lux and compass heading are available over D-Bus.
+The board mount matrix maps SSC axes as `x'=y`, `y'=-x`, `z'=z`. SensorProxy
+reports `normal`, `left-up`, `right-up` and `bottom-up` in the matching physical
+orientations, and KDE automatic display rotation is validated.
+
+SensorProxy also exposes TCS3701 lux as its standard ambient-light property.
+Plasma 6.7 KWin claims that property when automatic brightness is enabled in
+Display & Monitor and adjusts the internal KTZ8866 backlight. This end-to-end
+path is runtime-validated; no separate brightness daemon or private RGB/CCT
+translation is needed. KWin learns its per-user lux curve when the user changes
+brightness while automatic mode is active.
+
+## AP bus mapping and optional probe fragment
+
+The vendor QUPv3 description numbers its first wrapper's serial engines from
+zero.  Therefore SSC SPI instance 3 maps to mainline `spi3` at `0x00a8c000`
+(QUPv3 SE3), and SSC I2C instance 2 maps to mainline `i2c2` at `0x00a88000`
+(QUPv3 SE2).  The Caihong board currently enables `spi4` for the touchscreen;
+`spi3` remains disabled, so this mapping does not overlap the touch controller.
+
+`caihong-i2c2-sensors.dtsi` contains the registry-confirmed `0x30` MMC5603
+and `0x39` TCS3701 child nodes.  It is an opt-in probe fragment: include it
+only after confirming SSC has released I2C2 and the sensor rails are powered.
+The official ICM42607 driver requires `vdd` and `vddio` regulators and is kept
+out of DTS until those rails are mapped.  Its current upstream implementation
+uses one-shot IIO reads and does not consume the registry's SSC IRQ number;
+that IRQ remains a future buffered-sampling concern.
+
+## Next sensor work
+
+1. capture the exact `icm4x607` and MMC56x3x WHO-AM-I values if a safe SSC
+   diagnostic path becomes available, without taking their buses from SSC;
+2. add a Linux-facing RGB/CCT interface only when a concrete userspace consumer
+   can use the documented 16-float Oplus payload.
+
+ST's `vendor/st/opensource` content in the OnePlus OSS branch is NFC/eSE
+(`st21nfc`/`st54spi_gpio`), not this tablet's IMU stack, and remains intentionally
+out of this sensor port.

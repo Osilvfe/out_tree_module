@@ -1,4 +1,4 @@
-# OnePlus Pad Pro (caihong) bring-up notes
+# OnePlus Pad Pro (caihong) integration notes
 
 ## NT36532E
 
@@ -30,7 +30,9 @@ PAD -> keyboard frames use exactly the same framing with the source/destination 
 
 CRC is MSB-first polynomial `0x8005`, default init `0xc596`, over `F1/F2` through the payload (`len + 5` bytes). Commands `0x01`, `0x02` and `0x03` are keyboard, media keys and touchpad respectively. `0x2f` is the keyboard sync/heartbeat upload command. Touchpad contacts use five bytes each and support five slots.
 
-The vendor implementation also establishes an important startup property: the keyboard sends a power-up sync itself roughly 400 ms after power-on and then sends heartbeat traffic roughly every 100 ms. A mainline driver therefore does **not** need to transmit an unverified startup packet during probe. TX support can be added safely for commands whose payloads are known (LED/LCD/touchpad controls) without making probe depend on a speculative handshake.
+The vendor implementation also establishes an important startup property: the keyboard sends a power-up sync itself roughly 400 ms after power-on and then sends heartbeat traffic roughly every 100 ms. A mainline driver therefore does **not** need to transmit an unverified startup packet during probe. TX support can be added safely for commands whose payloads are known (CapsLock/LCD/touchpad controls) without making probe depend on a speculative handshake. Caihong's Pogo keyboard has no keyboard backlight; the mainline input device exposes only its CapsLock indicator as `EV_LED`. The board rootfs removes PowerDevil's generic keyboard-backlight action and cleans stale per-user shortcuts, so Plasma does not offer a non-functional keyboard-brightness control.
+
+The keyboard MCU can briefly suppress touchpad reports while processing a key or media report. The driver coalesces a single touchpad-state restore after each report edge. Restore TX uses a separate half-duplex lock from the RX parser, so the short control frame cannot hold up incoming touch frames.
 
 The current Caihong board integration uses QUPv3 wrapper 1 serial engine 7 at
 `0x00a9c000`, 921600 baud, GPIO62/63 for UART TX/RX, GPIO100 for active-high
@@ -59,10 +61,10 @@ The complete board description is kept directly in the companion kernel's
 };
 ```
 
-## Next bring-up checkpoint
+## Integration boundary
 
-For touchscreen, the next useful hardware log is the probe/firmware-download
-path and one raw IRQ packet after the module binds. For pogo, rerun a complete
-keyboard/media/touchpad/TX-control regression from the migrated external
-module. The GENI FIFO selector remains a minimal kernel-side prerequisite; see
-`patches/linux/README.md` and `docs/current-status.md`.
+Runtime driver code lives in this repository. Board pin assignments, power
+domains and device enablement remain in the companion kernel's
+`sm8650-oneplus-caihong.dts`; rootfs policy and service installation remain in
+the companion image tree. This keeps the external modules free of duplicated
+kernel patches and image-specific test scripts.

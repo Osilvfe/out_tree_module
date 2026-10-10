@@ -1,0 +1,114 @@
+name: Build sensors against arm64 Linux v7.2
+
+on:
+  push:
+    paths:
+      - 'sensors/**/*.c'
+      - 'sensors/**/*.h'
+      - 'sensors/**/*.dtsi'
+      - 'sensors/**/Kconfig'
+      - 'sensors/Makefile'
+      - 'sensors/**/Makefile'
+      - '.github/workflows/build-sensors-linux-v7.2.yml'
+  pull_request:
+    paths:
+      - 'sensors/**/*.c'
+      - 'sensors/**/*.h'
+      - 'sensors/**/*.dtsi'
+      - 'sensors/**/Kconfig'
+      - 'sensors/Makefile'
+      - 'sensors/**/Makefile'
+      - '.github/workflows/build-sensors-linux-v7.2.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: sensors-linux-v7.2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sensors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libelf-dev libssl-dev \
+            gcc-aarch64-linux-gnu
+
+      - name: Build minimal arm64 Linux v7.2 symbol table with sensor APIs
+        run: |
+          git clone --depth 1 --branch v7.2 https://github.com/torvalds/linux.git "$RUNNER_TEMP/linux"
+
+          # This CI validates the external sensor modules, not an arbitrary
+          # arm64 defconfig. Start from a small kernel and explicitly enable
+          # every framework the current modules use.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
+          cfg="$RUNNER_TEMP/linux/scripts/config"
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MODULES
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -d MODVERSIONS
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e OF
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e INPUT
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e GPIOLIB
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e REGULATOR
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e IIO
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e I2C
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e SPI_MASTER
+
+          # REGMAP_I2C is a hidden Kconfig symbol in v7.2 and cannot be
+          # enabled directly by scripts/config. The in-tree MMC5633 option
+          # selects it through the normal Kconfig dependency graph. This also
+          # makes the CI configuration describe the exact transport under test.
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e MMC5633
+
+          # The ICM42607 port uses the same IIO buffer and timestamp helpers as
+          # the in-tree InvenSense IMU drivers.  Enable the official ICM42600
+          # SPI transport so Kconfig selects the hidden shared dependencies
+          # (including REGMAP_SPI and IIO_INV_SENSORS_TIMESTAMP) through their
+          # normal dependency path.
+          "$cfg" --file "$RUNNER_TEMP/linux/.config" -e INV_ICM42600_SPI
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          for sym in MODULES OF INPUT GPIOLIB REGULATOR IIO I2C SPI SPI_MASTER \
+                     MMC5633 INV_ICM42600_SPI REGMAP_I2C REGMAP_SPI IIO_BUFFER \
+                     IIO_INV_SENSORS_TIMESTAMP; do
+            grep -q "^CONFIG_${sym}=y$" "$RUNNER_TEMP/linux/.config" || {
+              echo "CONFIG_${sym}=y was requested but Kconfig did not keep it" >&2
+              exit 1
+            }
+          done
+
+          # External-module final linking in v7.2 needs scripts/module.lds.
+          # The kernel's modules_prepare target is the supported way to create
+          # that file and the other generated headers required by M= builds.
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+
+          make -C "$RUNNER_TEMP/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+
+          # With an explicit vmlinux-only goal Linux v7.2 writes the real
+          # built-in export table as vmlinux.symvers. The frameworks required
+          # by these sensor modules are all asserted built-in above, so this is
+          # the exact kernel symbol table strict external modpost needs.
+          test -s "$RUNNER_TEMP/linux/vmlinux.symvers"
+          cp "$RUNNER_TEMP/linux/vmlinux.symvers" "$RUNNER_TEMP/linux/Module.symvers"
+          test -s "$RUNNER_TEMP/linux/Module.symvers"
+
+      - name: Build sensor modules with strict modpost
+        run: |
+          make -C sensors \
+            KDIR="$RUNNER_TEMP/linux" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
+
+      - name: Upload arm64 Linux v7.2 sensor modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: caihong-sensors-linux-v7.2-arm64-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            sensors/*.ko
+            sensors/*.dtsi
