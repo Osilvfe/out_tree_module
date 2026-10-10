@@ -807,7 +807,8 @@ static void sc8547_queue_vooc_retry(struct sc8547_device *sc,
 				    unsigned long delay)
 {
 	/* The continuous protocol exchange can remain active for the whole cable
-	 * session.  Keep it off system_wq so early boot power-supply notifications,
+	 * session. Keep it off generic system workqueues so early boot power-supply
+	 * notifications,
 	 * display setup and networking always retain their workers. */
 	mod_delayed_work(sc->vooc_wq, &sc->vooc_retry_work, delay);
 }
@@ -3690,7 +3691,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 	online = sc8547_vooc_usb_online();
 	vbus_uv = sc8547_get_vbus_uv(sc);
 	if (online < 0 && vbus_uv < 0) {
-		mod_delayed_work(system_wq, &sc->vooc_cable_work,
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 				 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 		return;
 	}
@@ -3706,7 +3707,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		 * confirmed by the next check. */
 		if (atomic_read(&sc->vooc_retry_running) ||
 		    READ_ONCE(sc->vooc_initialized)) {
-			mod_delayed_work(system_wq, &sc->vooc_cable_work,
+			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 			return;
 		}
@@ -3717,7 +3718,7 @@ static void sc8547_vooc_cable_workfn(struct work_struct *work)
 		 * already fail-safe: the protocol loop loses VBUS immediately. */
 		if (was_online && ++sc->vooc_cable_absent_count <
 				SC8547_VOOC_CABLE_REMOVE_SAMPLES) {
-			mod_delayed_work(system_wq, &sc->vooc_cable_work,
+			mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 					 msecs_to_jiffies(SC8547_VOOC_CABLE_RECHECK_MS));
 			return;
 		}
@@ -3763,7 +3764,7 @@ static int sc8547_vooc_psy_notifier(struct notifier_block *nb,
 	    strcmp(psy->desc->name, "qcom-battmgr-usb"))
 		return NOTIFY_DONE;
 
-	mod_delayed_work(system_wq, &sc->vooc_cable_work,
+	mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 			 msecs_to_jiffies(SC8547_VOOC_CABLE_DEBOUNCE_MS));
 	return NOTIFY_OK;
 }
@@ -4788,7 +4789,7 @@ static int sc8547_probe(struct i2c_client *client)
 		if (ret)
 			return dev_err_probe(&client->dev, ret,
 					     "failed to register VOOC power notifier\n");
-		mod_delayed_work(system_wq, &sc->vooc_cable_work,
+		mod_delayed_work(system_dfl_wq, &sc->vooc_cable_work,
 				 msecs_to_jiffies(SC8547_VOOC_CABLE_DEBOUNCE_MS));
 		if (sc->vooc_auto_retry)
 			sc8547_queue_vooc_retry(sc,
