@@ -1,6 +1,6 @@
 # out_tree_module
 
-Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
+Board-specific out-of-tree Linux drivers for the OnePlus Pad Pro (SM8650,
 `oneplus,caihong`).
 
 ## Modules
@@ -8,19 +8,22 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
 - `nt36532e_ts.ko`: Novatek NT36532E no-flash SPI touchscreen + pen.
 - `oneplus_pogo.ko`: OnePlus/Oplus pogo keyboard/touchpad protocol over UART
   using `serdev`.
-- `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump bring-up driver.
-- `camera/sc820cs.ko`: Caihong front SC820CS V4L2 driver; chip ID `0xd154`
+- `sc8547_cp.ko`: Southchip SC8547/SC8547A dual charge-pump driver with
+  automatic SVOOC and coordinated PPS operation.
+- `caihong_pen_power.ko`: on-demand CPS8601 controller used by the bounded
+  pen-charging service. The module leaves power inhibited outside a request.
+- `sc820cs.ko`: Caihong front SC820CS V4L2 driver; chip ID `0xd154`
   at Linux address `0x10` and a validated 3264x2448 RAW10 stream through
   CSIPHY4. The official SC820CS timing, exposure and analogue-gain controls
   are implemented; libcamera capture is validated through the software ISP.
-- `camera/sc1320cs.ko`: Caihong rear SC1320CS V4L2 driver; chip ID `0xc658`
+- `sc1320cs.ko`: Caihong rear SC1320CS V4L2 driver; chip ID `0xc658`
   at Linux address `0x36` and a validated 4208x3120 RAW10 stream through
   CSIPHY1. Link frequency (600 MHz), pixel rate (480 MHz), and exposure
   (1..3196 lines) controls are available. Captures at 3196 and 800 lines
   confirmed that the exposure register writes change the optical output.
   Fixed blanking and 1x gain controls complete the libcamera sensor contract;
   libcamera and GStreamer captures are validated through the software ISP.
-- `camera/gt9772.ko`: Caihong rear GT9772 V4L2 focus actuator; validated at
+- `gt9772.ko`: Caihong rear GT9772 V4L2 focus actuator; validated at
   Linux address `0x0c` with optical focus movement and park-to-40 behavior.
 - `sensors/ssc/`: the validated Qualcomm SSC runtime for the stock-owned
   ICM42607-class IMU, MMC56x3x magnetometer and TCS3701 ALS. Live
@@ -30,15 +33,13 @@ Out-of-tree Linux drivers being brought up for the OnePlus Pad Pro (SM8650,
   backends in `iio-sensor-proxy`; all four display orientations and KDE
   automatic rotation are validated. Plasma 6.7 native automatic brightness is
   also validated from TCS3701 lux through SensorProxy to the internal backlight.
-- `sensors/*.ko`: optional direct-AP bring-up modules for MMC56x3x, TCS3701
+- `sensors/*.ko`: optional direct-AP validation modules for MMC56x3x, TCS3701
   and the official upstream ICM42607 core. The GPIO-only BU52053NVX Hall
   switch uses the in-tree `gpio-keys` driver through the supplied DTS fragment.
 
 The touchscreen driver is written against the DTS currently used by Caihong:
 `spi4`, GPIO162 falling-edge interrupt, `firmware-name`, standard touchscreen
 coordinate transform properties, and optional `novatek,pen-support`.
-
-The pogo driver remains in the tree, but current work is focused on charging.
 
 Sensor work is tracked on `port/sm8650-camera-sensors`. The camera modules and
 Caihong camera DT graph are compile- and modpost-validated against Linux v7.2.
@@ -48,9 +49,11 @@ the direct-AP modules do not enable a device-tree node or take bus ownership.
 
 Caihong has two SC8547-family charge pumps at I2C address `0x6f` on separate
 I2C hubs: the primary SC8547A is on hub 2 and the secondary SC8547-family IC is
-on hub 0. The current standalone driver is deliberately telemetry-only: it
-enables the ADC, reads status/fault/voltage/current data, and never enables the
-charge pump or rewrites protection limits during probe. See
+on hub 0. The driver starts SVOOC automatically on cable insertion, applies the
+project-23926 current curves, controls both pumps, and continuously checks bus
+voltage, pump current, battery state and die temperature. Wired PPS is
+coordinated with `qcom_battmgr` through standard power-supply properties. Every
+failure and removal path disables both pumps and restores the idle profile. See
 [`docs/caihong-charging.md`](docs/caihong-charging.md).
 
 ## Build
@@ -94,9 +97,7 @@ The existing node is sufficient. Uncomment the pen flag when testing stylus:
 };
 ```
 
-## SC8547 telemetry DTS
-
-Use this only for the current safe bring-up stage:
+## SC8547 DTS
 
 ```dts
 &i2c_hub_0 {
@@ -122,9 +123,11 @@ Use this only for the current safe bring-up stage:
 };
 ```
 
-The `southchip,role` property is currently a local bring-up aid and is not an
-upstream binding. The driver also accepts the downstream-compatible strings
-`oplus,sc8547a` and `slave_vphy_sc8547` for comparison/testing.
+The local `southchip,role` property identifies the two physical pumps. Board
+profiles and safety limits are fixed in the driver; no register values or
+development controls are exposed through the device tree. The downstream
+compatible strings `oplus,sc8547a` and `slave_vphy_sc8547` remain accepted for
+compatibility.
 
 ## Pogo DTS skeleton
 
